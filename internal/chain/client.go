@@ -321,32 +321,25 @@ func (c *ChainClient) HasJobCompleted(ctx context.Context, jobID uint64) (bool, 
 	return false, nil
 }
 
-// GetSessionEncWorkerKey retrieves the encrypted worker key for a session by filtering
-// historical SessionCreated event logs. This is necessary because the JobRegistry ABI
-// has no view functions for session data (see Concern C-1).
+const sessionStatusActive uint8 = 0
+
+// GetSessionEncWorkerKey retrieves the current encrypted worker key for a session
+// from JobRegistry session storage. Sessions that are not currently Active are
+// blocked until on-chain failover has completed.
 func (c *ChainClient) GetSessionEncWorkerKey(ctx context.Context, sessionID uint64) ([]byte, error) {
 	if err := c.requireJobRegistry(); err != nil {
 		return nil, err
 	}
-	sessionIDBig := new(big.Int).SetUint64(sessionID)
-	filterOpts := &bind.FilterOpts{Context: ctx}
-
-	iter, err := c.jobRegistry.FilterSessionCreated(filterOpts, []*big.Int{sessionIDBig}, nil, nil)
+	sess, err := c.jobRegistry.GetSession(&bind.CallOpts{Context: ctx}, new(big.Int).SetUint64(sessionID))
 	if err != nil {
-		return nil, fmt.Errorf("filter SessionCreated for session %d: %w", sessionID, err)
+		return nil, fmt.Errorf("GetSession %d: %w", sessionID, err)
 	}
-	defer iter.Close()
-
-	if !iter.Next() {
-		if iter.Error() != nil {
-			return nil, fmt.Errorf("iterate SessionCreated events: %w", iter.Error())
-		}
-		return nil, fmt.Errorf("no SessionCreated event found for session %d", sessionID)
+	if sess.Status != sessionStatusActive {
+		return nil, fmt.Errorf("session %d not active: status=%d", sessionID, sess.Status)
 	}
-
-	encWorkerKey := iter.Event.EncWorkerKey
+	encWorkerKey := sess.EncWorkerKey
 	if len(encWorkerKey) == 0 {
-		return nil, fmt.Errorf("SessionCreated event for session %d has empty encWorkerKey", sessionID)
+		return nil, fmt.Errorf("session %d has empty encWorkerKey", sessionID)
 	}
 
 	return encWorkerKey, nil
