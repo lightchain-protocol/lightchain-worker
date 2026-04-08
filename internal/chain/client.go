@@ -321,6 +321,8 @@ func (c *ChainClient) HasJobCompleted(ctx context.Context, jobID uint64) (bool, 
 	return false, nil
 }
 
+// sessionStatusActive matches the Solidity enum JobRegistry.SessionStatus.Active (index 0).
+// Source: contracts/src/interfaces/IJobRegistry.sol — enum SessionStatus { Active, ... }
 const sessionStatusActive uint8 = 0
 
 // GetSessionEncWorkerKey retrieves the current encrypted worker key for a session

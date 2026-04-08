@@ -99,6 +99,7 @@ type Harness struct {
 	sessionStorePath string
 	asynqServer      *asynq.Server
 	asynqMux         *asynq.ServeMux
+	asynqInspector   *asynq.Inspector
 	sessionStore     *keystore.SessionKeyStore
 	readyCh          chan struct{}
 	readyOnce        sync.Once
@@ -179,7 +180,7 @@ func New(t testing.TB, opts Options) *Harness {
 		},
 	)
 
-	asynqServer := asynq.NewServer(asynq.RedisClientOpt{
+	redisConnOpt := asynq.RedisClientOpt{
 		Network:      redisOpts.Network,
 		Addr:         redisOpts.Addr,
 		Username:     redisOpts.Username,
@@ -190,10 +191,12 @@ func New(t testing.TB, opts Options) *Harness {
 		WriteTimeout: redisOpts.WriteTimeout,
 		PoolSize:     redisOpts.PoolSize,
 		TLSConfig:    redisOpts.TLSConfig,
-	}, asynq.Config{
+	}
+	asynqServer := asynq.NewServer(redisConnOpt, asynq.Config{
 		Concurrency: opts.MaxConcurrentJobs,
 		Queues:      map[string]int{queueName: 1},
 	})
+	asynqInspector := asynq.NewInspector(redisConnOpt)
 
 	mux := asynq.NewServeMux()
 	mux.HandleFunc(pipeline.TaskTypeJobInference, handler.HandleTask)
@@ -204,6 +207,7 @@ func New(t testing.TB, opts Options) *Harness {
 		sessionStorePath: opts.SessionStorePath,
 		asynqServer:      asynqServer,
 		asynqMux:         mux,
+		asynqInspector:   asynqInspector,
 		sessionStore:     sessionStore,
 		readyCh:          make(chan struct{}),
 	}
@@ -251,9 +255,17 @@ func (h *Harness) Close() error {
 			cancel()
 		}
 		h.asynqServer.Shutdown()
+		_ = h.asynqInspector.Close()
 		h.closeErr = h.sessionStore.ZeroAll()
 	})
 	return h.closeErr
+}
+
+// RunAllRetryTasks moves all tasks that are waiting to be retried into the
+// active queue immediately, bypassing the retry backoff delay. Useful in
+// tests where waiting for Asynq's default 15-44 second backoff is impractical.
+func (h *Harness) RunAllRetryTasks() (int, error) {
+	return h.asynqInspector.RunAllRetryTasks(h.queueName)
 }
 
 // WorkerAddress returns the worker's signing address.
