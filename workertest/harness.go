@@ -34,11 +34,11 @@ import (
 // ChainClient is the worker pipeline's chain-facing dependency surface.
 type ChainClient interface {
 	AcknowledgeJob(ctx context.Context, jobID uint64) error
-	CompleteJob(ctx context.Context, jobID uint64, responseBlobHashes [][32]byte, responseCiphertextHash [32]byte) error
+	CompleteJob(ctx context.Context, jobID uint64, responseBlobHash [32]byte, responseCiphertextHash [32]byte) error
 	HasJobAcknowledged(ctx context.Context, jobID uint64) (bool, error)
 	HasJobCompleted(ctx context.Context, jobID uint64) (bool, error)
 	GetSessionEncWorkerKey(ctx context.Context, sessionID uint64) ([]byte, error)
-	GetJobBlobHashes(ctx context.Context, jobID uint64) (promptHashes []common.Hash, responseHashes []common.Hash, submitBlock uint64, completionBlock uint64, err error)
+	GetJobBlobInfo(ctx context.Context, jobID uint64) (promptHash common.Hash, responseHash common.Hash, submitBlock uint64, completionBlock uint64, err error)
 }
 
 // BlobFetcher is the worker pipeline's blob-fetch dependency surface.

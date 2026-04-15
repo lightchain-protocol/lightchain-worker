@@ -40,11 +40,20 @@ type InferenceClient interface {
 // JobExecutionClient submits job lifecycle transactions on-chain.
 type JobExecutionClient interface {
 	AcknowledgeJob(ctx context.Context, jobID uint64) error
-	CompleteJob(ctx context.Context, jobID uint64, responseBlobHashes [][32]byte, responseCiphertextHash [32]byte) error
+	// CompleteJob submits a completeJob TX with a single bytes32 response blob hash.
+	// The contract enforces `blobhash(0) == responseBlobHash`, so the caller must
+	// have submitted exactly one blob in the same (blob-carrying) transaction.
+	CompleteJob(ctx context.Context, jobID uint64, responseBlobHash [32]byte, responseCiphertextHash [32]byte) error
 	HasJobAcknowledged(ctx context.Context, jobID uint64) (bool, error)
 	HasJobCompleted(ctx context.Context, jobID uint64) (bool, error)
+	// GetSessionEncWorkerKey returns the most recent encrypted worker session key
+	// for the given session — queries both SessionCreated and SessionKeyUpdated
+	// events and returns the one from the highest-numbered block.
 	GetSessionEncWorkerKey(ctx context.Context, sessionID uint64) ([]byte, error)
-	GetJobBlobHashes(ctx context.Context, jobID uint64) (promptHashes []common.Hash, responseHashes []common.Hash, submitBlock uint64, completionBlock uint64, err error)
+	// GetJobBlobInfo returns the single prompt and response blob hashes for a
+	// completed job along with the blocks they were submitted in. Used to build
+	// conversation history.
+	GetJobBlobInfo(ctx context.Context, jobID uint64) (promptHash common.Hash, responseHash common.Hash, submitBlock uint64, completionBlock uint64, err error)
 }
 
 // BlobFetcher fetches EIP-4844 blob data from the consensus layer.
@@ -150,18 +159,14 @@ func (h *JobHandler) processJob(ctx context.Context, p JobPayload) error {
 		return fmt.Errorf("stage 1 (ack): %w", err)
 	}
 
-	// Stage 2: Fetch prompt blob(s) from the consensus layer
-	hashes := p.EffectivePromptHashes()
-	if len(hashes) == 0 {
-		return fmt.Errorf("stage 2 (fetch blob): no prompt blob hashes")
+	// Stage 2: Fetch the prompt blob from the consensus layer. Post-audit
+	// each job carries a single bytes32 prompt blob hash.
+	if p.PromptBlobHash == (common.Hash{}) {
+		return fmt.Errorf("stage 2 (fetch blob): prompt blob hash is zero")
 	}
-	var blobData []byte
-	for _, hash := range hashes {
-		data, err := h.blobFetcher.FetchBlob(ctx, hash, p.BlockNumber)
-		if err != nil {
-			return fmt.Errorf("stage 2 (fetch blob %s): %w", hash.Hex(), err)
-		}
-		blobData = append(blobData, data...)
+	blobData, err := h.blobFetcher.FetchBlob(ctx, p.PromptBlobHash, p.BlockNumber)
+	if err != nil {
+		return fmt.Errorf("stage 2 (fetch blob %s): %w", p.PromptBlobHash.Hex(), err)
 	}
 
 	// Stage 3: Get session key (cache miss → chain fetch → store)
@@ -170,10 +175,23 @@ func (h *JobHandler) processJob(ctx context.Context, p JobPayload) error {
 		return fmt.Errorf("stage 3 (session key): %w", err)
 	}
 
-	// Stage 4: Decrypt prompt
+	// Stage 4: Decrypt prompt.
+	//
+	// On decryption failure, try refreshing the session key from chain once —
+	// the session key may have been rotated via updateSessionKey,
+	// emitting SessionKeyUpdated with a new encWorkerKey. GetSessionEncWorkerKey
+	// returns the newest event's key, so a refresh picks up the rotation.
 	prompt, err := pkgcrypto.Decrypt(sessionKey, blobData)
 	if err != nil {
-		return fmt.Errorf("stage 4 (decrypt prompt): %w", err)
+		refreshed, refreshErr := h.refreshSessionKey(ctx, p.SessionID)
+		if refreshErr != nil {
+			return fmt.Errorf("stage 4 (decrypt prompt): %w (refresh failed: %v)", err, refreshErr)
+		}
+		sessionKey = refreshed
+		prompt, err = pkgcrypto.Decrypt(sessionKey, blobData)
+		if err != nil {
+			return fmt.Errorf("stage 4 (decrypt prompt after key refresh): %w", err)
+		}
 	}
 
 	// Stage 5: AI inference (with conversation history if prior jobs exist)
@@ -218,14 +236,20 @@ func (h *JobHandler) processJob(ctx context.Context, p JobPayload) error {
 	// Stage 7: Publish to Redis (non-fatal on error)
 	h.publishToRedis(ctx, p.JobID, p.SessionID, p.CorrelationID, ciphertext)
 
-	// Stage 8: Submit blob TX + complete job on-chain
+	// Stage 8: Submit blob TX + complete job on-chain.
+	// Post-audit the contract's completeJob takes a single bytes32
+	// responseBlobHash and enforces `blobhash(0) == responseBlobHash`, so the
+	// blob TX must carry exactly one blob.
 	blobHashes, err := h.blobSubmitter.SubmitBlobTx(ctx, ciphertext)
 	if err != nil {
 		return fmt.Errorf("stage 8 (submit blob): %w", err)
 	}
+	if len(blobHashes) != 1 {
+		return fmt.Errorf("stage 8 (submit blob): expected exactly 1 blob hash, got %d", len(blobHashes))
+	}
 
 	responseCiphertextHash := crypto.Keccak256Hash(ciphertext)
-	if err := h.completeJob(ctx, p.JobID, blobHashes, responseCiphertextHash); err != nil {
+	if err := h.completeJob(ctx, p.JobID, blobHashes[0], responseCiphertextHash); err != nil {
 		return fmt.Errorf("stage 8 (complete job): %w", err)
 	}
 
@@ -261,10 +285,10 @@ func (h *JobHandler) ensureAcknowledged(ctx context.Context, jobID uint64) error
 func (h *JobHandler) completeJob(
 	ctx context.Context,
 	jobID uint64,
-	responseBlobHashes [][32]byte,
+	responseBlobHash [32]byte,
 	responseCiphertextHash [32]byte,
 ) error {
-	if err := h.chainClient.CompleteJob(ctx, jobID, responseBlobHashes, responseCiphertextHash); err != nil {
+	if err := h.chainClient.CompleteJob(ctx, jobID, responseBlobHash, responseCiphertextHash); err != nil {
 		completed, checkErr := h.chainClient.HasJobCompleted(ctx, jobID)
 		if checkErr != nil {
 			return fmt.Errorf("complete job: %w (recheck failed: %v)", err, checkErr)
@@ -284,8 +308,23 @@ func (h *JobHandler) getOrDeriveSessionKey(ctx context.Context, sessionID uint64
 	if err == nil {
 		return key, nil
 	}
+	return h.deriveAndStoreSessionKey(ctx, sessionID)
+}
 
-	// Cache miss — fetch encrypted key from chain and decrypt
+// refreshSessionKey skips the local cache and derives the latest session key
+// directly from chain events. Used on decryption failure to pick up a rotated
+// session key.
+func (h *JobHandler) refreshSessionKey(ctx context.Context, sessionID uint64) ([]byte, error) {
+	h.logger.Info("refreshing session key from chain", "sessionID", sessionID)
+	return h.deriveAndStoreSessionKey(ctx, sessionID)
+}
+
+// deriveAndStoreSessionKey fetches the latest encrypted worker key for the
+// session from chain, decrypts it with the worker's ECDH private key, and
+// stores the result in the local keystore. The on-chain query returns the
+// most recent SessionKeyUpdated event if one exists, falling back to
+// SessionCreated — so this always yields the current live key.
+func (h *JobHandler) deriveAndStoreSessionKey(ctx context.Context, sessionID uint64) ([]byte, error) {
 	encWorkerKey, err := h.chainClient.GetSessionEncWorkerKey(ctx, sessionID)
 	if err != nil {
 		return nil, fmt.Errorf("fetch enc worker key for session %d: %w", sessionID, err)
@@ -372,21 +411,18 @@ func (h *JobHandler) buildConversationHistory(
 	var messages []ollama.ChatMessage
 
 	for _, jobID := range priorJobIDs {
-		promptHashes, responseHashes, submitBlock, completionBlock, err := h.chainClient.GetJobBlobHashes(ctx, jobID)
+		promptHash, responseHash, submitBlock, completionBlock, err := h.chainClient.GetJobBlobInfo(ctx, jobID)
 		if err != nil {
 			return nil, fmt.Errorf("get blob hashes for job %d: %w", jobID, err)
 		}
 
-		// Fetch and decrypt prompt (may span multiple blobs, lives in submitJob TX block).
-		var promptBlob []byte
-		for _, hash := range promptHashes {
-			blob, err := h.blobFetcher.FetchBlob(ctx, hash, submitBlock)
+		// Fetch and decrypt prompt. Post-audit each job carries a
+		// single prompt blob; the on-chain tx submission lives in submitBlock.
+		if promptHash != (common.Hash{}) {
+			promptBlob, err := h.blobFetcher.FetchBlob(ctx, promptHash, submitBlock)
 			if err != nil {
 				return nil, fmt.Errorf("fetch prompt blob for job %d: %w", jobID, err)
 			}
-			promptBlob = append(promptBlob, blob...)
-		}
-		if len(promptBlob) > 0 {
 			promptText, err := pkgcrypto.Decrypt(sessionKey, promptBlob)
 			if err != nil {
 				return nil, fmt.Errorf("decrypt prompt for job %d: %w", jobID, err)
@@ -394,16 +430,12 @@ func (h *JobHandler) buildConversationHistory(
 			messages = append(messages, ollama.ChatMessage{Role: "user", Content: string(promptText)})
 		}
 
-		// Fetch and decrypt response (may span multiple blobs, lives in completeJob TX block).
-		var responseBlob []byte
-		for _, hash := range responseHashes {
-			blob, err := h.blobFetcher.FetchBlob(ctx, hash, completionBlock)
+		// Fetch and decrypt response (single blob, lives in completeJob TX block).
+		if responseHash != (common.Hash{}) {
+			responseBlob, err := h.blobFetcher.FetchBlob(ctx, responseHash, completionBlock)
 			if err != nil {
 				return nil, fmt.Errorf("fetch response blob for job %d: %w", jobID, err)
 			}
-			responseBlob = append(responseBlob, blob...)
-		}
-		if len(responseBlob) > 0 {
 			responseText, err := pkgcrypto.Decrypt(sessionKey, responseBlob)
 			if err != nil {
 				return nil, fmt.Errorf("decrypt response for job %d: %w", jobID, err)

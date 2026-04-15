@@ -49,12 +49,26 @@ func (m *mockClient) GetWorkerEncryptionKey(ctx context.Context, worker common.A
 }
 
 var (
-	testAddr   = common.HexToAddress("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
-	testPubKey = []byte{0x04, 0x01, 0x02}
+	testAddr = common.HexToAddress("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+	// testPubKey is a synthetic 65-byte uncompressed P-256 pubkey — the first
+	// byte is the required 0x04 prefix and the remaining 64 bytes are a
+	// deterministic fill. WorkerRegistry.registerWorker only validates length
+	// and prefix, not that the key lies on the P-256 curve,
+	// so a fill value is sufficient for unit tests that don't exercise crypto.
+	testPubKey = buildTestPubKey()
 	model1     = [32]byte{0x01}
 	model2     = [32]byte{0x02}
 	minStake   = big.NewInt(1_000_000_000_000_000_000) // 1 ETH in wei
 )
+
+func buildTestPubKey() []byte {
+	key := make([]byte, P256UncompressedPubKeyLength)
+	key[0] = P256UncompressedPrefix
+	for i := 1; i < P256UncompressedPubKeyLength; i++ {
+		key[i] = byte(i)
+	}
+	return key
+}
 
 func newLogger() *slog.Logger {
 	return slog.New(slog.NewTextHandler(io.Discard, &slog.HandlerOptions{Level: slog.LevelError}))
@@ -302,4 +316,59 @@ func TestDeregister_Error_Propagated(t *testing.T) {
 	err := mgr.Deregister(context.Background())
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "deregister worker")
+}
+
+// Post-audit guardrail: the manager must reject keys that
+// don't meet the 65-byte / 0x04-prefix format BEFORE making any chain calls,
+// so a misconfigured worker fails fast instead of burning a registerWorker tx
+// on a contract revert.
+func TestEnsureRegistered_InvalidPubKey_Rejected(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name        string
+		key         []byte
+		errContains string
+	}{
+		{
+			name:        "too short",
+			key:         []byte{0x04, 0x01, 0x02},
+			errContains: "65 bytes",
+		},
+		{
+			name: "wrong prefix",
+			key: func() []byte {
+				k := make([]byte, P256UncompressedPubKeyLength)
+				k[0] = 0x02 // compressed prefix, not uncompressed
+				return k
+			}(),
+			errContains: "0x04 prefix",
+		},
+		{
+			name:        "empty",
+			key:         []byte{},
+			errContains: "65 bytes",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			chainCalled := false
+			mock := &mockClient{
+				isWorkerRegisteredFn: func(_ context.Context, _ common.Address) (bool, error) {
+					chainCalled = true
+					return false, nil
+				},
+			}
+
+			mgr := NewManager(mock, testAddr, nil, newLogger())
+			err := mgr.EnsureRegistered(context.Background(), tc.key, minStake)
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), "invalid encryption pubkey")
+			assert.Contains(t, err.Error(), tc.errContains)
+			assert.False(t, chainCalled, "no chain calls must be made when pubkey validation fails")
+		})
+	}
 }

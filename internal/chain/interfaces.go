@@ -52,12 +52,15 @@ type JobExecutionClient interface {
 	// AcknowledgeJob submits an acknowledgeJob transaction for the given job ID.
 	AcknowledgeJob(ctx context.Context, jobID uint64) error
 
-	// CompleteJob submits a completeJob transaction with the response blob hashes
-	// and the keccak256 hash of the full encrypted response ciphertext.
+	// CompleteJob submits a completeJob transaction with a single bytes32 response
+	// blob hash and the keccak256 hash of the full encrypted response ciphertext.
+	// Post-audit the contract's completeJob takes one bytes32 and enforces
+	// `blobhash(0) == responseBlobHash`, so the caller must have included exactly
+	// one blob in the same blob-carrying transaction.
 	CompleteJob(
 		ctx context.Context,
 		jobID uint64,
-		responseBlobHashes [][32]byte,
+		responseBlobHash [32]byte,
 		responseCiphertextHash [32]byte,
 	) error
 
@@ -67,14 +70,15 @@ type JobExecutionClient interface {
 	// HasJobCompleted reports whether JobCompleted has already been observed for the job.
 	HasJobCompleted(ctx context.Context, jobID uint64) (bool, error)
 
-	// GetSessionEncWorkerKey retrieves the current encrypted worker key for a session
-	// from JobRegistry session storage. After reassignment, the consumer is expected
-	// to re-wrap the same underlying symmetric session key for the replacement worker.
-	// Implementations must reject sessions that are not currently active.
+	// GetSessionEncWorkerKey returns the most recent encrypted worker key for a
+	// session by filtering historical SessionCreated and SessionKeyUpdated event
+	// logs, returning whichever was emitted in the highest-numbered block. This
+	// picks up post-creation key rotations.
 	GetSessionEncWorkerKey(ctx context.Context, sessionID uint64) ([]byte, error)
 
-	// GetJobBlobHashes returns the prompt blob hashes, response blob hashes,
+	// GetJobBlobInfo returns the prompt blob hash, response blob hash,
 	// submitBlockNumber, and completionBlockNumber for a completed job.
-	// Used to build conversation history.
-	GetJobBlobHashes(ctx context.Context, jobID uint64) (promptHashes []common.Hash, responseHashes []common.Hash, submitBlock uint64, completionBlock uint64, err error)
+	// Used to build conversation history. Post-audit each job carries one
+	// prompt blob and one response blob.
+	GetJobBlobInfo(ctx context.Context, jobID uint64) (promptHash common.Hash, responseHash common.Hash, submitBlock uint64, completionBlock uint64, err error)
 }

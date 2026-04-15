@@ -33,7 +33,7 @@ import (
 
 type mockChainClient struct {
 	ackJobFn             func(ctx context.Context, jobID uint64) error
-	completeJobFn        func(ctx context.Context, jobID uint64, hashes [][32]byte, responseCiphertextHash [32]byte) error
+	completeJobFn        func(ctx context.Context, jobID uint64, hash [32]byte, responseCiphertextHash [32]byte) error
 	hasJobAcknowledgedFn func(ctx context.Context, jobID uint64) (bool, error)
 	hasJobCompletedFn    func(ctx context.Context, jobID uint64) (bool, error)
 	getEncWorkerKeyFn    func(ctx context.Context, sessionID uint64) ([]byte, error)
@@ -42,7 +42,7 @@ type mockChainClient struct {
 func (m *mockChainClient) AcknowledgeJob(ctx context.Context, jobID uint64) error {
 	return m.ackJobFn(ctx, jobID)
 }
-func (m *mockChainClient) CompleteJob(ctx context.Context, jobID uint64, h [][32]byte, responseCiphertextHash [32]byte) error {
+func (m *mockChainClient) CompleteJob(ctx context.Context, jobID uint64, h [32]byte, responseCiphertextHash [32]byte) error {
 	return m.completeJobFn(ctx, jobID, h, responseCiphertextHash)
 }
 func (m *mockChainClient) HasJobAcknowledged(ctx context.Context, jobID uint64) (bool, error) {
@@ -60,8 +60,8 @@ func (m *mockChainClient) HasJobCompleted(ctx context.Context, jobID uint64) (bo
 func (m *mockChainClient) GetSessionEncWorkerKey(ctx context.Context, sessionID uint64) ([]byte, error) {
 	return m.getEncWorkerKeyFn(ctx, sessionID)
 }
-func (m *mockChainClient) GetJobBlobHashes(_ context.Context, _ uint64) ([]common.Hash, []common.Hash, uint64, uint64, error) {
-	return nil, nil, 0, 0, nil
+func (m *mockChainClient) GetJobBlobInfo(_ context.Context, _ uint64) (common.Hash, common.Hash, uint64, uint64, error) {
+	return common.Hash{}, common.Hash{}, 0, 0, nil
 }
 
 type mockBlobFetcher struct {
@@ -226,10 +226,10 @@ func TestHandleTask_FullPipelineSuccess(t *testing.T) {
 			assert.Equal(t, uint64(42), jobID)
 			return nil
 		},
-		completeJobFn: func(_ context.Context, jobID uint64, hashes [][32]byte, responseCiphertextHash [32]byte) error {
+		completeJobFn: func(_ context.Context, jobID uint64, hash [32]byte, responseCiphertextHash [32]byte) error {
 			stagesExecuted = append(stagesExecuted, "complete")
 			assert.Equal(t, uint64(42), jobID)
-			assert.Len(t, hashes, 1)
+			assert.NotEqual(t, [32]byte{}, hash)
 			assert.NotEqual(t, [32]byte{}, responseCiphertextHash)
 			return nil
 		},
@@ -302,7 +302,7 @@ func TestHandleTask_AckFailure_StopsEarly(t *testing.T) {
 		ackJobFn: func(_ context.Context, _ uint64) error {
 			return fmt.Errorf("chain unavailable")
 		},
-		completeJobFn:     func(_ context.Context, _ uint64, _ [][32]byte, _ [32]byte) error { panic("should not be called") },
+		completeJobFn:     func(_ context.Context, _ uint64, _ [32]byte, _ [32]byte) error { panic("should not be called") },
 		getEncWorkerKeyFn: func(_ context.Context, _ uint64) ([]byte, error) { panic("should not be called") },
 	}
 	fetcher := &mockBlobFetcher{fetchFn: func(_ context.Context, _ common.Hash, _ uint64) ([]byte, error) { panic("should not be called") }}
@@ -328,7 +328,7 @@ func TestHandleTask_BlobFetchFailure(t *testing.T) {
 
 	chain := &mockChainClient{
 		ackJobFn:          func(_ context.Context, _ uint64) error { return nil },
-		completeJobFn:     func(_ context.Context, _ uint64, _ [][32]byte, _ [32]byte) error { panic("should not be called") },
+		completeJobFn:     func(_ context.Context, _ uint64, _ [32]byte, _ [32]byte) error { panic("should not be called") },
 		getEncWorkerKeyFn: func(_ context.Context, _ uint64) ([]byte, error) { panic("should not be called") },
 	}
 	fetcher := &mockBlobFetcher{fetchFn: func(_ context.Context, _ common.Hash, _ uint64) ([]byte, error) {
@@ -366,7 +366,7 @@ func TestHandleTask_SessionKeyCacheHit(t *testing.T) {
 	chainCalled := false
 	chain := &mockChainClient{
 		ackJobFn:      func(_ context.Context, _ uint64) error { return nil },
-		completeJobFn: func(_ context.Context, _ uint64, _ [][32]byte, _ [32]byte) error { return nil },
+		completeJobFn: func(_ context.Context, _ uint64, _ [32]byte, _ [32]byte) error { return nil },
 		getEncWorkerKeyFn: func(_ context.Context, _ uint64) ([]byte, error) {
 			chainCalled = true
 			return nil, fmt.Errorf("should not be called — key cached")
@@ -412,7 +412,7 @@ func TestHandleTask_SessionKeyCacheMiss_FetchAndStore(t *testing.T) {
 
 	chain := &mockChainClient{
 		ackJobFn:      func(_ context.Context, _ uint64) error { return nil },
-		completeJobFn: func(_ context.Context, _ uint64, _ [][32]byte, _ [32]byte) error { return nil },
+		completeJobFn: func(_ context.Context, _ uint64, _ [32]byte, _ [32]byte) error { return nil },
 		getEncWorkerKeyFn: func(_ context.Context, sid uint64) ([]byte, error) {
 			assert.Equal(t, uint64(1), sid)
 			return encSessionKey, nil
@@ -447,6 +447,79 @@ func TestHandleTask_SessionKeyCacheMiss_FetchAndStore(t *testing.T) {
 	assert.Equal(t, sessionKey, stored)
 }
 
+// TestHandleTask_SessionKeyRotated_Refreshes guards the updateSessionKey flow.
+// When the cached session key fails to decrypt the prompt
+// blob — which happens after the consumer rotates the key via updateSessionKey
+// on-chain — the handler must refresh from the chain once and retry. The
+// mocked chain returns an outdated encrypted key on the first call and the
+// rotated one on the second, mirroring how GetSessionEncWorkerKey picks up
+// the latest SessionKeyUpdated event.
+func TestHandleTask_SessionKeyRotated_Refreshes(t *testing.T) {
+	t.Parallel()
+	mr := miniredis.RunT(t)
+	rc := redis.NewClient(&redis.Options{Addr: mr.Addr()})
+	t.Cleanup(func() { rc.Close() })
+
+	oldSessionKey := testSessionKey(t)
+	newSessionKey := testSessionKey(t)
+	require.NotEqual(t, oldSessionKey, newSessionKey)
+
+	ecdhKey := testECDHKey(t)
+	encNewSessionKey := encryptSessionKeyForWorker(t, newSessionKey, ecdhKey)
+
+	// Blob is encrypted with the NEW key — the old cached key cannot decrypt it.
+	promptCiphertext := encryptBlob(t, newSessionKey, "rotated prompt")
+
+	// Pre-populate cache with the OLD session key — this is the stale state
+	// that exists at the start of the first job after a rotation.
+	ks := newMockKeyStore()
+	ks.keys[1] = oldSessionKey
+
+	var getEncKeyCalls int
+	chain := &mockChainClient{
+		ackJobFn:      func(_ context.Context, _ uint64) error { return nil },
+		completeJobFn: func(_ context.Context, _ uint64, _ [32]byte, _ [32]byte) error { return nil },
+		getEncWorkerKeyFn: func(_ context.Context, sid uint64) ([]byte, error) {
+			getEncKeyCalls++
+			assert.Equal(t, uint64(1), sid)
+			return encNewSessionKey, nil
+		},
+	}
+	fetcher := &mockBlobFetcher{fetchFn: func(_ context.Context, _ common.Hash, _ uint64) ([]byte, error) {
+		return promptCiphertext, nil
+	}}
+	submitter := &mockBlobSubmitter{submitFn: func(_ context.Context, _ []byte) ([][32]byte, error) {
+		return [][32]byte{{0x01}}, nil
+	}}
+	ollama := &mockOllama{generateFn: func(_ context.Context, _, prompt string) (string, error) {
+		assert.Equal(t, "rotated prompt", prompt)
+		return "rotated resp", nil
+	}}
+
+	counter := &atomic.Int32{}
+	logger := slog.New(slog.NewTextHandler(io.Discard, &slog.HandlerOptions{Level: slog.LevelError}))
+	handler := NewJobHandler(chain, fetcher, submitter, ks, ollama, rc,
+		testSigningKey(t), ecdhKey, counter, logger,
+		HandlerConfig{AckTxTimeout: 5 * time.Second})
+
+	payload := testPayload(t)
+	data, _ := json.Marshal(payload)
+	task := asynq.NewTask(TaskTypeJobInference, data)
+
+	err := handler.HandleTask(context.Background(), task)
+	require.NoError(t, err)
+
+	// Chain must have been queried exactly once (only the refresh path — the
+	// first lookup was a cache hit on the stale key).
+	assert.Equal(t, 1, getEncKeyCalls)
+
+	// After refresh, the keystore should hold the new key — subsequent jobs
+	// for this session will get a clean cache hit.
+	stored, err := ks.GetKey(1)
+	require.NoError(t, err)
+	assert.Equal(t, newSessionKey, stored)
+}
+
 func TestHandleTask_CompleteJobFailure(t *testing.T) {
 	t.Parallel()
 	mr := miniredis.RunT(t)
@@ -462,7 +535,7 @@ func TestHandleTask_CompleteJobFailure(t *testing.T) {
 
 	chain := &mockChainClient{
 		ackJobFn: func(_ context.Context, _ uint64) error { return nil },
-		completeJobFn: func(_ context.Context, _ uint64, _ [][32]byte, _ [32]byte) error {
+		completeJobFn: func(_ context.Context, _ uint64, _ [32]byte, _ [32]byte) error {
 			return fmt.Errorf("TX reverted")
 		},
 		getEncWorkerKeyFn: func(_ context.Context, _ uint64) ([]byte, error) { return nil, nil },
@@ -506,7 +579,7 @@ func TestHandleTask_JobCounterIncrementDecrement(t *testing.T) {
 			assert.Equal(t, int32(1), counter.Load())
 			return fmt.Errorf("fail after checking counter")
 		},
-		completeJobFn:     func(_ context.Context, _ uint64, _ [][32]byte, _ [32]byte) error { return nil },
+		completeJobFn:     func(_ context.Context, _ uint64, _ [32]byte, _ [32]byte) error { return nil },
 		getEncWorkerKeyFn: func(_ context.Context, _ uint64) ([]byte, error) { return nil, nil },
 	}
 	fetcher := &mockBlobFetcher{fetchFn: func(_ context.Context, _ common.Hash, _ uint64) ([]byte, error) { return nil, nil }}
@@ -545,7 +618,7 @@ func TestHandleTask_RedisPublishFailure_NonFatal(t *testing.T) {
 
 	chain := &mockChainClient{
 		ackJobFn:          func(_ context.Context, _ uint64) error { return nil },
-		completeJobFn:     func(_ context.Context, _ uint64, _ [][32]byte, _ [32]byte) error { return nil },
+		completeJobFn:     func(_ context.Context, _ uint64, _ [32]byte, _ [32]byte) error { return nil },
 		getEncWorkerKeyFn: func(_ context.Context, _ uint64) ([]byte, error) { return nil, nil },
 	}
 	fetcher := &mockBlobFetcher{fetchFn: func(_ context.Context, _ common.Hash, _ uint64) ([]byte, error) {
@@ -644,7 +717,7 @@ func TestHandleTask_AckAlreadyMined_SkipsRetryAck(t *testing.T) {
 			assert.Equal(t, uint64(42), jobID)
 			return true, nil
 		},
-		completeJobFn: func(_ context.Context, _ uint64, _ [][32]byte, _ [32]byte) error { return nil },
+		completeJobFn: func(_ context.Context, _ uint64, _ [32]byte, _ [32]byte) error { return nil },
 	}
 
 	fetcher := &mockBlobFetcher{fetchFn: func(_ context.Context, _ common.Hash, _ uint64) ([]byte, error) {
@@ -682,7 +755,7 @@ func TestHandleTask_CompleteAlreadyMined_TreatsRetryAsSuccess(t *testing.T) {
 
 	chain := &mockChainClient{
 		ackJobFn: func(_ context.Context, _ uint64) error { return nil },
-		completeJobFn: func(_ context.Context, _ uint64, _ [][32]byte, _ [32]byte) error {
+		completeJobFn: func(_ context.Context, _ uint64, _ [32]byte, _ [32]byte) error {
 			return fmt.Errorf("already completed")
 		},
 		hasJobCompletedFn: func(_ context.Context, jobID uint64) (bool, error) {

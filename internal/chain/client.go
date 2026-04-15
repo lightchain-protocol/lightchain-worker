@@ -256,18 +256,21 @@ func (c *ChainClient) AcknowledgeJob(ctx context.Context, jobID uint64) error {
 	})
 }
 
-// CompleteJob submits a completeJob transaction with the response blob hashes.
+// CompleteJob submits a completeJob transaction with a single bytes32 response
+// blob hash. Post-audit the contract takes one bytes32 and enforces
+// `blobhash(0) == responseBlobHash`, so the blob-carrying TX must contain
+// exactly one blob matching this hash.
 func (c *ChainClient) CompleteJob(
 	ctx context.Context,
 	jobID uint64,
-	responseBlobHashes [][32]byte,
+	responseBlobHash [32]byte,
 	responseCiphertextHash [32]byte,
 ) error {
 	if err := c.requireJobRegistry(); err != nil {
 		return err
 	}
 	return c.submitPreparedTx(ctx, "CompleteJob", nil, func(opts *bind.TransactOpts) (*types.Transaction, error) {
-		return c.jobRegistry.CompleteJob(opts, new(big.Int).SetUint64(jobID), responseBlobHashes, responseCiphertextHash)
+		return c.jobRegistry.CompleteJob(opts, new(big.Int).SetUint64(jobID), responseBlobHash, responseCiphertextHash)
 	})
 }
 
@@ -321,55 +324,89 @@ func (c *ChainClient) HasJobCompleted(ctx context.Context, jobID uint64) (bool, 
 	return false, nil
 }
 
-// sessionStatusActive matches the Solidity enum JobRegistry.SessionStatus.Active (index 0).
-// Source: contracts/src/interfaces/IJobRegistry.sol — enum SessionStatus { Active, ... }
-const sessionStatusActive uint8 = 0
-
-// GetSessionEncWorkerKey retrieves the current encrypted worker key for a session
-// from JobRegistry session storage. Sessions that are not currently Active are
-// blocked until on-chain failover has completed.
+// GetSessionEncWorkerKey returns the most recent encrypted worker key for a
+// session. It queries both SessionCreated and SessionKeyUpdated event logs
+// and returns whichever was emitted in the highest-numbered block, so the
+// post-audit updateSessionKey flow (LSC-15) transparently rotates the key
+// worker-side without any explicit event subscription.
+//
+// Event iteration is required because the JobRegistry ABI has no view functions
+// that expose session data.
 func (c *ChainClient) GetSessionEncWorkerKey(ctx context.Context, sessionID uint64) ([]byte, error) {
 	if err := c.requireJobRegistry(); err != nil {
 		return nil, err
 	}
-	sess, err := c.jobRegistry.GetSession(&bind.CallOpts{Context: ctx}, new(big.Int).SetUint64(sessionID))
+	sessionIDBig := new(big.Int).SetUint64(sessionID)
+	filterOpts := &bind.FilterOpts{Context: ctx}
+
+	// Baseline: the SessionCreated event carries the original encWorkerKey and
+	// is the only event guaranteed to exist for any valid session.
+	createdIter, err := c.jobRegistry.FilterSessionCreated(filterOpts, []*big.Int{sessionIDBig}, nil, nil)
 	if err != nil {
 		return nil, fmt.Errorf("GetSession %d: %w", sessionID, err)
 	}
-	if sess.Status != sessionStatusActive {
-		return nil, fmt.Errorf("session %d not active: status=%d", sessionID, sess.Status)
-	}
-	encWorkerKey := sess.EncWorkerKey
-	if len(encWorkerKey) == 0 {
-		return nil, fmt.Errorf("session %d has empty encWorkerKey", sessionID)
+	defer createdIter.Close()
+
+	if !createdIter.Next() {
+		if createdIter.Error() != nil {
+			return nil, fmt.Errorf("iterate SessionCreated events: %w", createdIter.Error())
+		}
+		return nil, fmt.Errorf("no SessionCreated event found for session %d", sessionID)
 	}
 
-	return encWorkerKey, nil
+	latestBlock := createdIter.Event.Raw.BlockNumber
+	latestKey := createdIter.Event.EncWorkerKey
+	if len(latestKey) == 0 {
+		return nil, fmt.Errorf("SessionCreated event for session %d has empty encWorkerKey", sessionID)
+	}
+
+	// Layer any SessionKeyUpdated events over the baseline. Each such event
+	// carries a replacement encWorkerKey; the newest one wins.
+	updatedIter, err := c.jobRegistry.FilterSessionKeyUpdated(filterOpts, []*big.Int{sessionIDBig})
+	if err != nil {
+		return nil, fmt.Errorf("filter SessionKeyUpdated for session %d: %w", sessionID, err)
+	}
+	defer updatedIter.Close()
+
+	for updatedIter.Next() {
+		block := updatedIter.Event.Raw.BlockNumber
+		if block < latestBlock {
+			continue
+		}
+		if len(updatedIter.Event.EncWorkerKey) == 0 {
+			// Defensive: ignore an empty rotation rather than crash — contract
+			// enforces 125-byte length, so this should never happen in practice.
+			continue
+		}
+		latestBlock = block
+		latestKey = updatedIter.Event.EncWorkerKey
+	}
+	if err := updatedIter.Error(); err != nil {
+		return nil, fmt.Errorf("iterate SessionKeyUpdated events: %w", err)
+	}
+
+	return latestKey, nil
 }
 
-// GetJobBlobHashes reads a job from the contract and returns its prompt blob hashes,
-// response blob hashes, submitBlockNumber, and completionBlockNumber.
-func (c *ChainClient) GetJobBlobHashes(ctx context.Context, jobID uint64) ([]common.Hash, []common.Hash, uint64, uint64, error) {
+// GetJobBlobInfo reads a job from the contract and returns its prompt blob
+// hash, response blob hash, submitBlockNumber, and completionBlockNumber.
+// Post-audit each job carries a single prompt blob and a single
+// response blob.
+func (c *ChainClient) GetJobBlobInfo(ctx context.Context, jobID uint64) (common.Hash, common.Hash, uint64, uint64, error) {
 	if err := c.requireJobRegistry(); err != nil {
-		return nil, nil, 0, 0, err
+		return common.Hash{}, common.Hash{}, 0, 0, err
 	}
 
 	job, err := c.jobRegistry.GetJob(&bind.CallOpts{Context: ctx}, new(big.Int).SetUint64(jobID))
 	if err != nil {
-		return nil, nil, 0, 0, fmt.Errorf("GetJob %d: %w", jobID, err)
+		return common.Hash{}, common.Hash{}, 0, 0, fmt.Errorf("GetJob %d: %w", jobID, err)
 	}
 
-	promptHashes := make([]common.Hash, len(job.PromptBlobHashes))
-	for i, h := range job.PromptBlobHashes {
-		promptHashes[i] = common.Hash(h)
-	}
-
-	responseHashes := make([]common.Hash, len(job.ResponseBlobHashes))
-	for i, h := range job.ResponseBlobHashes {
-		responseHashes[i] = common.Hash(h)
-	}
-
-	return promptHashes, responseHashes, job.SubmitBlockNumber.Uint64(), job.CompletionBlockNumber.Uint64(), nil
+	return common.Hash(job.PromptBlobHash),
+		common.Hash(job.ResponseBlobHash),
+		job.SubmitBlockNumber.Uint64(),
+		job.CompletionBlockNumber.Uint64(),
+		nil
 }
 
 // EthClient returns the underlying ethclient for use by blob layer components.

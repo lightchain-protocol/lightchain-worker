@@ -55,7 +55,7 @@ func (m *MockRegistrationClient) GetWorkerEncryptionKey(ctx context.Context, wor
 // MockJobExecutionClient is a hand-rolled mock for JobExecutionClient.
 type MockJobExecutionClient struct {
 	AcknowledgeJobFn         func(ctx context.Context, jobID uint64) error
-	CompleteJobFn            func(ctx context.Context, jobID uint64, responseBlobHashes [][32]byte, responseCiphertextHash [32]byte) error
+	CompleteJobFn            func(ctx context.Context, jobID uint64, responseBlobHash [32]byte, responseCiphertextHash [32]byte) error
 	HasJobAcknowledgedFn     func(ctx context.Context, jobID uint64) (bool, error)
 	HasJobCompletedFn        func(ctx context.Context, jobID uint64) (bool, error)
 	GetSessionEncWorkerKeyFn func(ctx context.Context, sessionID uint64) ([]byte, error)
@@ -68,10 +68,10 @@ func (m *MockJobExecutionClient) AcknowledgeJob(ctx context.Context, jobID uint6
 func (m *MockJobExecutionClient) CompleteJob(
 	ctx context.Context,
 	jobID uint64,
-	responseBlobHashes [][32]byte,
+	responseBlobHash [32]byte,
 	responseCiphertextHash [32]byte,
 ) error {
-	return m.CompleteJobFn(ctx, jobID, responseBlobHashes, responseCiphertextHash)
+	return m.CompleteJobFn(ctx, jobID, responseBlobHash, responseCiphertextHash)
 }
 
 func (m *MockJobExecutionClient) HasJobAcknowledged(ctx context.Context, jobID uint64) (bool, error) {
@@ -86,8 +86,8 @@ func (m *MockJobExecutionClient) GetSessionEncWorkerKey(ctx context.Context, ses
 	return m.GetSessionEncWorkerKeyFn(ctx, sessionID)
 }
 
-func (m *MockJobExecutionClient) GetJobBlobHashes(_ context.Context, _ uint64) ([]common.Hash, []common.Hash, uint64, uint64, error) {
-	return nil, nil, 0, 0, nil
+func (m *MockJobExecutionClient) GetJobBlobInfo(_ context.Context, _ uint64) (common.Hash, common.Hash, uint64, uint64, error) {
+	return common.Hash{}, common.Hash{}, 0, 0, nil
 }
 
 // TestMockImplementsInterface verifies mocks satisfy their interfaces.

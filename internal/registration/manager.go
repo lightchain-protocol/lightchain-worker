@@ -15,6 +15,30 @@ import (
 	"github.com/lightchain/worker/internal/chain"
 )
 
+// P256UncompressedPubKeyLength is the expected length of an uncompressed P-256
+// public key — 1-byte 0x04 prefix followed by 32-byte X and 32-byte Y coords.
+// Post-audit WorkerRegistry.registerWorker reverts any key
+// whose length is not exactly this value or whose first byte is not 0x04.
+const (
+	P256UncompressedPubKeyLength = 65
+	P256UncompressedPrefix       = 0x04
+)
+
+// validateEncryptionPubKey enforces the same 65-byte / 0x04-prefix check that
+// WorkerRegistry.registerWorker applies on-chain, so registration fails fast
+// with a clear local error instead of burning a tx on a contract revert.
+func validateEncryptionPubKey(key []byte) error {
+	if len(key) != P256UncompressedPubKeyLength {
+		return fmt.Errorf("encryption pubkey must be %d bytes, got %d",
+			P256UncompressedPubKeyLength, len(key))
+	}
+	if key[0] != P256UncompressedPrefix {
+		return fmt.Errorf("encryption pubkey must start with 0x%02x prefix, got 0x%02x",
+			P256UncompressedPrefix, key[0])
+	}
+	return nil
+}
+
 // RegistrationManager handles startup registration and graceful deregistration.
 type RegistrationManager struct {
 	client     chain.RegistrationClient
@@ -44,7 +68,15 @@ func NewManager(
 //
 // Registration is idempotent: if IsWorkerRegistered returns true, this is a no-op.
 // If AddSupportedModel fails after RegisterWorker succeeds, DeregisterWorker is called to roll back.
+//
+// The ecdhPubKey must be an uncompressed P-256 public key — 65 bytes with a
+// leading 0x04 byte. The contract enforces this format and reverts otherwise;
+// the same check is applied locally so misconfigured workers fail fast.
 func (m *RegistrationManager) EnsureRegistered(ctx context.Context, ecdhPubKey []byte, stake *big.Int) error {
+	if err := validateEncryptionPubKey(ecdhPubKey); err != nil {
+		return fmt.Errorf("invalid encryption pubkey: %w", err)
+	}
+
 	registered, err := m.client.IsWorkerRegistered(ctx, m.workerAddr)
 	if err != nil {
 		return fmt.Errorf("check registration status: %w", err)
