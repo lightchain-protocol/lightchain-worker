@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"math/big"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -656,10 +657,16 @@ func TestPublishToRedis_SignsContractCompatibleDigest(t *testing.T) {
 	t.Cleanup(func() { rc.Close() })
 
 	signingKey := testSigningKey(t)
+	chainID := big.NewInt(31337)
+	jobRegistryAddr := common.HexToAddress("0x0000000000000000000000000000000000001337")
 	handler := &JobHandler{
 		redisClient: rc,
 		signingKey:  signingKey,
 		logger:      slog.New(slog.NewTextHandler(io.Discard, &slog.HandlerOptions{Level: slog.LevelError})),
+		cfg: HandlerConfig{
+			ChainID:         chainID,
+			JobRegistryAddr: jobRegistryAddr,
+		},
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -687,7 +694,11 @@ func TestPublishToRedis_SignsContractCompatibleDigest(t *testing.T) {
 	assert.Equal(t, "corr-42", payload.CorrelationID)
 	assert.Equal(t, ciphertext, payload.Payload)
 
-	expectedDigest := redisResponseDigest(ciphertext, 42)
+	// Reconstruct the same digest the contract's disputeResponseMismatch
+	// verification would compute and assert we recover the worker's signing
+	// address.
+	expectedDigest, err := responseMismatchDigest(chainID, jobRegistryAddr, 42, 9, ciphertext)
+	require.NoError(t, err)
 	sig, err := hex.DecodeString(strings.TrimPrefix(payload.Signature, "0x"))
 	require.NoError(t, err)
 

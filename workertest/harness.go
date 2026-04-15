@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"github.com/ethereum/go-ethereum/accounts"
+	"github.com/ethereum/go-ethereum/accounts/abi"
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/crypto"
 	"github.com/hibiken/asynq"
@@ -76,6 +77,11 @@ type Options struct {
 	SessionStorePath       string
 	SessionStorePassphrase string
 	Logger                 *slog.Logger
+	// ChainID and JobRegistryAddr are required for the worker's
+	// disputeResponseMismatch-compatible response signing. Tests that do not
+	// exercise the Redis publish path may leave them zero.
+	ChainID         *big.Int
+	JobRegistryAddr common.Address
 }
 
 // RealChainClientOptions configures a real worker chain client for E2E tests.
@@ -175,8 +181,10 @@ func New(t testing.TB, opts Options) *Harness {
 		jobCounter,
 		opts.Logger,
 		pipeline.HandlerConfig{
-			AckTxTimeout:  opts.AckTxTimeout,
-			ModelIDToName: opts.ModelIDToName,
+			AckTxTimeout:    opts.AckTxTimeout,
+			ModelIDToName:   opts.ModelIDToName,
+			ChainID:         opts.ChainID,
+			JobRegistryAddr: opts.JobRegistryAddr,
 		},
 	)
 
@@ -284,8 +292,13 @@ func (h *Harness) SessionStorePath() string {
 }
 
 // RecoverResponseSigner recovers the signer from a Redis response payload signature.
-func RecoverResponseSigner(resp ResponsePayload) (common.Address, error) {
-	digest := responseDigest(resp.Payload, uint64(resp.JobID))
+// The digest matches JobRegistry.disputeResponseMismatch verification so the returned
+// signature is directly usable as on-chain mismatch evidence.
+func RecoverResponseSigner(chainID *big.Int, jobRegistryAddr common.Address, resp ResponsePayload) (common.Address, error) {
+	digest, err := responseDigest(chainID, jobRegistryAddr, uint64(resp.JobID), uint64(resp.SessionID), resp.Payload)
+	if err != nil {
+		return common.Address{}, err
+	}
 	sig, err := hex.DecodeString(strings.TrimPrefix(resp.Signature, "0x"))
 	if err != nil {
 		return common.Address{}, fmt.Errorf("decode response signature: %w", err)
@@ -301,12 +314,48 @@ func workerQueueName(addr common.Address) string {
 	return fmt.Sprintf("worker:%s", strings.ToLower(addr.Hex()))
 }
 
-func responseDigest(ciphertext []byte, jobID uint64) []byte {
-	jobIDBytes := common.LeftPadBytes(new(big.Int).SetUint64(jobID).Bytes(), 32)
-	payload := make([]byte, 0, len(ciphertext)+len(jobIDBytes))
-	payload = append(payload, ciphertext...)
-	payload = append(payload, jobIDBytes...)
-	return crypto.Keccak256(payload)
+// responseDigestSigArgs mirrors pipeline.responseMismatchSigArgs in the
+// worker package — kept here so workertest does not depend on internal/pipeline
+// implementation details.
+var responseDigestSigArgs abi.Arguments
+
+func init() {
+	uint256Ty, err := abi.NewType("uint256", "", nil)
+	if err != nil {
+		panic(fmt.Sprintf("workertest: abi.NewType(uint256): %v", err))
+	}
+	addressTy, err := abi.NewType("address", "", nil)
+	if err != nil {
+		panic(fmt.Sprintf("workertest: abi.NewType(address): %v", err))
+	}
+	bytesTy, err := abi.NewType("bytes", "", nil)
+	if err != nil {
+		panic(fmt.Sprintf("workertest: abi.NewType(bytes): %v", err))
+	}
+	responseDigestSigArgs = abi.Arguments{
+		{Type: uint256Ty}, // block.chainid
+		{Type: addressTy}, // address(jobRegistry)
+		{Type: uint256Ty}, // jobId
+		{Type: uint256Ty}, // sessionId
+		{Type: bytesTy},   // ciphertext
+	}
+}
+
+func responseDigest(chainID *big.Int, jobRegistryAddr common.Address, jobID, sessionID uint64, ciphertext []byte) ([]byte, error) {
+	if chainID == nil {
+		return nil, fmt.Errorf("responseDigest: chainID is nil")
+	}
+	encoded, err := responseDigestSigArgs.Pack(
+		new(big.Int).Set(chainID),
+		jobRegistryAddr,
+		new(big.Int).SetUint64(jobID),
+		new(big.Int).SetUint64(sessionID),
+		ciphertext,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("pack mismatch payload: %w", err)
+	}
+	return crypto.Keccak256(encoded), nil
 }
 
 // NewRealChainClient creates the worker's real chain client behind the public

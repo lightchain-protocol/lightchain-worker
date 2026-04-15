@@ -205,8 +205,10 @@ func New(cfg *config.Config) (*Service, error) {
 		jobCounter,
 		logger,
 		pipeline.HandlerConfig{
-			AckTxTimeout:  cfg.AckTxTimeout,
-			ModelIDToName: modelIDToName,
+			AckTxTimeout:    cfg.AckTxTimeout,
+			ModelIDToName:   modelIDToName,
+			ChainID:         big.NewInt(cfg.ChainID),
+			JobRegistryAddr: cfg.JobRegistryAddress,
 		},
 	)
 

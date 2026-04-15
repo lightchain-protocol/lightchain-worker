@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/ethereum/go-ethereum/accounts"
+	"github.com/ethereum/go-ethereum/accounts/abi"
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/crypto"
 	"github.com/hibiken/asynq"
@@ -68,8 +69,10 @@ type BlobSubmitter interface {
 
 // HandlerConfig holds pipeline-specific configuration.
 type HandlerConfig struct {
-	AckTxTimeout  time.Duration
-	ModelIDToName map[string]string
+	AckTxTimeout    time.Duration
+	ModelIDToName   map[string]string
+	ChainID         *big.Int
+	JobRegistryAddr common.Address
 }
 
 // JobHandler processes inference jobs received from Asynq.
@@ -343,6 +346,32 @@ func (h *JobHandler) deriveAndStoreSessionKey(ctx context.Context, sessionID uin
 	return sessionKey, nil
 }
 
+// responseMismatchSigArgs matches JobRegistry.disputeResponseMismatch signature
+// verification: keccak256(abi.encode(chainid, address(this), jobId, sessionId, ciphertext)).
+var responseMismatchSigArgs abi.Arguments
+
+func init() {
+	uint256Ty, err := abi.NewType("uint256", "", nil)
+	if err != nil {
+		panic(fmt.Sprintf("pipeline: abi.NewType(uint256): %v", err))
+	}
+	addressTy, err := abi.NewType("address", "", nil)
+	if err != nil {
+		panic(fmt.Sprintf("pipeline: abi.NewType(address): %v", err))
+	}
+	bytesTy, err := abi.NewType("bytes", "", nil)
+	if err != nil {
+		panic(fmt.Sprintf("pipeline: abi.NewType(bytes): %v", err))
+	}
+	responseMismatchSigArgs = abi.Arguments{
+		{Type: uint256Ty}, // block.chainid
+		{Type: addressTy}, // address(jobRegistry)
+		{Type: uint256Ty}, // jobId
+		{Type: uint256Ty}, // sessionId
+		{Type: bytesTy},   // ciphertext
+	}
+}
+
 // publishToRedis signs and publishes the response to the session's Redis channel.
 // Errors are logged but non-fatal — the on-chain blob is the authoritative response.
 func (h *JobHandler) publishToRedis(
@@ -351,7 +380,7 @@ func (h *JobHandler) publishToRedis(
 	correlationID string,
 	ciphertext []byte,
 ) {
-	sig, err := signRedisResponse(ciphertext, jobID, h.signingKey)
+	sig, err := signMismatchEvidence(h.cfg.ChainID, h.cfg.JobRegistryAddr, jobID, sessionID, ciphertext, h.signingKey)
 	if err != nil {
 		h.logger.Warn("failed to sign response for Redis", "jobID", jobID, "error", err)
 		return
@@ -381,19 +410,47 @@ func (h *JobHandler) publishToRedis(
 	}
 }
 
-func signRedisResponse(ciphertext []byte, jobID uint64, signingKey *ecdsa.PrivateKey) ([]byte, error) {
-	digest := redisResponseDigest(ciphertext, jobID)
+// signMismatchEvidence produces an EIP-191 worker signature over the domain-separated
+// payload that JobRegistry.disputeResponseMismatch verifies on-chain. Consumers who
+// receive the signed PubSubMessage off-chain can use the signature as evidence when
+// raising a mismatch dispute.
+func signMismatchEvidence(
+	chainID *big.Int,
+	jobRegistryAddr common.Address,
+	jobID, sessionID uint64,
+	ciphertext []byte,
+	signingKey *ecdsa.PrivateKey,
+) ([]byte, error) {
+	digest, err := responseMismatchDigest(chainID, jobRegistryAddr, jobID, sessionID, ciphertext)
+	if err != nil {
+		return nil, err
+	}
 	return crypto.Sign(accounts.TextHash(digest), signingKey)
 }
 
-func redisResponseDigest(ciphertext []byte, jobID uint64) []byte {
-	jobIDBig := new(big.Int).SetUint64(jobID)
-	jobIDBytes := common.LeftPadBytes(jobIDBig.Bytes(), 32)
-
-	payload := make([]byte, 0, len(ciphertext)+len(jobIDBytes))
-	payload = append(payload, ciphertext...)
-	payload = append(payload, jobIDBytes...)
-	return crypto.Keccak256(payload)
+// responseMismatchDigest computes keccak256(abi.encode(chainid, jobRegistryAddr,
+// jobId, sessionId, ciphertext)) — the inner hash that JobRegistry wraps with
+// EIP-191 before verifying in disputeResponseMismatch.
+func responseMismatchDigest(
+	chainID *big.Int,
+	jobRegistryAddr common.Address,
+	jobID, sessionID uint64,
+	ciphertext []byte,
+) ([]byte, error) {
+	if chainID == nil {
+		return nil, fmt.Errorf("responseMismatchDigest: chainID is nil")
+	}
+	encoded, err := responseMismatchSigArgs.Pack(
+		new(big.Int).Set(chainID),
+		jobRegistryAddr,
+		new(big.Int).SetUint64(jobID),
+		new(big.Int).SetUint64(sessionID),
+		ciphertext,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("pack mismatch payload: %w", err)
+	}
+	return crypto.Keccak256(encoded), nil
 }
 
 // buildConversationHistory fetches prior jobs' prompt and response blobs,
