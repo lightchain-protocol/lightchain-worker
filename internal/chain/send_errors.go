@@ -23,18 +23,39 @@ const (
 // blob tx (or a non-blob tx against a pending blob, and vice versa). The
 // sentinel error is plain (errors.New) and its string is stable across
 // go-ethereum releases, so substring matching survives RPC wrapping.
-const alreadyReservedSubstr = "address already reserved"
+//
+// nonceTooHighSubstr and nonceTooLowSubstr match go-ethereum's core txpool
+// nonce-desync rejections. They arrive from nodes that surface plain (non
+// -RPC-coded) errors under specific txpool paths — notably when the local
+// NonceManager counter drifts from the chain's pending nonce after a
+// WaitMined timeout leaves a tx stuck in the mempool. Both are emitted as
+// strings like "nonce too high: tx nonce 126, gapped nonce 122" or "nonce
+// too low: next nonce 126, tx nonce 124", so a directional substring match
+// is safe (and deliberately narrower than a bare "nonce" match, which would
+// swallow unrelated errors).
+const (
+	alreadyReservedSubstr = "address already reserved"
+	nonceTooHighSubstr    = "nonce too high"
+	nonceTooLowSubstr     = "nonce too low"
+)
 
-// isAlreadyReserved reports whether err is (or wraps, or contains via RPC
-// message) go-ethereum's txpool reservation error.
-func isAlreadyReserved(err error) bool {
-	return err != nil && strings.Contains(err.Error(), alreadyReservedSubstr)
+// isNonceDesyncError reports whether err is any of the three known local/chain
+// nonce-desync conditions that should trigger a NonceManager reset so the next
+// NextNonce() refetches the chain's pending nonce.
+func isNonceDesyncError(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := err.Error()
+	return strings.Contains(msg, alreadyReservedSubstr) ||
+		strings.Contains(msg, nonceTooHighSubstr) ||
+		strings.Contains(msg, nonceTooLowSubstr)
 }
 
 // ShouldResetNonceOnSendError reports whether a SendTransaction failure was a
 // definite pre-broadcast rejection and the locally reserved nonce should be discarded.
 func ShouldResetNonceOnSendError(err error) bool {
-	if isAlreadyReserved(err) {
+	if isNonceDesyncError(err) {
 		return true
 	}
 

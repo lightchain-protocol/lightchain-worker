@@ -48,6 +48,40 @@ func TestShouldResetNonceOnSendError(t *testing.T) {
 			want: true,
 		},
 
+		// Local/chain nonce-desync surfaced as plain strings. Observed in
+		// testnet cascades when the local counter drifts past a stuck
+		// mempool tx (nonce too high) or trails behind after the pool
+		// evicts it (nonce too low).
+		{
+			name: "plain nonce too high",
+			err:  errors.New("nonce too high: tx nonce 126, gapped nonce 122"),
+			want: true,
+		},
+		{
+			name: "wrapped nonce too high",
+			err:  fmt.Errorf("send: %w", errors.New("nonce too high")),
+			want: true,
+		},
+		{
+			name: "plain nonce too low",
+			err:  errors.New("nonce too low: next nonce 126, tx nonce 124"),
+			want: true,
+		},
+		{
+			name: "wrapped nonce too low",
+			err:  fmt.Errorf("send: %w", errors.New("nonce too low")),
+			want: true,
+		},
+		// Regression guard: the desync match must be directional. A bare
+		// "nonce" string (without "too high"/"too low") must not trigger
+		// a reset — otherwise any error mentioning nonces would swallow
+		// into this path.
+		{
+			name: "bare nonce string does not match",
+			err:  errors.New("nonce issue"),
+			want: false,
+		},
+
 		// Unrelated transport error must not trigger a reset.
 		{name: "unrelated network error", err: errors.New("connection refused"), want: false},
 	}
