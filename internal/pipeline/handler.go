@@ -144,6 +144,17 @@ func (h *JobHandler) HandleTask(ctx context.Context, task *asynq.Task) error {
 	retryCount, _ := asynq.GetRetryCount(ctx)
 	maxRetry, _ := asynq.GetMaxRetry(ctx)
 
+	// Surface the dispatcher-configured asynq task deadline so operators
+	// can correlate "context deadline exceeded" cascades with the upstream
+	// timeout. The worker does not control this ceiling — the dispatcher
+	// passes it via ctx — so we log it and warn loudly if it looks too
+	// tight for the pipeline's own stage timeouts.
+	deadline, hasDeadline := ctx.Deadline()
+	budget := time.Duration(0)
+	if hasDeadline {
+		budget = time.Until(deadline)
+	}
+
 	h.logger.Info("processing job",
 		"jobID", payload.JobID,
 		"sessionID", payload.SessionID,
@@ -152,7 +163,29 @@ func (h *JobHandler) HandleTask(ctx context.Context, task *asynq.Task) error {
 		"attempt", retryCount+1,
 		"maxRetry", maxRetry,
 		"isRetry", retryCount > 0,
+		"taskBudgetMs", budget.Milliseconds(),
+		"hasDeadline", hasDeadline,
 	)
+
+	// Minimum realistic budget = ACK timeout + BLOB tx timeout + 10s buffer
+	// for inference/encrypt/fetch/redis. If the dispatcher's task ctx is
+	// tighter than this, stage 8 will hit ctx.Done before completing,
+	// leaving nonces gapped and blob txs stuck. This is an operator-config
+	// concern; log loud so it shows up in the first failing job, not after
+	// a cascade.
+	if hasDeadline {
+		minBudget := h.cfg.AckTxTimeout + h.cfg.BlobTxTimeout + 10*time.Second
+		if budget < minBudget {
+			h.logger.Warn("task budget appears too small for the pipeline",
+				"jobID", payload.JobID,
+				"taskBudgetMs", budget.Milliseconds(),
+				"minRecommendedMs", minBudget.Milliseconds(),
+				"ackTxTimeoutMs", h.cfg.AckTxTimeout.Milliseconds(),
+				"blobTxTimeoutMs", h.cfg.BlobTxTimeout.Milliseconds(),
+				"hint", "raise the dispatcher's asynq task timeout",
+			)
+		}
+	}
 
 	if err := h.processJob(ctx, payload); err != nil {
 		h.logger.Error("job failed",

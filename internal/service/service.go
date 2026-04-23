@@ -250,6 +250,9 @@ func New(cfg *config.Config) (*Service, error) {
 		"models", len(modelIDs),
 		"maxConcurrentJobs", cfg.MaxConcurrentJobs,
 		"queue", queueName,
+		"ackTxTimeout", cfg.AckTxTimeout.String(),
+		"blobTxTimeout", cfg.BlobTxTimeout.String(),
+		"minExpectedTaskBudget", (cfg.AckTxTimeout + cfg.BlobTxTimeout + 10*time.Second).String(),
 	)
 
 	return &Service{
