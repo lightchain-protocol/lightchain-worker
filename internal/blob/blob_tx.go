@@ -41,26 +41,45 @@ type BlobTxBackend interface {
 
 // BlobTxSubmitter builds and submits type-3 (EIP-4844) blob transactions.
 //
-// The broadcastMu serializes the SendTransaction..WaitMined window so that at
-// most one blob tx per submitter is in-flight on the execution layer at a time.
-// Go-ethereum's txpool rejects a second blob tx from the same sender with
-// ErrAlreadyReserved while a prior one is still pending; since a single worker
-// has a single signing key, this mutex is what enforces that invariant
-// across concurrent asynq worker goroutines.
+// broadcastSlot serializes the SendTransaction..WaitMined window so that at
+// most one blob tx per submitter is in-flight on the execution layer at a
+// time. Go-ethereum's txpool rejects a second blob tx from the same sender
+// with ErrAlreadyReserved while a prior one is still pending; since a single
+// worker has a single signing key, this slot enforces that invariant across
+// concurrent asynq worker goroutines.
+//
+// Unlike sync.Mutex, the slot is a buffered channel of size 1 used as a
+// ctx-aware binary semaphore: empty = unlocked, sending acquires, receiving
+// releases. Acquisition respects ctx.Done() so a cancelled job (e.g. during
+// worker shutdown) aborts promptly instead of waiting out the current
+// holder's WaitMined. broadcastSlotOnce lazy-initializes the channel so tests
+// that construct via struct literal do not need to pre-seed it.
 type BlobTxSubmitter struct {
-	ethClient   *ethclient.Client
-	txBackend   BlobTxBackend
-	signingKey  *ecdsa.PrivateKey
-	signTx      func(tx *types.Transaction, signer types.Signer, key *ecdsa.PrivateKey) (*types.Transaction, error)
-	waitMined   func(ctx context.Context, b bind.DeployBackend, tx *types.Transaction) (*types.Receipt, error)
-	chainID     *big.Int
-	nonceMgr    NonceManager
-	maxGasPrice *big.Int
-	broadcastMu sync.Mutex
+	ethClient         *ethclient.Client
+	txBackend         BlobTxBackend
+	signingKey        *ecdsa.PrivateKey
+	signTx            func(tx *types.Transaction, signer types.Signer, key *ecdsa.PrivateKey) (*types.Transaction, error)
+	waitMined         func(ctx context.Context, b bind.DeployBackend, tx *types.Transaction) (*types.Receipt, error)
+	chainID           *big.Int
+	nonceMgr          NonceManager
+	maxGasPrice       *big.Int
+	broadcastSlot     chan struct{}
+	broadcastSlotOnce sync.Once
 	// logger is optional. When nil, no structured logs are emitted. Tests
 	// that construct BlobTxSubmitter via struct literal may leave this nil;
 	// the production constructor wires in the service-level logger.
 	logger *slog.Logger
+}
+
+// slot lazily initializes and returns the broadcast serialization channel.
+// Safe for concurrent use via sync.Once.
+func (s *BlobTxSubmitter) slot() chan struct{} {
+	s.broadcastSlotOnce.Do(func() {
+		if s.broadcastSlot == nil {
+			s.broadcastSlot = make(chan struct{}, 1)
+		}
+	})
+	return s.broadcastSlot
 }
 
 // NewBlobTxSubmitter creates a BlobTxSubmitter. The logger may be nil; when
@@ -75,15 +94,16 @@ func NewBlobTxSubmitter(
 	logger *slog.Logger,
 ) *BlobTxSubmitter {
 	return &BlobTxSubmitter{
-		ethClient:   ethClient,
-		txBackend:   ethClient,
-		signingKey:  signingKey,
-		signTx:      types.SignTx,
-		waitMined:   bind.WaitMined,
-		chainID:     chainID,
-		nonceMgr:    nonceMgr,
-		maxGasPrice: maxGasPrice,
-		logger:      logger,
+		ethClient:     ethClient,
+		txBackend:     ethClient,
+		signingKey:    signingKey,
+		signTx:        types.SignTx,
+		waitMined:     bind.WaitMined,
+		chainID:       chainID,
+		nonceMgr:      nonceMgr,
+		maxGasPrice:   maxGasPrice,
+		broadcastSlot: make(chan struct{}, 1),
+		logger:        logger,
 	}
 }
 
@@ -158,15 +178,31 @@ func (s *BlobTxSubmitter) SubmitBlobTx(ctx context.Context, data []byte) ([][32]
 	txHash := signedTx.Hash()
 
 	if s.logger != nil {
-		s.logger.Debug("acquiring blob broadcast mutex",
+		s.logger.Debug("acquiring blob broadcast slot",
 			"stage", "submit_blob",
 			"txHash", txHash.Hex(),
 			"nonce", nonce,
 		)
 	}
+	slot := s.slot()
 	mutexWaitStart := time.Now()
-	s.broadcastMu.Lock()
-	defer s.broadcastMu.Unlock()
+	select {
+	case slot <- struct{}{}:
+		// acquired
+	case <-ctx.Done():
+		mutexWaitMs := time.Since(mutexWaitStart).Milliseconds()
+		if s.logger != nil {
+			s.logger.Warn("ctx cancelled waiting for broadcast slot",
+				"stage", "submit_blob",
+				"txHash", txHash.Hex(),
+				"nonce", nonce,
+				"mutexWaitMs", mutexWaitMs,
+				"error", ctx.Err(),
+			)
+		}
+		return nil, fmt.Errorf("wait for blob broadcast slot: %w", ctx.Err())
+	}
+	defer func() { <-slot }()
 	mutexWaitMs := time.Since(mutexWaitStart).Milliseconds()
 
 	broadcastStart := time.Now()

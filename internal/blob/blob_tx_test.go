@@ -149,6 +149,171 @@ func TestBlobTxSubmitter_SerializesBroadcast(t *testing.T) {
 	assert.Equal(t, int32(1), maxInFlight.Load(), "expected broadcast to be serialized, max in-flight was %d", maxInFlight.Load())
 }
 
+// TestBlobTxSubmitter_CtxCancelDuringSlotWait asserts that a goroutine
+// waiting for the broadcast slot aborts promptly when its context is
+// cancelled, and never reaches SendTransaction. Without ctx-awareness on
+// the slot acquire, the queued goroutine would be stuck until the prior
+// holder's WaitMined returns.
+//
+// Synchronization relies on the signTx hook firing after KZG/signing but
+// before the slot acquire select, giving the test a deterministic moment
+// at which G2 is about to block on the slot.
+func TestBlobTxSubmitter_CtxCancelDuringSlotWait(t *testing.T) {
+	t.Parallel()
+
+	var sendCalls atomic.Int32
+	backend := mockBlobTxBackend{
+		gasTipCap: big.NewInt(1),
+		sendCalls: &sendCalls,
+	}
+
+	g1InSlot := make(chan struct{})
+	g1Release := make(chan struct{})
+	waitMined := func(ctx context.Context, _ bind.DeployBackend, tx *types.Transaction) (*types.Receipt, error) {
+		close(g1InSlot)
+		select {
+		case <-g1Release:
+			return &types.Receipt{Status: types.ReceiptStatusSuccessful, TxHash: tx.Hash()}, nil
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
+
+	// signTx hook: fires g2Signed on the 2nd call (G2's), giving us a
+	// deterministic signal that G2 has finished KZG+signing and is about
+	// to enter the slot acquire select.
+	var signCount atomic.Int32
+	g2Signed := make(chan struct{})
+	signTxStub := func(tx *types.Transaction, signer types.Signer, key *ecdsa.PrivateKey) (*types.Transaction, error) {
+		result, err := types.SignTx(tx, signer, key)
+		if signCount.Add(1) == 2 {
+			close(g2Signed)
+		}
+		return result, err
+	}
+
+	submitter := &BlobTxSubmitter{
+		txBackend:   backend,
+		signingKey:  testSigningKey(t),
+		signTx:      signTxStub,
+		waitMined:   waitMined,
+		chainID:     big.NewInt(1),
+		nonceMgr:    &mockNonceManager{next: 7},
+		maxGasPrice: big.NewInt(2),
+	}
+
+	// G1 enters the slot and blocks in waitMined.
+	g1Done := make(chan struct{})
+	go func() {
+		defer close(g1Done)
+		_, err := submitter.SubmitBlobTx(context.Background(), []byte("g1-ciphertext"))
+		assert.NoError(t, err, "g1 should succeed after release")
+	}()
+
+	// Wait until G1 is holding the slot (generous timeout accounts for ~9s KZG).
+	select {
+	case <-g1InSlot:
+	case <-time.After(30 * time.Second):
+		close(g1Release)
+		<-g1Done
+		t.Fatal("g1 did not enter waitMined within 30s")
+	}
+
+	// G2 attempts acquire with a cancellable ctx.
+	ctx, cancel := context.WithCancel(context.Background())
+	g2ErrCh := make(chan error, 1)
+	go func() {
+		_, err := submitter.SubmitBlobTx(ctx, []byte("g2-ciphertext"))
+		g2ErrCh <- err
+	}()
+
+	// Wait until G2 has signed — it's now at the slot acquire select,
+	// blocked because G1 still holds the slot.
+	select {
+	case <-g2Signed:
+	case <-time.After(30 * time.Second):
+		close(g1Release)
+		<-g1Done
+		t.Fatal("g2 did not finish signing within 30s")
+	}
+
+	// Now cancel. With the ctx-aware slot, G2 exits promptly. Without
+	// the fix, G2 would block on Lock() indefinitely since G1 still holds.
+	cancelAt := time.Now()
+	cancel()
+
+	select {
+	case err := <-g2ErrCh:
+		require.Error(t, err)
+		assert.ErrorIs(t, err, context.Canceled)
+		assert.Less(t, time.Since(cancelAt), 500*time.Millisecond,
+			"g2 should exit within 500ms of cancel — slot must be ctx-aware")
+	case <-time.After(5 * time.Second):
+		close(g1Release)
+		<-g1Done
+		t.Fatal("g2 did not return within 5s of cancel — slot acquire is not ctx-aware")
+	}
+
+	assert.Equal(t, int32(1), sendCalls.Load(),
+		"g2 must not reach SendTransaction while blocked on ctx-cancelled slot wait")
+
+	// Release G1 to let the test complete cleanly.
+	close(g1Release)
+	<-g1Done
+}
+
+// TestBlobTxSubmitter_CtxCancelDuringWaitMined asserts that when the ctx
+// deadline expires while the holder is inside WaitMined, the holder returns
+// AND the broadcast slot is released so a subsequent caller is not starved.
+// Regression guard for a hanging EL connection blocking all following
+// broadcasts forever.
+func TestBlobTxSubmitter_CtxCancelDuringWaitMined(t *testing.T) {
+	t.Parallel()
+
+	var sendCalls atomic.Int32
+	backend := mockBlobTxBackend{
+		gasTipCap: big.NewInt(1),
+		sendCalls: &sendCalls,
+	}
+
+	// waitMined stub that hangs until ctx.Done fires, simulating a dead EL.
+	waitMined := func(ctx context.Context, _ bind.DeployBackend, _ *types.Transaction) (*types.Receipt, error) {
+		<-ctx.Done()
+		return nil, ctx.Err()
+	}
+
+	submitter := &BlobTxSubmitter{
+		txBackend:   backend,
+		signingKey:  testSigningKey(t),
+		waitMined:   waitMined,
+		chainID:     big.NewInt(1),
+		nonceMgr:    &mockNonceManager{next: 7},
+		maxGasPrice: big.NewInt(2),
+	}
+
+	// First call: reaches waitMined (pays ~9s KZG overhead), then hangs
+	// until ctx deadline fires. We give it 15s so it has time for KZG + a
+	// few seconds inside waitMined.
+	ctx1, cancel1 := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel1()
+	_, err := submitter.SubmitBlobTx(ctx1, []byte("ciphertext-1"))
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "wait for blob tx")
+	assert.Equal(t, int32(1), sendCalls.Load(), "first call should have broadcast")
+
+	// Second call: proves the slot was released. It ALSO pays ~9s KZG,
+	// reaches SendTransaction (sendCalls becomes 2), enters waitMined,
+	// and hangs until its own ctx deadline. The key assertion is that
+	// SendTransaction was reached at all — without slot release, the
+	// second call would block forever at slot acquire.
+	ctx2, cancel2 := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel2()
+	_, err = submitter.SubmitBlobTx(ctx2, []byte("ciphertext-2"))
+	require.Error(t, err)
+	assert.Equal(t, int32(2), sendCalls.Load(),
+		"second call must reach SendTransaction — slot was released after first call returned")
+}
+
 // Compile-time assertion
 var _ BlobSubmitter = (*BlobTxSubmitter)(nil)
 
@@ -172,10 +337,13 @@ type mockBlobTxBackend struct {
 	// Optional instrumentation for concurrency assertions. When inFlight and
 	// maxInFlight are set, SendTransaction increments inFlight on entry,
 	// bumps maxInFlight via CAS to the observed peak, optionally sleeps to
-	// widen the observation window, and decrements on exit.
+	// widen the observation window, and decrements on exit. sendCalls, if
+	// set, counts total SendTransaction invocations — used by cancellation
+	// tests to assert that a cancelled goroutine never reached broadcast.
 	inFlight    *atomic.Int32
 	maxInFlight *atomic.Int32
 	sendDelay   time.Duration
+	sendCalls   *atomic.Int32
 }
 
 func (m mockBlobTxBackend) SuggestGasTipCap(context.Context) (*big.Int, error) {
@@ -183,6 +351,9 @@ func (m mockBlobTxBackend) SuggestGasTipCap(context.Context) (*big.Int, error) {
 }
 
 func (m mockBlobTxBackend) SendTransaction(ctx context.Context, _ *types.Transaction) error {
+	if m.sendCalls != nil {
+		m.sendCalls.Add(1)
+	}
 	if m.inFlight != nil {
 		cur := m.inFlight.Add(1)
 		defer m.inFlight.Add(-1)
