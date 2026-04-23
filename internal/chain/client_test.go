@@ -233,10 +233,14 @@ func newTestChainClient(t *testing.T) *ChainClient {
 
 type mockRPCError struct {
 	code int
+	msg  string
 }
 
 func (e mockRPCError) Error() string {
-	return "rpc error"
+	if e.msg == "" {
+		return "rpc error"
+	}
+	return e.msg
 }
 
 func (e mockRPCError) ErrorCode() int {

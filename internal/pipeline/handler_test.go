@@ -679,7 +679,7 @@ func TestPublishToRedis_SignsContractCompatibleDigest(t *testing.T) {
 	require.NoError(t, err)
 
 	ciphertext := []byte("ciphertext-for-redis")
-	handler.publishToRedis(ctx, 42, 9, "corr-42", ciphertext)
+	handler.publishToRedis(ctx, handler.logger, 42, 9, "corr-42", ciphertext)
 
 	msg, err := sub.ReceiveMessage(ctx)
 	require.NoError(t, err)

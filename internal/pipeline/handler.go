@@ -136,57 +136,111 @@ func (h *JobHandler) HandleTask(ctx context.Context, task *asynq.Task) error {
 	h.jobCounter.Add(1)
 	defer h.jobCounter.Add(-1)
 
+	// Asynq populates retry metadata in the context on every invocation.
+	// retryCount is 0 on the first attempt and increments on each retry,
+	// which lets us distinguish a fresh job from a retried one without
+	// changing the task payload shape.
+	retryCount, _ := asynq.GetRetryCount(ctx)
+	maxRetry, _ := asynq.GetMaxRetry(ctx)
+
 	h.logger.Info("processing job",
 		"jobID", payload.JobID,
 		"sessionID", payload.SessionID,
 		"model", payload.ModelID,
 		"correlationID", payload.CorrelationID,
+		"attempt", retryCount+1,
+		"maxRetry", maxRetry,
+		"isRetry", retryCount > 0,
 	)
 
 	if err := h.processJob(ctx, payload); err != nil {
 		h.logger.Error("job failed",
 			"jobID", payload.JobID,
+			"attempt", retryCount+1,
+			"maxRetry", maxRetry,
+			"willRetry", retryCount < maxRetry,
 			"error", err,
 		)
 		return err
 	}
 
-	h.logger.Info("job completed", "jobID", payload.JobID)
+	h.logger.Info("job completed",
+		"jobID", payload.JobID,
+		"attempt", retryCount+1,
+	)
 	return nil
 }
 
 // processJob executes the 8-stage inference pipeline.
+//
+// A child logger tagged with job/session/correlation IDs is threaded through
+// every helper so each stage-boundary log line is automatically correlated
+// in Cloud Logging. Every stage emits at minimum a completion log with a
+// stable `stage` attribute and `durationMs` so slow/stuck stages are easy
+// to locate when debugging production traces.
 func (h *JobHandler) processJob(ctx context.Context, p JobPayload) error {
+	logger := h.logger.With(
+		"jobID", p.JobID,
+		"sessionID", p.SessionID,
+		"correlationID", p.CorrelationID,
+	)
+
 	// Stage 1: ACK — acknowledge job on-chain
-	if err := h.ensureAcknowledged(ctx, p.JobID); err != nil {
+	stageStart := time.Now()
+	if err := h.ensureAcknowledged(ctx, logger, p.JobID); err != nil {
 		return fmt.Errorf("stage 1 (ack): %w", err)
 	}
+	logger.Info("stage 1 complete",
+		"stage", "ack",
+		"durationMs", time.Since(stageStart).Milliseconds(),
+	)
 
 	// Stage 2: Fetch the prompt blob from the consensus layer. Post-audit
 	// each job carries a single bytes32 prompt blob hash.
 	if p.PromptBlobHash == (common.Hash{}) {
 		return fmt.Errorf("stage 2 (fetch blob): prompt blob hash is zero")
 	}
+	stageStart = time.Now()
+	logger.Info("stage 2 starting",
+		"stage", "fetch_blob",
+		"promptBlobHash", p.PromptBlobHash.Hex(),
+		"blockNumber", p.BlockNumber,
+	)
 	blobData, err := h.blobFetcher.FetchBlob(ctx, p.PromptBlobHash, p.BlockNumber)
 	if err != nil {
 		return fmt.Errorf("stage 2 (fetch blob %s): %w", p.PromptBlobHash.Hex(), err)
 	}
+	logger.Info("stage 2 complete",
+		"stage", "fetch_blob",
+		"blobBytes", len(blobData),
+		"durationMs", time.Since(stageStart).Milliseconds(),
+	)
 
 	// Stage 3: Get session key (cache miss → chain fetch → store)
-	sessionKey, err := h.getOrDeriveSessionKey(ctx, p.SessionID)
+	stageStart = time.Now()
+	sessionKey, err := h.getOrDeriveSessionKey(ctx, logger, p.SessionID)
 	if err != nil {
 		return fmt.Errorf("stage 3 (session key): %w", err)
 	}
+	logger.Info("stage 3 complete",
+		"stage", "session_key",
+		"durationMs", time.Since(stageStart).Milliseconds(),
+	)
 
 	// Stage 4: Decrypt prompt.
 	//
 	// On decryption failure, try refreshing the session key from chain once —
-	// the session key may have been rotated via updateSessionKey,
-	// emitting SessionKeyUpdated with a new encWorkerKey. GetSessionEncWorkerKey
-	// returns the newest event's key, so a refresh picks up the rotation.
+	// the session key may have been rotated via updateSessionKey.
+	// GetSessionEncWorkerKey reads session storage directly, so a refresh
+	// picks up the current key regardless of how it was set.
+	stageStart = time.Now()
 	prompt, err := pkgcrypto.Decrypt(sessionKey, blobData)
 	if err != nil {
-		refreshed, refreshErr := h.refreshSessionKey(ctx, p.SessionID)
+		logger.Warn("stage 4: initial decrypt failed, refreshing session key",
+			"stage", "decrypt",
+			"error", err,
+		)
+		refreshed, refreshErr := h.refreshSessionKey(ctx, logger, p.SessionID)
 		if refreshErr != nil {
 			return fmt.Errorf("stage 4 (decrypt prompt): %w (refresh failed: %v)", err, refreshErr)
 		}
@@ -196,6 +250,11 @@ func (h *JobHandler) processJob(ctx context.Context, p JobPayload) error {
 			return fmt.Errorf("stage 4 (decrypt prompt after key refresh): %w", err)
 		}
 	}
+	logger.Info("stage 4 complete",
+		"stage", "decrypt",
+		"promptBytes", len(prompt),
+		"durationMs", time.Since(stageStart).Milliseconds(),
+	)
 
 	// Stage 5: AI inference (with conversation history if prior jobs exist)
 	modelName, err := h.resolveModelName(p.ModelID)
@@ -206,17 +265,24 @@ func (h *JobHandler) processJob(ctx context.Context, p JobPayload) error {
 	var response string
 	var history []ollama.ChatMessage
 	if len(p.PriorJobIDs) > 0 {
-		var err error
-		history, err = h.buildConversationHistory(ctx, p.PriorJobIDs, sessionKey)
-		if err != nil {
-			h.logger.Warn("failed to build conversation history, falling back to single prompt",
-				"jobID", p.JobID,
-				"error", err,
+		var hErr error
+		history, hErr = h.buildConversationHistory(ctx, p.PriorJobIDs, sessionKey)
+		if hErr != nil {
+			logger.Warn("failed to build conversation history, falling back to single prompt",
+				"stage", "inference",
+				"error", hErr,
 			)
 			history = nil
 		}
 	}
 
+	stageStart = time.Now()
+	logger.Info("stage 5 starting",
+		"stage", "inference",
+		"model", modelName,
+		"promptBytes", len(prompt),
+		"historyTurns", len(history),
+	)
 	if len(history) > 0 {
 		messages := append(history, ollama.ChatMessage{Role: "user", Content: string(prompt)})
 		response, err = h.ollamaClient.Chat(ctx, modelName, messages)
@@ -229,20 +295,42 @@ func (h *JobHandler) processJob(ctx context.Context, p JobPayload) error {
 			return fmt.Errorf("stage 5 (inference): %w", err)
 		}
 	}
+	logger.Info("stage 5 complete",
+		"stage", "inference",
+		"model", modelName,
+		"responseBytes", len(response),
+		"durationMs", time.Since(stageStart).Milliseconds(),
+	)
 
 	// Stage 6: Encrypt response
+	stageStart = time.Now()
 	ciphertext, err := pkgcrypto.Encrypt(sessionKey, []byte(response))
 	if err != nil {
 		return fmt.Errorf("stage 6 (encrypt response): %w", err)
 	}
+	logger.Info("stage 6 complete",
+		"stage", "encrypt",
+		"ciphertextBytes", len(ciphertext),
+		"durationMs", time.Since(stageStart).Milliseconds(),
+	)
 
 	// Stage 7: Publish to Redis (non-fatal on error)
-	h.publishToRedis(ctx, p.JobID, p.SessionID, p.CorrelationID, ciphertext)
+	stageStart = time.Now()
+	h.publishToRedis(ctx, logger, p.JobID, p.SessionID, p.CorrelationID, ciphertext)
+	logger.Info("stage 7 complete",
+		"stage", "redis_publish",
+		"durationMs", time.Since(stageStart).Milliseconds(),
+	)
 
-	// Stage 8: Submit blob TX + complete job on-chain.
+	// Stage 8a: Submit blob TX.
 	// Post-audit the contract's completeJob takes a single bytes32
 	// responseBlobHash and enforces `blobhash(0) == responseBlobHash`, so the
 	// blob TX must carry exactly one blob.
+	stageStart = time.Now()
+	logger.Info("stage 8a starting",
+		"stage", "submit_blob",
+		"ciphertextBytes", len(ciphertext),
+	)
 	blobHashes, err := h.blobSubmitter.SubmitBlobTx(ctx, ciphertext)
 	if err != nil {
 		return fmt.Errorf("stage 8 (submit blob): %w", err)
@@ -250,23 +338,50 @@ func (h *JobHandler) processJob(ctx context.Context, p JobPayload) error {
 	if len(blobHashes) != 1 {
 		return fmt.Errorf("stage 8 (submit blob): expected exactly 1 blob hash, got %d", len(blobHashes))
 	}
+	versionedHash := common.Hash(blobHashes[0])
+	logger.Info("stage 8a complete",
+		"stage", "submit_blob",
+		"versionedHash", versionedHash.Hex(),
+		"durationMs", time.Since(stageStart).Milliseconds(),
+	)
 
+	// Stage 8b: Complete job on-chain.
+	stageStart = time.Now()
 	responseCiphertextHash := crypto.Keccak256Hash(ciphertext)
-	if err := h.completeJob(ctx, p.JobID, blobHashes[0], responseCiphertextHash); err != nil {
+	logger.Info("stage 8b starting",
+		"stage", "complete_job",
+		"versionedHash", versionedHash.Hex(),
+		"ciphertextHash", responseCiphertextHash.Hex(),
+	)
+	if err := h.completeJob(ctx, logger, p.JobID, blobHashes[0], responseCiphertextHash); err != nil {
 		return fmt.Errorf("stage 8 (complete job): %w", err)
 	}
+	logger.Info("stage 8b complete",
+		"stage", "complete_job",
+		"durationMs", time.Since(stageStart).Milliseconds(),
+	)
 
 	return nil
 }
 
-func (h *JobHandler) ensureAcknowledged(ctx context.Context, jobID uint64) error {
+func (h *JobHandler) ensureAcknowledged(ctx context.Context, logger *slog.Logger, jobID uint64) error {
 	acknowledged, err := h.chainClient.HasJobAcknowledged(ctx, jobID)
 	if err != nil {
 		return fmt.Errorf("check acknowledged state: %w", err)
 	}
 	if acknowledged {
+		logger.Info("stage 1: job already acknowledged on-chain, skipping ack tx",
+			"stage", "ack",
+			"path", "already_acked",
+		)
 		return nil
 	}
+
+	logger.Info("stage 1: sending ack tx",
+		"stage", "ack",
+		"path", "sending_ack",
+		"timeout", h.cfg.AckTxTimeout.String(),
+	)
 
 	ackCtx, ackCancel := context.WithTimeout(ctx, h.cfg.AckTxTimeout)
 	defer ackCancel()
@@ -277,6 +392,10 @@ func (h *JobHandler) ensureAcknowledged(ctx context.Context, jobID uint64) error
 			return fmt.Errorf("acknowledge job: %w (recheck failed: %v)", err, checkErr)
 		}
 		if acknowledged {
+			logger.Warn("stage 1: ack tx returned error but job is acknowledged on-chain",
+				"stage", "ack",
+				"error", err,
+			)
 			return nil
 		}
 		return fmt.Errorf("acknowledge job: %w", err)
@@ -287,6 +406,7 @@ func (h *JobHandler) ensureAcknowledged(ctx context.Context, jobID uint64) error
 
 func (h *JobHandler) completeJob(
 	ctx context.Context,
+	logger *slog.Logger,
 	jobID uint64,
 	responseBlobHash [32]byte,
 	responseCiphertextHash [32]byte,
@@ -297,6 +417,10 @@ func (h *JobHandler) completeJob(
 			return fmt.Errorf("complete job: %w (recheck failed: %v)", err, checkErr)
 		}
 		if completed {
+			logger.Warn("stage 8b: completeJob tx returned error but job is completed on-chain",
+				"stage", "complete_job",
+				"error", err,
+			)
 			return nil
 		}
 		return fmt.Errorf("complete job: %w", err)
@@ -306,28 +430,39 @@ func (h *JobHandler) completeJob(
 }
 
 // getOrDeriveSessionKey tries the cache first, then derives from chain on miss.
-func (h *JobHandler) getOrDeriveSessionKey(ctx context.Context, sessionID uint64) ([]byte, error) {
+func (h *JobHandler) getOrDeriveSessionKey(ctx context.Context, logger *slog.Logger, sessionID uint64) ([]byte, error) {
 	key, err := h.keyStore.GetKey(sessionID)
 	if err == nil {
+		logger.Info("stage 3: session key cache hit",
+			"stage", "session_key",
+			"path", "cache_hit",
+		)
 		return key, nil
 	}
-	return h.deriveAndStoreSessionKey(ctx, sessionID)
+	logger.Info("stage 3: session key cache miss, deriving from chain",
+		"stage", "session_key",
+		"path", "chain_derive",
+	)
+	return h.deriveAndStoreSessionKey(ctx, logger, sessionID)
 }
 
 // refreshSessionKey skips the local cache and derives the latest session key
 // directly from chain events. Used on decryption failure to pick up a rotated
 // session key.
-func (h *JobHandler) refreshSessionKey(ctx context.Context, sessionID uint64) ([]byte, error) {
-	h.logger.Info("refreshing session key from chain", "sessionID", sessionID)
-	return h.deriveAndStoreSessionKey(ctx, sessionID)
+func (h *JobHandler) refreshSessionKey(ctx context.Context, logger *slog.Logger, sessionID uint64) ([]byte, error) {
+	logger.Info("stage 4: refreshing session key from chain (possible rotation)",
+		"stage", "session_key",
+		"path", "refresh",
+	)
+	return h.deriveAndStoreSessionKey(ctx, logger, sessionID)
 }
 
 // deriveAndStoreSessionKey fetches the latest encrypted worker key for the
 // session from chain, decrypts it with the worker's ECDH private key, and
-// stores the result in the local keystore. The on-chain query returns the
-// most recent SessionKeyUpdated event if one exists, falling back to
-// SessionCreated — so this always yields the current live key.
-func (h *JobHandler) deriveAndStoreSessionKey(ctx context.Context, sessionID uint64) ([]byte, error) {
+// stores the result in the local keystore. The on-chain query reads session
+// storage directly via GetSession, so this always yields the current live
+// key whether set at creation or after rotation.
+func (h *JobHandler) deriveAndStoreSessionKey(ctx context.Context, logger *slog.Logger, sessionID uint64) ([]byte, error) {
 	encWorkerKey, err := h.chainClient.GetSessionEncWorkerKey(ctx, sessionID)
 	if err != nil {
 		return nil, fmt.Errorf("fetch enc worker key for session %d: %w", sessionID, err)
@@ -340,7 +475,10 @@ func (h *JobHandler) deriveAndStoreSessionKey(ctx context.Context, sessionID uin
 
 	if err := h.keyStore.StoreKey(sessionID, sessionKey); err != nil {
 		// Log but don't fail — key is in memory for this job
-		h.logger.Warn("failed to persist session key", "sessionID", sessionID, "error", err)
+		logger.Warn("failed to persist session key",
+			"stage", "session_key",
+			"error", err,
+		)
 	}
 
 	return sessionKey, nil
@@ -376,13 +514,17 @@ func init() {
 // Errors are logged but non-fatal — the on-chain blob is the authoritative response.
 func (h *JobHandler) publishToRedis(
 	ctx context.Context,
+	logger *slog.Logger,
 	jobID, sessionID uint64,
 	correlationID string,
 	ciphertext []byte,
 ) {
 	sig, err := signMismatchEvidence(h.cfg.ChainID, h.cfg.JobRegistryAddr, jobID, sessionID, ciphertext, h.signingKey)
 	if err != nil {
-		h.logger.Warn("failed to sign response for Redis", "jobID", jobID, "error", err)
+		logger.Warn("failed to sign response for Redis",
+			"stage", "redis_publish",
+			"error", err,
+		)
 		return
 	}
 
@@ -400,13 +542,20 @@ func (h *JobHandler) publishToRedis(
 
 	data, err := json.Marshal(resp)
 	if err != nil {
-		h.logger.Warn("failed to marshal response for Redis", "jobID", jobID, "error", err)
+		logger.Warn("failed to marshal response for Redis",
+			"stage", "redis_publish",
+			"error", err,
+		)
 		return
 	}
 
 	channel := fmt.Sprintf("session:%d:responses", sessionID)
 	if err := h.redisClient.Publish(ctx, channel, data).Err(); err != nil {
-		h.logger.Warn("failed to publish response to Redis", "jobID", jobID, "channel", channel, "error", err)
+		logger.Warn("failed to publish response to Redis",
+			"stage", "redis_publish",
+			"channel", channel,
+			"error", err,
+		)
 	}
 }
 

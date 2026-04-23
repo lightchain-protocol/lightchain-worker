@@ -179,6 +179,7 @@ func New(cfg *config.Config) (*Service, error) {
 			big.NewInt(cfg.ChainID),
 			chainClient.NonceManager(),
 			cfg.MaxGasPrice,
+			logger,
 		)
 		logger.Info("blob mode: eip-4844 (beacon)")
 	default:
