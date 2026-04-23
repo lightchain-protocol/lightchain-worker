@@ -381,6 +381,7 @@ func NewRealChainClient(t testing.TB, opts RealChainClientOptions) ChainClient {
 		opts.JobRegistryAddress,
 		opts.SigningKey,
 		opts.GasPriceMultiplierBps,
+		workerchain.NewBroadcastSerializer(),
 	)
 	if err != nil {
 		t.Fatalf("workertest: create real chain client: %v", err)

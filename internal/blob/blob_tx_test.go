@@ -16,6 +16,8 @@ import (
 	"github.com/ethereum/go-ethereum/crypto"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	workerchain "github.com/lightchain/worker/internal/chain"
 )
 
 func TestBlobTxSubmitter_ResetNonceOnSignFailure(t *testing.T) {
@@ -342,6 +344,58 @@ func TestBlobTxSubmitter_ResetsNonceOnWaitMinedFailure(t *testing.T) {
 	assert.Contains(t, err.Error(), "wait for blob tx")
 	assert.Equal(t, 1, nonceMgr.resetCalls,
 		"ResetNonce must fire on WaitMined failure so next broadcast refetches chain pending")
+}
+
+// TestBlobTxSubmitter_BlocksOnExternallyHeldSlot mirrors the chain-package
+// test on the blob side: when the same BroadcastSerializer is held by an
+// external goroutine (simulating a concurrent ChainClient.submitPreparedTx
+// broadcast), SubmitBlobTx must not reach SendTransaction until released.
+// Together with the chain-side test, this proves the Hazard A invariant
+// end-to-end across both submitter implementations.
+func TestBlobTxSubmitter_BlocksOnExternallyHeldSlot(t *testing.T) {
+	t.Parallel()
+
+	var sendCalls atomic.Int32
+	serializer := workerchain.NewBroadcastSerializer()
+	submitter := &BlobTxSubmitter{
+		txBackend:   mockBlobTxBackend{gasTipCap: big.NewInt(1), sendCalls: &sendCalls},
+		signingKey:  testSigningKey(t),
+		waitMined: func(ctx context.Context, _ bind.DeployBackend, tx *types.Transaction) (*types.Receipt, error) {
+			return &types.Receipt{Status: types.ReceiptStatusSuccessful, TxHash: tx.Hash()}, nil
+		},
+		chainID:     big.NewInt(1),
+		nonceMgr:    &mockNonceManager{next: 7},
+		maxGasPrice: big.NewInt(2),
+		serializer:  serializer,
+	}
+
+	// External holder simulates a concurrent ChainClient broadcast in
+	// its SendTransaction..WaitMined window on the SAME serializer.
+	require.NoError(t, serializer.Acquire(context.Background()))
+
+	submitDone := make(chan error, 1)
+	go func() {
+		_, err := submitter.SubmitBlobTx(context.Background(), []byte("ciphertext"))
+		submitDone <- err
+	}()
+
+	// Wait past the ~9s KZG overhead so we know the submitter has
+	// reached the slot acquire select, then verify it's blocked.
+	time.Sleep(11 * time.Second)
+	assert.Equal(t, int32(0), sendCalls.Load(),
+		"SubmitBlobTx must not reach SendTransaction while external holder owns the shared serializer")
+
+	// Release; SubmitBlobTx should now proceed to a successful broadcast.
+	serializer.Release()
+
+	select {
+	case err := <-submitDone:
+		require.NoError(t, err)
+		assert.Equal(t, int32(1), sendCalls.Load(),
+			"SendTransaction must fire exactly once after external holder releases")
+	case <-time.After(5 * time.Second):
+		t.Fatal("SubmitBlobTx did not proceed within 5s of external release — shared slot is not actually shared")
+	}
 }
 
 // Compile-time assertion

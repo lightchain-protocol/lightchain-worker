@@ -107,6 +107,12 @@ func New(cfg *config.Config) (*Service, error) {
 		modelIDToName[strings.TrimPrefix(strings.ToLower(modelHex), "0x")] = cfg.SupportedModels[i]
 	}
 
+	// Per-signing-key broadcast serializer. ONE instance is shared across
+	// every tx submission path (BlobTxSubmitter and ChainClient) so
+	// go-ethereum's sender-wide txpool reservation can't produce blob-vs-ACK
+	// or blob-vs-CompleteJob collisions under concurrent jobs.
+	broadcastSerializer := chain.NewBroadcastSerializer()
+
 	// Dial chain (now includes JobRegistry binding)
 	chainClient, err := chain.NewChainClient(
 		cfg.RPCURL,
@@ -116,6 +122,7 @@ func New(cfg *config.Config) (*Service, error) {
 		cfg.JobRegistryAddress,
 		signingKey,
 		cfg.GasPriceMultiplierBps,
+		broadcastSerializer,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("connect to chain: %w", err)
@@ -179,6 +186,7 @@ func New(cfg *config.Config) (*Service, error) {
 			big.NewInt(cfg.ChainID),
 			chainClient.NonceManager(),
 			cfg.MaxGasPrice,
+			broadcastSerializer,
 			logger,
 		)
 		logger.Info("blob mode: eip-4844 (beacon)")

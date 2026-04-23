@@ -41,69 +41,69 @@ type BlobTxBackend interface {
 
 // BlobTxSubmitter builds and submits type-3 (EIP-4844) blob transactions.
 //
-// broadcastSlot serializes the SendTransaction..WaitMined window so that at
-// most one blob tx per submitter is in-flight on the execution layer at a
-// time. Go-ethereum's txpool rejects a second blob tx from the same sender
-// with ErrAlreadyReserved while a prior one is still pending; since a single
-// worker has a single signing key, this slot enforces that invariant across
-// concurrent asynq worker goroutines.
+// The SendTransaction..WaitMined window is serialized by a shared
+// chain.BroadcastSerializer (see internal/chain/broadcast.go). The
+// serializer is per-signing-key, so the same instance is injected into
+// BOTH this submitter and ChainClient — go-ethereum's txpool reservation
+// is sender-wide, meaning a blob tx pending for sender S blocks any
+// concurrent non-blob tx from S as well.
 //
-// Unlike sync.Mutex, the slot is a buffered channel of size 1 used as a
-// ctx-aware binary semaphore: empty = unlocked, sending acquires, receiving
-// releases. Acquisition respects ctx.Done() so a cancelled job (e.g. during
-// worker shutdown) aborts promptly instead of waiting out the current
-// holder's WaitMined. broadcastSlotOnce lazy-initializes the channel so tests
-// that construct via struct literal do not need to pre-seed it.
+// serializerOnce lazy-initializes the serializer when constructed via
+// struct literal without one (the NewBlobTxSubmitter constructor injects
+// the shared instance from the service layer).
 type BlobTxSubmitter struct {
-	ethClient         *ethclient.Client
-	txBackend         BlobTxBackend
-	signingKey        *ecdsa.PrivateKey
-	signTx            func(tx *types.Transaction, signer types.Signer, key *ecdsa.PrivateKey) (*types.Transaction, error)
-	waitMined         func(ctx context.Context, b bind.DeployBackend, tx *types.Transaction) (*types.Receipt, error)
-	chainID           *big.Int
-	nonceMgr          NonceManager
-	maxGasPrice       *big.Int
-	broadcastSlot     chan struct{}
-	broadcastSlotOnce sync.Once
+	ethClient      *ethclient.Client
+	txBackend      BlobTxBackend
+	signingKey     *ecdsa.PrivateKey
+	signTx         func(tx *types.Transaction, signer types.Signer, key *ecdsa.PrivateKey) (*types.Transaction, error)
+	waitMined      func(ctx context.Context, b bind.DeployBackend, tx *types.Transaction) (*types.Receipt, error)
+	chainID        *big.Int
+	nonceMgr       NonceManager
+	maxGasPrice    *big.Int
+	serializer     *workerchain.BroadcastSerializer
+	serializerOnce sync.Once
 	// logger is optional. When nil, no structured logs are emitted. Tests
 	// that construct BlobTxSubmitter via struct literal may leave this nil;
 	// the production constructor wires in the service-level logger.
 	logger *slog.Logger
 }
 
-// slot lazily initializes and returns the broadcast serialization channel.
-// Safe for concurrent use via sync.Once.
-func (s *BlobTxSubmitter) slot() chan struct{} {
-	s.broadcastSlotOnce.Do(func() {
-		if s.broadcastSlot == nil {
-			s.broadcastSlot = make(chan struct{}, 1)
+// broadcastSerializer returns the shared serializer, lazy-initializing a
+// private one if none was injected (useful for tests that construct via
+// struct literal and don't care about cross-submitter sharing).
+func (s *BlobTxSubmitter) broadcastSerializer() *workerchain.BroadcastSerializer {
+	s.serializerOnce.Do(func() {
+		if s.serializer == nil {
+			s.serializer = workerchain.NewBroadcastSerializer()
 		}
 	})
-	return s.broadcastSlot
+	return s.serializer
 }
 
 // NewBlobTxSubmitter creates a BlobTxSubmitter. The logger may be nil; when
 // nil, structured logs are suppressed (useful for tests that inject their own
-// instrumentation via struct literals).
+// instrumentation via struct literals). The serializer must be the shared
+// per-signing-key instance — see BroadcastSerializer's package docs.
 func NewBlobTxSubmitter(
 	ethClient *ethclient.Client,
 	signingKey *ecdsa.PrivateKey,
 	chainID *big.Int,
 	nonceMgr NonceManager,
 	maxGasPrice *big.Int,
+	serializer *workerchain.BroadcastSerializer,
 	logger *slog.Logger,
 ) *BlobTxSubmitter {
 	return &BlobTxSubmitter{
-		ethClient:     ethClient,
-		txBackend:     ethClient,
-		signingKey:    signingKey,
-		signTx:        types.SignTx,
-		waitMined:     bind.WaitMined,
-		chainID:       chainID,
-		nonceMgr:      nonceMgr,
-		maxGasPrice:   maxGasPrice,
-		broadcastSlot: make(chan struct{}, 1),
-		logger:        logger,
+		ethClient:   ethClient,
+		txBackend:   ethClient,
+		signingKey:  signingKey,
+		signTx:      types.SignTx,
+		waitMined:   bind.WaitMined,
+		chainID:     chainID,
+		nonceMgr:    nonceMgr,
+		maxGasPrice: maxGasPrice,
+		serializer:  serializer,
+		logger:      logger,
 	}
 }
 
@@ -184,12 +184,9 @@ func (s *BlobTxSubmitter) SubmitBlobTx(ctx context.Context, data []byte) ([][32]
 			"nonce", nonce,
 		)
 	}
-	slot := s.slot()
+	serializer := s.broadcastSerializer()
 	mutexWaitStart := time.Now()
-	select {
-	case slot <- struct{}{}:
-		// acquired
-	case <-ctx.Done():
+	if err := serializer.Acquire(ctx); err != nil {
 		mutexWaitMs := time.Since(mutexWaitStart).Milliseconds()
 		if s.logger != nil {
 			s.logger.Warn("ctx cancelled waiting for broadcast slot",
@@ -197,12 +194,12 @@ func (s *BlobTxSubmitter) SubmitBlobTx(ctx context.Context, data []byte) ([][32]
 				"txHash", txHash.Hex(),
 				"nonce", nonce,
 				"mutexWaitMs", mutexWaitMs,
-				"error", ctx.Err(),
+				"error", err,
 			)
 		}
-		return nil, fmt.Errorf("wait for blob broadcast slot: %w", ctx.Err())
+		return nil, fmt.Errorf("wait for blob broadcast slot: %w", err)
 	}
-	defer func() { <-slot }()
+	defer serializer.Release()
 	mutexWaitMs := time.Since(mutexWaitStart).Milliseconds()
 
 	broadcastStart := time.Now()

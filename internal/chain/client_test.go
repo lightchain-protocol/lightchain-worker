@@ -4,6 +4,7 @@ import (
 	"context"
 	"math/big"
 	"testing"
+	"time"
 
 	"github.com/ethereum/go-ethereum/accounts/abi/bind"
 	"github.com/ethereum/go-ethereum/common"
@@ -184,6 +185,95 @@ func TestSubmitPreparedTx_ResetsNonceOnPreBroadcastSendFailure(t *testing.T) {
 	assert.Contains(t, err.Error(), "send CompleteJob tx")
 	assert.False(t, client.nonceMgr.initialized, "definite pre-broadcast failure must reset the nonce manager")
 	assert.Equal(t, 1, client.jobTxBackend.(*mockJobTxBackend).sendCalls)
+}
+
+// TestSubmitPreparedTx_BlocksOnExternallyHeldSlot asserts that the shared
+// BroadcastSerializer actually serializes across submitters: a goroutine
+// holding the serializer (simulating a concurrent BlobTxSubmitter in-flight)
+// prevents submitPreparedTx from reaching SendTransaction. This is the
+// Hazard A invariant — go-ethereum's txpool reservation is sender-wide, so
+// one shared serializer must cover blob AND non-blob paths.
+func TestSubmitPreparedTx_BlocksOnExternallyHeldSlot(t *testing.T) {
+	t.Parallel()
+
+	serializer := NewBroadcastSerializer()
+	client := newTestChainClient(t)
+	client.serializer = serializer
+	// Fail SendTransaction cheaply so submitPreparedTx returns without
+	// needing a real ethClient for WaitMined.
+	client.jobTxBackend.(*mockJobTxBackend).sendErr = assert.AnError
+
+	// External holder simulates a concurrent BlobTxSubmitter broadcast in
+	// its SendTransaction..WaitMined window. Same serializer pointer => any
+	// concurrent submitPreparedTx must block.
+	require.NoError(t, serializer.Acquire(context.Background()))
+
+	submitDone := make(chan error, 1)
+	go func() {
+		submitDone <- client.submitPreparedTx(context.Background(), "AcknowledgeJob", nil, func(opts *bind.TransactOpts) (*types.Transaction, error) {
+			return types.NewTx(&types.LegacyTx{Nonce: opts.Nonce.Uint64()}), nil
+		})
+	}()
+
+	// Give the goroutine time to progress past NextNonce+build and arrive
+	// at the serializer.Acquire select — then verify it's blocked.
+	time.Sleep(100 * time.Millisecond)
+	assert.Equal(t, 0, client.jobTxBackend.(*mockJobTxBackend).sendCalls,
+		"submitPreparedTx must not reach SendTransaction while external holder owns the shared serializer")
+
+	// Release the external holder; submitPreparedTx should now proceed,
+	// fail its SendTransaction (due to injected sendErr), and return.
+	serializer.Release()
+
+	select {
+	case err := <-submitDone:
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "send AcknowledgeJob tx")
+		assert.Equal(t, 1, client.jobTxBackend.(*mockJobTxBackend).sendCalls,
+			"SendTransaction must fire exactly once after external holder releases")
+	case <-time.After(2 * time.Second):
+		t.Fatal("submitPreparedTx did not proceed within 2s of external release — shared slot is not actually shared")
+	}
+}
+
+// TestSubmitPreparedTx_CtxCancelDuringSlotWait asserts that a submitPreparedTx
+// call blocked on the shared serializer exits promptly on ctx cancel without
+// reaching SendTransaction. Regression guard for asynq task cancellation
+// propagating through the non-blob broadcast path.
+func TestSubmitPreparedTx_CtxCancelDuringSlotWait(t *testing.T) {
+	t.Parallel()
+
+	serializer := NewBroadcastSerializer()
+	client := newTestChainClient(t)
+	client.serializer = serializer
+
+	// External holder keeps the slot until the test ends.
+	require.NoError(t, serializer.Acquire(context.Background()))
+	defer serializer.Release()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	submitDone := make(chan error, 1)
+	go func() {
+		submitDone <- client.submitPreparedTx(ctx, "AcknowledgeJob", nil, func(opts *bind.TransactOpts) (*types.Transaction, error) {
+			return types.NewTx(&types.LegacyTx{Nonce: opts.Nonce.Uint64()}), nil
+		})
+	}()
+
+	time.Sleep(50 * time.Millisecond)
+	cancelAt := time.Now()
+	cancel()
+
+	select {
+	case err := <-submitDone:
+		require.Error(t, err)
+		assert.ErrorIs(t, err, context.Canceled)
+		assert.Less(t, time.Since(cancelAt), 500*time.Millisecond,
+			"submitPreparedTx must exit within 500ms of ctx cancel")
+		assert.Equal(t, 0, client.jobTxBackend.(*mockJobTxBackend).sendCalls,
+			"SendTransaction must not fire when ctx is cancelled during slot wait")
+	case <-time.After(2 * time.Second):
+		t.Fatal("submitPreparedTx did not return within 2s of ctx cancel — serializer.Acquire is not ctx-aware")
+	}
 }
 
 type staticNonceFetcher struct {

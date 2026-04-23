@@ -5,6 +5,7 @@ import (
 	"crypto/ecdsa"
 	"fmt"
 	"math/big"
+	"sync"
 
 	"github.com/ethereum/go-ethereum/accounts/abi/bind"
 	"github.com/ethereum/go-ethereum/common"
@@ -37,6 +38,11 @@ type ChainClient struct {
 	chainID         *big.Int
 	gasPriceMulBps  int
 	nonceMgr        *NonceManager
+	// serializer is the per-sender broadcast serializer, shared with
+	// BlobTxSubmitter via injection at the service layer. Nil-safe via
+	// broadcastSerializer() lazy init for tests that don't inject one.
+	serializer     *BroadcastSerializer
+	serializerOnce sync.Once
 }
 
 type jobTxBackend interface {
@@ -46,6 +52,7 @@ type jobTxBackend interface {
 
 // NewChainClient dials the RPC endpoint, instantiates the contract bindings, and
 // returns a ChainClient ready to submit registration and job transactions.
+// serializer must be the shared per-signing-key broadcast serializer.
 func NewChainClient(
 	rpcURL string,
 	chainID int64,
@@ -54,6 +61,7 @@ func NewChainClient(
 	jobRegistryAddr common.Address,
 	signingKey *ecdsa.PrivateKey,
 	gasMulBps int,
+	serializer *BroadcastSerializer,
 ) (*ChainClient, error) {
 	if signingKey == nil {
 		return nil, fmt.Errorf("signingKey must not be nil")
@@ -106,7 +114,20 @@ func NewChainClient(
 		chainID:         big.NewInt(chainID),
 		gasPriceMulBps:  gasMulBps,
 		nonceMgr:        nonceMgr,
+		serializer:      serializer,
 	}, nil
+}
+
+// broadcastSerializer returns the shared serializer, lazy-initializing a
+// private one if none was injected (useful for tests that construct
+// ChainClient via struct literal and don't need cross-submitter sharing).
+func (c *ChainClient) broadcastSerializer() *BroadcastSerializer {
+	c.serializerOnce.Do(func() {
+		if c.serializer == nil {
+			c.serializer = NewBroadcastSerializer()
+		}
+	})
+	return c.serializer
 }
 
 // Close shuts down the underlying ethclient connection.
@@ -218,6 +239,24 @@ func (c *ChainClient) submitPreparedTx(
 		c.nonceMgr.ResetNonce()
 		return fmt.Errorf("%s transaction: %w", txName, err)
 	}
+
+	// Acquire the shared per-sender broadcast slot before SendTransaction.
+	// Held until after WaitMined returns so no concurrent blob tx from
+	// BlobTxSubmitter can collide with this broadcast on go-ethereum's
+	// sender-wide ErrAlreadyReserved. Ctx-aware so a cancelled task
+	// drops out promptly if another holder is stuck in WaitMined.
+	//
+	// Nonce was allocated above; on ctx cancel here we do NOT reset —
+	// the tx never went out, but another concurrent caller may have
+	// observed a higher nonce downstream and a reset would cause them
+	// to refetch. The allocated nonce simply goes unused; the chain's
+	// PendingNonceAt will not regress, so next NextNonce just proceeds
+	// past it. A retry will reclaim it via ResetNonce if needed.
+	serializer := c.broadcastSerializer()
+	if err := serializer.Acquire(ctx); err != nil {
+		return fmt.Errorf("wait for %s broadcast slot: %w", txName, err)
+	}
+	defer serializer.Release()
 
 	if err := backend.SendTransaction(ctx, tx); err != nil {
 		if ShouldResetNonceOnSendError(err) {

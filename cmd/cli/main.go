@@ -260,6 +260,7 @@ func dialChain(cfg *config.RegistrationConfig, signingKey *ecdsa.PrivateKey, log
 		common.Address{}, // jobRegistryAddr — not needed for CLI operations
 		signingKey,
 		cfg.GasPriceMultiplierBps,
+		chain.NewBroadcastSerializer(),
 	)
 	if err != nil {
 		logger.Error("failed to connect to chain", "error", err)
