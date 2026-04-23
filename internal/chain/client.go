@@ -5,6 +5,7 @@ import (
 	"crypto/ecdsa"
 	"fmt"
 	"math/big"
+	"strings"
 	"sync"
 
 	"github.com/ethereum/go-ethereum/accounts/abi/bind"
@@ -43,6 +44,11 @@ type ChainClient struct {
 	// broadcastSerializer() lazy init for tests that don't inject one.
 	serializer     *BroadcastSerializer
 	serializerOnce sync.Once
+	// stuckTracker is the shared per-sender stuck-nonce tracker. Also
+	// shared with BlobTxSubmitter. Nil-safe via stuckNonceTracker()
+	// lazy init for tests that don't inject one.
+	stuckTracker     *StuckNonceTracker
+	stuckTrackerOnce sync.Once
 }
 
 type jobTxBackend interface {
@@ -52,7 +58,7 @@ type jobTxBackend interface {
 
 // NewChainClient dials the RPC endpoint, instantiates the contract bindings, and
 // returns a ChainClient ready to submit registration and job transactions.
-// serializer must be the shared per-signing-key broadcast serializer.
+// serializer and stuckTracker must be the shared per-signing-key instances.
 func NewChainClient(
 	rpcURL string,
 	chainID int64,
@@ -62,6 +68,7 @@ func NewChainClient(
 	signingKey *ecdsa.PrivateKey,
 	gasMulBps int,
 	serializer *BroadcastSerializer,
+	stuckTracker *StuckNonceTracker,
 ) (*ChainClient, error) {
 	if signingKey == nil {
 		return nil, fmt.Errorf("signingKey must not be nil")
@@ -115,6 +122,7 @@ func NewChainClient(
 		gasPriceMulBps:  gasMulBps,
 		nonceMgr:        nonceMgr,
 		serializer:      serializer,
+		stuckTracker:    stuckTracker,
 	}, nil
 }
 
@@ -128,6 +136,19 @@ func (c *ChainClient) broadcastSerializer() *BroadcastSerializer {
 		}
 	})
 	return c.serializer
+}
+
+// stuckNonceTracker returns the shared tracker, lazy-initializing a private
+// one if none was injected. Shared with BlobTxSubmitter in production so
+// hits from the non-blob path accumulate into the blob path's replacement
+// decision.
+func (c *ChainClient) stuckNonceTracker() *StuckNonceTracker {
+	c.stuckTrackerOnce.Do(func() {
+		if c.stuckTracker == nil {
+			c.stuckTracker = NewStuckNonceTracker()
+		}
+	})
+	return c.stuckTracker
 }
 
 // Close shuts down the underlying ethclient connection.
@@ -262,6 +283,16 @@ func (c *ChainClient) submitPreparedTx(
 		if ShouldResetNonceOnSendError(err) {
 			c.nonceMgr.ResetNonce()
 		}
+		// Stuck-nonce detection (Hazard B): record "address already
+		// reserved" hits at this nonce into the shared tracker. The
+		// blob-tx path watches this counter and triggers replacement
+		// when it crosses the threshold. Non-blob txs cannot themselves
+		// evict a stuck blob from the pool (go-ethereum blob pool only
+		// accepts blob replacements), so we defer the actual fix to
+		// the next blob broadcast's decision.
+		if strings.Contains(err.Error(), "address already reserved") {
+			c.stuckNonceTracker().Record(tx.Nonce())
+		}
 		return fmt.Errorf("send %s tx: %w", txName, err)
 	}
 
@@ -282,6 +313,10 @@ func (c *ChainClient) submitPreparedTx(
 	if err := checkReceipt(receipt, txName); err != nil {
 		return err
 	}
+
+	// A mined receipt means this tx is no longer in the pool. Clear the
+	// stuck tracker — future rejections at a new nonce start fresh.
+	c.stuckNonceTracker().Clear()
 
 	return nil
 }

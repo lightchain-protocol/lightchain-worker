@@ -346,6 +346,80 @@ func TestBlobTxSubmitter_ResetsNonceOnWaitMinedFailure(t *testing.T) {
 		"ResetNonce must fire on WaitMined failure so next broadcast refetches chain pending")
 }
 
+// TestBlobTxSubmitter_DetectsStuckNonce_BelowThreshold asserts that
+// repeated "address already reserved" rejections at the same nonce bump
+// the shared tracker's hit count, but replacement is NOT triggered while
+// below the configured threshold. Commit H is detection-only; Commit I
+// wires the replacement.
+func TestBlobTxSubmitter_DetectsStuckNonce_BelowThreshold(t *testing.T) {
+	t.Parallel()
+
+	tracker := workerchain.NewStuckNonceTracker()
+	submitter := &BlobTxSubmitter{
+		txBackend: mockBlobTxBackend{
+			gasTipCap: big.NewInt(1),
+			sendErr:   errors.New("eth_sendRawTransaction: address already reserved"),
+		},
+		signingKey:   testSigningKey(t),
+		chainID:      big.NewInt(1),
+		nonceMgr:     &mockNonceManager{next: 152},
+		maxGasPrice:  big.NewInt(2),
+		stuckTracker: tracker,
+		stuckCfg:     StuckNonceConfig{Threshold: 5, MaxBumps: 3, AutoReplace: true},
+	}
+
+	// Four consecutive rejections — below threshold of 5.
+	for i := 0; i < 4; i++ {
+		_, err := submitter.SubmitBlobTx(context.Background(), []byte("ciphertext"))
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "address already reserved")
+	}
+
+	assert.Equal(t, 4, tracker.ConsecutiveHits(),
+		"4 consecutive rejections at same nonce must produce 4 tracker hits")
+	n, ok := tracker.LastNonce()
+	assert.True(t, ok)
+	assert.Equal(t, uint64(152), n)
+	assert.Equal(t, 0, tracker.BumpAttemptsUsed(),
+		"no bump attempts must fire below threshold")
+}
+
+// TestBlobTxSubmitter_ClearsOnSuccessfulMine asserts that a successful
+// blob tx mining resets the stuck tracker so a subsequent rejection at a
+// different nonce starts from clean state.
+func TestBlobTxSubmitter_ClearsOnSuccessfulMine(t *testing.T) {
+	t.Parallel()
+
+	tracker := workerchain.NewStuckNonceTracker()
+	// Preload tracker with a stale "stuck" state that predates this tx.
+	tracker.Record(151)
+	tracker.Record(151)
+	tracker.Record(151)
+	require.Equal(t, 3, tracker.ConsecutiveHits())
+
+	submitter := &BlobTxSubmitter{
+		txBackend:  mockBlobTxBackend{gasTipCap: big.NewInt(1)},
+		signingKey: testSigningKey(t),
+		waitMined: func(ctx context.Context, _ bind.DeployBackend, tx *types.Transaction) (*types.Receipt, error) {
+			return &types.Receipt{Status: types.ReceiptStatusSuccessful, TxHash: tx.Hash()}, nil
+		},
+		chainID:      big.NewInt(1),
+		nonceMgr:     &mockNonceManager{next: 152},
+		maxGasPrice:  big.NewInt(2),
+		stuckTracker: tracker,
+		stuckCfg:     StuckNonceConfig{Threshold: 5, MaxBumps: 3, AutoReplace: true},
+	}
+
+	_, err := submitter.SubmitBlobTx(context.Background(), []byte("ciphertext"))
+	require.NoError(t, err)
+
+	assert.Equal(t, 0, tracker.ConsecutiveHits(),
+		"successful mine must clear the tracker")
+	_, ok := tracker.LastNonce()
+	assert.False(t, ok,
+		"successful mine must clear the tracked nonce observation")
+}
+
 // TestBlobTxSubmitter_BlocksOnExternallyHeldSlot mirrors the chain-package
 // test on the blob side: when the same BroadcastSerializer is held by an
 // external goroutine (simulating a concurrent ChainClient.submitPreparedTx

@@ -113,6 +113,11 @@ func New(cfg *config.Config) (*Service, error) {
 	// or blob-vs-CompleteJob collisions under concurrent jobs.
 	broadcastSerializer := chain.NewBroadcastSerializer()
 
+	// Per-signing-key stuck-nonce tracker. Shared across submitters so
+	// "address already reserved" hits from ACK/CompleteJob broadcasts
+	// accumulate into the blob path's replacement decision.
+	stuckTracker := chain.NewStuckNonceTracker()
+
 	// Dial chain (now includes JobRegistry binding)
 	chainClient, err := chain.NewChainClient(
 		cfg.RPCURL,
@@ -123,6 +128,7 @@ func New(cfg *config.Config) (*Service, error) {
 		signingKey,
 		cfg.GasPriceMultiplierBps,
 		broadcastSerializer,
+		stuckTracker,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("connect to chain: %w", err)
@@ -187,6 +193,12 @@ func New(cfg *config.Config) (*Service, error) {
 			chainClient.NonceManager(),
 			cfg.MaxGasPrice,
 			broadcastSerializer,
+			stuckTracker,
+			blob.StuckNonceConfig{
+				Threshold:   cfg.StuckNonceThreshold,
+				MaxBumps:    cfg.StuckNonceMaxBumps,
+				AutoReplace: cfg.StuckNonceAutoReplace,
+			},
 			logger,
 		)
 		logger.Info("blob mode: eip-4844 (beacon)")
@@ -261,6 +273,9 @@ func New(cfg *config.Config) (*Service, error) {
 		"ackTxTimeout", cfg.AckTxTimeout.String(),
 		"blobTxTimeout", cfg.BlobTxTimeout.String(),
 		"minExpectedTaskBudget", (cfg.AckTxTimeout + cfg.BlobTxTimeout + 10*time.Second).String(),
+		"stuckNonceThreshold", cfg.StuckNonceThreshold,
+		"stuckNonceMaxBumps", cfg.StuckNonceMaxBumps,
+		"stuckNonceAutoReplace", cfg.StuckNonceAutoReplace,
 	)
 
 	return &Service{

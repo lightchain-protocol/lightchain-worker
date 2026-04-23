@@ -2,6 +2,7 @@ package chain
 
 import (
 	"context"
+	"errors"
 	"math/big"
 	"testing"
 	"time"
@@ -185,6 +186,33 @@ func TestSubmitPreparedTx_ResetsNonceOnPreBroadcastSendFailure(t *testing.T) {
 	assert.Contains(t, err.Error(), "send CompleteJob tx")
 	assert.False(t, client.nonceMgr.initialized, "definite pre-broadcast failure must reset the nonce manager")
 	assert.Equal(t, 1, client.jobTxBackend.(*mockJobTxBackend).sendCalls)
+}
+
+// TestSubmitPreparedTx_RecordsStuckNonceHitWithoutReplacement asserts that
+// a non-blob tx hitting "address already reserved" records a hit into the
+// shared tracker but does NOT itself attempt replacement — the blob pool
+// only accepts blob replacements, so the non-blob path defers recovery to
+// the next blob broadcast's decision.
+func TestSubmitPreparedTx_RecordsStuckNonceHitWithoutReplacement(t *testing.T) {
+	t.Parallel()
+
+	tracker := NewStuckNonceTracker()
+	client := newTestChainClient(t)
+	client.stuckTracker = tracker
+	client.jobTxBackend.(*mockJobTxBackend).sendErr = errors.New("eth_sendRawTransaction: address already reserved")
+
+	for i := 0; i < 3; i++ {
+		err := client.submitPreparedTx(context.Background(), "AcknowledgeJob", nil, func(opts *bind.TransactOpts) (*types.Transaction, error) {
+			return types.NewTx(&types.LegacyTx{Nonce: opts.Nonce.Uint64()}), nil
+		})
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "address already reserved")
+	}
+
+	assert.Equal(t, 3, tracker.ConsecutiveHits(),
+		"three consecutive reservation rejections must accumulate in the shared tracker")
+	assert.Equal(t, 0, tracker.BumpAttemptsUsed(),
+		"non-blob path must not attempt any replacement bumps")
 }
 
 // TestSubmitPreparedTx_BlocksOnExternallyHeldSlot asserts that the shared

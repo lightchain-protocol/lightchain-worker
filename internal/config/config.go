@@ -58,6 +58,25 @@ type Config struct {
 	SessionKeyFile    string
 	ReceiptPollInterval time.Duration
 
+	// Stuck-nonce recovery (Hazard B). When the worker's signing key has a
+	// tx stuck in the mempool — e.g. BlobFeeCap underbid the current blob
+	// base fee — every SendTransaction is rejected with "address already
+	// reserved" and the ResetNonce+refetch loop cannot clear it. These
+	// settings bound detection and automated replacement.
+	//
+	// StuckNonceThreshold — consecutive rejections at the same nonce before
+	// declaring it stuck. Default 5 tolerates transient pool flakiness.
+	//
+	// StuckNonceMaxBumps — max replacement-tx attempts per stuck nonce
+	// before returning a loud error. Default 3 caps the worst-case gas
+	// cost of automated recovery.
+	//
+	// StuckNonceAutoReplace — operator kill-switch. When false the tracker
+	// still detects and logs, but no replacement tx is submitted.
+	StuckNonceThreshold    int
+	StuckNonceMaxBumps     int
+	StuckNonceAutoReplace  bool
+
 	// Shutdown
 	ShutdownTimeout time.Duration
 
@@ -178,6 +197,11 @@ func Load() (*Config, error) {
 	cfg.MaxConcurrentJobs = parseInt("MAX_CONCURRENT_JOBS", 2, &errs)
 	cfg.BlobFetchRetries = parseInt("BLOB_FETCH_RETRIES", 3, &errs)
 
+	// Stuck-nonce recovery config
+	cfg.StuckNonceThreshold = parseInt("WORKER_STUCK_NONCE_THRESHOLD", 5, &errs)
+	cfg.StuckNonceMaxBumps = parseInt("WORKER_STUCK_NONCE_MAX_BUMPS", 3, &errs)
+	cfg.StuckNonceAutoReplace = parseBool("WORKER_STUCK_NONCE_AUTOREPLACE", true, &errs)
+
 	if len(errs) > 0 {
 		return nil, fmt.Errorf("config load errors:\n  - %s", strings.Join(errs, "\n  - "))
 	}
@@ -244,6 +268,12 @@ func (c *Config) Validate() []string {
 	}
 	if c.LogFormat != "json" && c.LogFormat != "text" {
 		errs = append(errs, fmt.Sprintf("LOG_FORMAT: must be \"json\" or \"text\", got %q", c.LogFormat))
+	}
+	if c.StuckNonceThreshold <= 0 {
+		errs = append(errs, "WORKER_STUCK_NONCE_THRESHOLD must be positive")
+	}
+	if c.StuckNonceMaxBumps <= 0 {
+		errs = append(errs, "WORKER_STUCK_NONCE_MAX_BUMPS must be positive")
 	}
 
 	return errs
@@ -319,6 +349,25 @@ func parseDuration(key, defaultVal string, errs *[]string) time.Duration {
 		return 0
 	}
 	return d
+}
+
+// parseBool reads an env var and parses standard truthy/falsy strings.
+// Accepts: true/false, 1/0, yes/no, on/off (case-insensitive). Empty
+// defaults to defaultVal.
+func parseBool(key string, defaultVal bool, errs *[]string) bool {
+	raw := strings.TrimSpace(os.Getenv(key))
+	if raw == "" {
+		return defaultVal
+	}
+	switch strings.ToLower(raw) {
+	case "true", "1", "yes", "on":
+		return true
+	case "false", "0", "no", "off":
+		return false
+	default:
+		*errs = append(*errs, fmt.Sprintf("%s: invalid boolean %q", key, raw))
+		return defaultVal
+	}
 }
 
 func parseInt(key string, defaultVal int, errs *[]string) int {

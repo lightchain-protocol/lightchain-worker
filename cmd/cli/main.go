@@ -261,6 +261,7 @@ func dialChain(cfg *config.RegistrationConfig, signingKey *ecdsa.PrivateKey, log
 		signingKey,
 		cfg.GasPriceMultiplierBps,
 		chain.NewBroadcastSerializer(),
+		chain.NewStuckNonceTracker(),
 	)
 	if err != nil {
 		logger.Error("failed to connect to chain", "error", err)

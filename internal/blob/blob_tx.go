@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 	"math/big"
+	"strings"
 	"sync"
 	"time"
 
@@ -62,10 +63,23 @@ type BlobTxSubmitter struct {
 	maxGasPrice    *big.Int
 	serializer     *workerchain.BroadcastSerializer
 	serializerOnce sync.Once
+	// stuckTracker is the shared per-sender stuck-nonce tracker. Nil-safe
+	// via stuckNonceTracker() lazy init for tests that don't inject one.
+	stuckTracker     *workerchain.StuckNonceTracker
+	stuckTrackerOnce sync.Once
+	stuckCfg         StuckNonceConfig
 	// logger is optional. When nil, no structured logs are emitted. Tests
 	// that construct BlobTxSubmitter via struct literal may leave this nil;
 	// the production constructor wires in the service-level logger.
 	logger *slog.Logger
+}
+
+// StuckNonceConfig bounds stuck-nonce detection and replacement. Mirrors
+// the env vars WORKER_STUCK_NONCE_THRESHOLD / _MAX_BUMPS / _AUTOREPLACE.
+type StuckNonceConfig struct {
+	Threshold   int
+	MaxBumps    int
+	AutoReplace bool
 }
 
 // broadcastSerializer returns the shared serializer, lazy-initializing a
@@ -80,10 +94,23 @@ func (s *BlobTxSubmitter) broadcastSerializer() *workerchain.BroadcastSerializer
 	return s.serializer
 }
 
+// stuckNonceTracker returns the shared tracker, lazy-initializing a private
+// one if none was injected. Behaves identically to broadcastSerializer — if
+// the caller shares an instance with ChainClient, both sides see the same
+// counts; otherwise detection still works but is submitter-local.
+func (s *BlobTxSubmitter) stuckNonceTracker() *workerchain.StuckNonceTracker {
+	s.stuckTrackerOnce.Do(func() {
+		if s.stuckTracker == nil {
+			s.stuckTracker = workerchain.NewStuckNonceTracker()
+		}
+	})
+	return s.stuckTracker
+}
+
 // NewBlobTxSubmitter creates a BlobTxSubmitter. The logger may be nil; when
 // nil, structured logs are suppressed (useful for tests that inject their own
-// instrumentation via struct literals). The serializer must be the shared
-// per-signing-key instance — see BroadcastSerializer's package docs.
+// instrumentation via struct literals). The serializer and stuckTracker must
+// be the shared per-signing-key instances — see their package docs.
 func NewBlobTxSubmitter(
 	ethClient *ethclient.Client,
 	signingKey *ecdsa.PrivateKey,
@@ -91,19 +118,23 @@ func NewBlobTxSubmitter(
 	nonceMgr NonceManager,
 	maxGasPrice *big.Int,
 	serializer *workerchain.BroadcastSerializer,
+	stuckTracker *workerchain.StuckNonceTracker,
+	stuckCfg StuckNonceConfig,
 	logger *slog.Logger,
 ) *BlobTxSubmitter {
 	return &BlobTxSubmitter{
-		ethClient:   ethClient,
-		txBackend:   ethClient,
-		signingKey:  signingKey,
-		signTx:      types.SignTx,
-		waitMined:   bind.WaitMined,
-		chainID:     chainID,
-		nonceMgr:    nonceMgr,
-		maxGasPrice: maxGasPrice,
-		serializer:  serializer,
-		logger:      logger,
+		ethClient:    ethClient,
+		txBackend:    ethClient,
+		signingKey:   signingKey,
+		signTx:       types.SignTx,
+		waitMined:    bind.WaitMined,
+		chainID:      chainID,
+		nonceMgr:     nonceMgr,
+		maxGasPrice:  maxGasPrice,
+		serializer:   serializer,
+		stuckTracker: stuckTracker,
+		stuckCfg:     stuckCfg,
+		logger:       logger,
 	}
 }
 
@@ -208,6 +239,17 @@ func (s *BlobTxSubmitter) SubmitBlobTx(ctx context.Context, data []byte) ([][32]
 		if resetNonce {
 			s.nonceMgr.ResetNonce()
 		}
+		// Stuck-nonce detection (Hazard B): when the rejection reason is
+		// "address already reserved" at the same nonce repeatedly, it
+		// indicates a tx stuck in the mempool that ResetNonce+refetch
+		// cannot clear. Record a hit on the shared tracker and log
+		// distinctly once we cross the threshold — Commit I activates
+		// automated replacement in this branch.
+		stuckHits := 0
+		stuck := strings.Contains(err.Error(), "address already reserved")
+		if stuck {
+			stuckHits = s.stuckNonceTracker().Record(nonce)
+		}
 		if s.logger != nil {
 			s.logger.Warn("blob tx rejected by SendTransaction",
 				"stage", "submit_blob",
@@ -215,8 +257,19 @@ func (s *BlobTxSubmitter) SubmitBlobTx(ctx context.Context, data []byte) ([][32]
 				"nonce", nonce,
 				"mutexWaitMs", mutexWaitMs,
 				"nonceReset", resetNonce,
+				"stuckHits", stuckHits,
 				"error", err,
 			)
+			if stuck && s.stuckCfg.Threshold > 0 && stuckHits >= s.stuckCfg.Threshold {
+				s.logger.Error("stuck-nonce threshold reached",
+					"stage", "submit_blob",
+					"nonce", nonce,
+					"consecutiveHits", stuckHits,
+					"threshold", s.stuckCfg.Threshold,
+					"autoReplace", s.stuckCfg.AutoReplace,
+					"hint", "mempool entry at this nonce is not clearing; manual replacement tx may be required",
+				)
+			}
 		}
 		return nil, fmt.Errorf("send blob tx: %w", err)
 	}
@@ -263,6 +316,11 @@ func (s *BlobTxSubmitter) SubmitBlobTx(ctx context.Context, data []byte) ([][32]
 	if receipt.Status != types.ReceiptStatusSuccessful {
 		return nil, fmt.Errorf("blob tx reverted (status 0, tx %s)", receipt.TxHash.Hex())
 	}
+
+	// A mined receipt means the tx at this nonce is no longer in the pool.
+	// Clear the stuck tracker so a subsequent rejection at a different nonce
+	// starts from a clean slate rather than an inherited state.
+	s.stuckNonceTracker().Clear()
 
 	if s.logger != nil {
 		s.logger.Info("blob tx mined",

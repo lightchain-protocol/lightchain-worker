@@ -70,6 +70,36 @@ func TestLoad_ValidConfig(t *testing.T) {
 	assert.NotNil(t, cfg.MaxGasPrice)
 	// 100 gwei default
 	assert.Equal(t, "100000000000", cfg.MaxGasPrice.String())
+	// Stuck-nonce recovery defaults
+	assert.Equal(t, 5, cfg.StuckNonceThreshold)
+	assert.Equal(t, 3, cfg.StuckNonceMaxBumps)
+	assert.True(t, cfg.StuckNonceAutoReplace, "auto-replace must default to true")
+}
+
+func TestLoad_StuckNonceOverrides(t *testing.T) {
+	validEnv(t)
+	t.Setenv("WORKER_KEYSTORE_PATH", "/tmp/keystore.json")
+	t.Setenv("WORKER_KEYSTORE_PASSWORD", "secret")
+	t.Setenv("WORKER_STUCK_NONCE_THRESHOLD", "8")
+	t.Setenv("WORKER_STUCK_NONCE_MAX_BUMPS", "1")
+	t.Setenv("WORKER_STUCK_NONCE_AUTOREPLACE", "false")
+
+	cfg, err := Load()
+	require.NoError(t, err)
+	assert.Equal(t, 8, cfg.StuckNonceThreshold)
+	assert.Equal(t, 1, cfg.StuckNonceMaxBumps)
+	assert.False(t, cfg.StuckNonceAutoReplace)
+}
+
+func TestLoad_StuckNonceInvalidBoolean(t *testing.T) {
+	validEnv(t)
+	t.Setenv("WORKER_KEYSTORE_PATH", "/tmp/keystore.json")
+	t.Setenv("WORKER_KEYSTORE_PASSWORD", "secret")
+	t.Setenv("WORKER_STUCK_NONCE_AUTOREPLACE", "maybe")
+
+	_, err := Load()
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "WORKER_STUCK_NONCE_AUTOREPLACE")
 }
 
 func TestLoad_MissingChainID(t *testing.T) {
