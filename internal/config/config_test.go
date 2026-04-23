@@ -20,7 +20,7 @@ var allEnvKeys = []string{
 	"REDIS_URL", "REDIS_PASSWORD",
 	"HEARTBEAT_INTERVAL", "OLLAMA_URL", "OLLAMA_TIMEOUT",
 	"BEACON_API_URL", "SESSION_KEY_FILE",
-	"MAX_CONCURRENT_JOBS", "ACK_TX_TIMEOUT", "BLOB_FETCH_TIMEOUT",
+	"MAX_CONCURRENT_JOBS", "ACK_TX_TIMEOUT", "BLOB_TX_TIMEOUT", "BLOB_FETCH_TIMEOUT",
 	"BLOB_FETCH_RETRIES", "RECEIPT_POLL_INTERVAL",
 	"SHUTDOWN_TIMEOUT",
 	"LOG_LEVEL", "LOG_FORMAT",
@@ -61,6 +61,7 @@ func TestLoad_ValidConfig(t *testing.T) {
 	assert.Equal(t, "http://localhost:3500", cfg.BeaconAPIURL)
 	assert.Equal(t, 2, cfg.MaxConcurrentJobs)
 	assert.Equal(t, 15*time.Second, cfg.AckTxTimeout)
+	assert.Equal(t, 90*time.Second, cfg.BlobTxTimeout)
 	assert.Equal(t, 10*time.Second, cfg.BlobFetchTimeout)
 	assert.Equal(t, 3, cfg.BlobFetchRetries)
 	assert.Equal(t, 120*time.Second, cfg.OllamaTimeout)
@@ -342,6 +343,7 @@ func TestLoad_JobExecutionDefaults(t *testing.T) {
 	assert.Equal(t, 2, cfg.MaxConcurrentJobs)
 	assert.Equal(t, 3, cfg.BlobFetchRetries)
 	assert.Equal(t, 15*time.Second, cfg.AckTxTimeout)
+	assert.Equal(t, 90*time.Second, cfg.BlobTxTimeout)
 	assert.Equal(t, 10*time.Second, cfg.BlobFetchTimeout)
 	assert.Equal(t, 120*time.Second, cfg.OllamaTimeout)
 	assert.Equal(t, 2*time.Second, cfg.ReceiptPollInterval)
@@ -354,6 +356,7 @@ func TestLoad_JobExecutionOverrides(t *testing.T) {
 	t.Setenv("MAX_CONCURRENT_JOBS", "8")
 	t.Setenv("BLOB_FETCH_RETRIES", "5")
 	t.Setenv("ACK_TX_TIMEOUT", "30s")
+	t.Setenv("BLOB_TX_TIMEOUT", "180s")
 	t.Setenv("BLOB_FETCH_TIMEOUT", "20s")
 	t.Setenv("OLLAMA_TIMEOUT", "60s")
 	t.Setenv("BEACON_API_URL", "http://beacon:3500")
@@ -367,6 +370,7 @@ func TestLoad_JobExecutionOverrides(t *testing.T) {
 	assert.Equal(t, 8, cfg.MaxConcurrentJobs)
 	assert.Equal(t, 5, cfg.BlobFetchRetries)
 	assert.Equal(t, 30*time.Second, cfg.AckTxTimeout)
+	assert.Equal(t, 180*time.Second, cfg.BlobTxTimeout)
 	assert.Equal(t, 20*time.Second, cfg.BlobFetchTimeout)
 	assert.Equal(t, 60*time.Second, cfg.OllamaTimeout)
 	assert.Equal(t, "http://beacon:3500", cfg.BeaconAPIURL)

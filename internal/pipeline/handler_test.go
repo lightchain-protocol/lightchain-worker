@@ -180,7 +180,8 @@ func newTestHandler(
 ) *JobHandler {
 	t.Helper()
 	return newTestHandlerWithConfig(t, chain, fetcher, submitter, keyStore, ollama, redisClient, HandlerConfig{
-		AckTxTimeout: 5 * time.Second,
+		AckTxTimeout:  5 * time.Second,
+		BlobTxTimeout: 60 * time.Second,
 	})
 }
 
@@ -270,7 +271,8 @@ func TestHandleTask_FullPipelineSuccess(t *testing.T) {
 		chain, fetcher, submitter, newMockKeyStore(), ollama,
 		rc, testSigningKey(t), ecdhKey, counter, logger,
 		HandlerConfig{
-			AckTxTimeout: 5 * time.Second,
+			AckTxTimeout:  5 * time.Second,
+			BlobTxTimeout: 60 * time.Second,
 			ModelIDToName: map[string]string{
 				expectedModelID: "llama3-8b",
 			},
@@ -387,7 +389,7 @@ func TestHandleTask_SessionKeyCacheHit(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(io.Discard, &slog.HandlerOptions{Level: slog.LevelError}))
 	handler := NewJobHandler(chain, fetcher, submitter, ks, ollama, rc,
 		testSigningKey(t), ecdhKey, counter, logger,
-		HandlerConfig{AckTxTimeout: 5 * time.Second})
+		HandlerConfig{AckTxTimeout: 5 * time.Second, BlobTxTimeout: 60 * time.Second})
 
 	payload := testPayload(t)
 	data, _ := json.Marshal(payload)
@@ -433,7 +435,7 @@ func TestHandleTask_SessionKeyCacheMiss_FetchAndStore(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(io.Discard, &slog.HandlerOptions{Level: slog.LevelError}))
 	handler := NewJobHandler(chain, fetcher, submitter, ks, ollama, rc,
 		testSigningKey(t), ecdhKey, counter, logger,
-		HandlerConfig{AckTxTimeout: 5 * time.Second})
+		HandlerConfig{AckTxTimeout: 5 * time.Second, BlobTxTimeout: 60 * time.Second})
 
 	payload := testPayload(t)
 	data, _ := json.Marshal(payload)
@@ -501,7 +503,7 @@ func TestHandleTask_SessionKeyRotated_Refreshes(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(io.Discard, &slog.HandlerOptions{Level: slog.LevelError}))
 	handler := NewJobHandler(chain, fetcher, submitter, ks, ollama, rc,
 		testSigningKey(t), ecdhKey, counter, logger,
-		HandlerConfig{AckTxTimeout: 5 * time.Second})
+		HandlerConfig{AckTxTimeout: 5 * time.Second, BlobTxTimeout: 60 * time.Second})
 
 	payload := testPayload(t)
 	data, _ := json.Marshal(payload)
@@ -555,7 +557,7 @@ func TestHandleTask_CompleteJobFailure(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(io.Discard, &slog.HandlerOptions{Level: slog.LevelError}))
 	handler := NewJobHandler(chain, fetcher, submitter, ks, ollama, rc,
 		testSigningKey(t), ecdhKey, counter, logger,
-		HandlerConfig{AckTxTimeout: 5 * time.Second})
+		HandlerConfig{AckTxTimeout: 5 * time.Second, BlobTxTimeout: 60 * time.Second})
 
 	payload := testPayload(t)
 	data, _ := json.Marshal(payload)
@@ -590,7 +592,7 @@ func TestHandleTask_JobCounterIncrementDecrement(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(io.Discard, &slog.HandlerOptions{Level: slog.LevelError}))
 	handler := NewJobHandler(chain, fetcher, submitter, newMockKeyStore(), ollama, rc,
 		testSigningKey(t), testECDHKey(t), counter, logger,
-		HandlerConfig{AckTxTimeout: 5 * time.Second})
+		HandlerConfig{AckTxTimeout: 5 * time.Second, BlobTxTimeout: 60 * time.Second})
 
 	payload := testPayload(t)
 	data, _ := json.Marshal(payload)
@@ -636,7 +638,7 @@ func TestHandleTask_RedisPublishFailure_NonFatal(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(io.Discard, &slog.HandlerOptions{Level: slog.LevelError}))
 	handler := NewJobHandler(chain, fetcher, submitter, ks, ollama, rc,
 		testSigningKey(t), ecdhKey, counter, logger,
-		HandlerConfig{AckTxTimeout: 5 * time.Second})
+		HandlerConfig{AckTxTimeout: 5 * time.Second, BlobTxTimeout: 60 * time.Second})
 
 	payload := testPayload(t)
 	data, _ := json.Marshal(payload)

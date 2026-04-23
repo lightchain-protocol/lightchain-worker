@@ -52,6 +52,7 @@ type Config struct {
 	// Job execution
 	MaxConcurrentJobs int
 	AckTxTimeout      time.Duration
+	BlobTxTimeout     time.Duration
 	BlobFetchTimeout  time.Duration
 	BlobFetchRetries  int
 	SessionKeyFile    string
@@ -166,6 +167,10 @@ func Load() (*Config, error) {
 	cfg.ShutdownTimeout = parseDuration("SHUTDOWN_TIMEOUT", "30s", &errs)
 	cfg.OllamaTimeout = parseDuration("OLLAMA_TIMEOUT", "120s", &errs)
 	cfg.AckTxTimeout = parseDuration("ACK_TX_TIMEOUT", "15s", &errs)
+	// BlobTxTimeout bounds stage 8 (submit_blob): slot wait + SendTransaction
+	// + WaitMined. Default 90s = ~15 blocks at 6s block time, generous buffer
+	// over the ~12s typical to absorb network jitter and queued broadcasts.
+	cfg.BlobTxTimeout = parseDuration("BLOB_TX_TIMEOUT", "90s", &errs)
 	cfg.BlobFetchTimeout = parseDuration("BLOB_FETCH_TIMEOUT", "10s", &errs)
 	cfg.ReceiptPollInterval = parseDuration("RECEIPT_POLL_INTERVAL", "2s", &errs)
 
@@ -224,6 +229,9 @@ func (c *Config) Validate() []string {
 	}
 	if c.AckTxTimeout <= 0 {
 		errs = append(errs, "ACK_TX_TIMEOUT must be positive")
+	}
+	if c.BlobTxTimeout <= 0 {
+		errs = append(errs, "BLOB_TX_TIMEOUT must be positive")
 	}
 	if c.BlobFetchTimeout <= 0 {
 		errs = append(errs, "BLOB_FETCH_TIMEOUT must be positive")

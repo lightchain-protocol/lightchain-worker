@@ -70,6 +70,7 @@ type BlobSubmitter interface {
 // HandlerConfig holds pipeline-specific configuration.
 type HandlerConfig struct {
 	AckTxTimeout    time.Duration
+	BlobTxTimeout   time.Duration
 	ModelIDToName   map[string]string
 	ChainID         *big.Int
 	JobRegistryAddr common.Address
@@ -326,12 +327,19 @@ func (h *JobHandler) processJob(ctx context.Context, p JobPayload) error {
 	// Post-audit the contract's completeJob takes a single bytes32
 	// responseBlobHash and enforces `blobhash(0) == responseBlobHash`, so the
 	// blob TX must carry exactly one blob.
+	//
+	// Wrap in BlobTxTimeout so a stuck WaitMined (e.g. dead EL websocket)
+	// cannot hold the broadcast slot indefinitely and starve other jobs.
+	// Matches the AckTxTimeout pattern above.
 	stageStart = time.Now()
 	logger.Info("stage 8a starting",
 		"stage", "submit_blob",
 		"ciphertextBytes", len(ciphertext),
+		"timeout", h.cfg.BlobTxTimeout.String(),
 	)
-	blobHashes, err := h.blobSubmitter.SubmitBlobTx(ctx, ciphertext)
+	submitCtx, submitCancel := context.WithTimeout(ctx, h.cfg.BlobTxTimeout)
+	blobHashes, err := h.blobSubmitter.SubmitBlobTx(submitCtx, ciphertext)
+	submitCancel()
 	if err != nil {
 		return fmt.Errorf("stage 8 (submit blob): %w", err)
 	}
