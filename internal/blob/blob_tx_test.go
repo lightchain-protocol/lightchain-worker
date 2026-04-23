@@ -384,6 +384,145 @@ func TestBlobTxSubmitter_DetectsStuckNonce_BelowThreshold(t *testing.T) {
 		"no bump attempts must fire below threshold")
 }
 
+// TestBlobTxSubmitter_TriggersReplacementAtThreshold asserts that once
+// consecutive "address already reserved" rejections reach the configured
+// threshold, a bumped-fee replacement blob tx is broadcast at the SAME
+// nonce. This is the Hazard B recovery path — without it the stuck
+// nonce loop would exhaust asynq's MaxRetry with no fix applied.
+func TestBlobTxSubmitter_TriggersReplacementAtThreshold(t *testing.T) {
+	t.Parallel()
+
+	var captured []*types.Transaction
+	var mu sync.Mutex
+	backend := &capturingBlobTxBackend{
+		gasTipCap: big.NewInt(100),
+		sendErr:   errors.New("eth_sendRawTransaction: address already reserved"),
+		onSend: func(tx *types.Transaction) {
+			mu.Lock()
+			defer mu.Unlock()
+			captured = append(captured, tx)
+		},
+	}
+	tracker := workerchain.NewStuckNonceTracker()
+	submitter := &BlobTxSubmitter{
+		txBackend:    backend,
+		signingKey:   testSigningKey(t),
+		chainID:      big.NewInt(1),
+		nonceMgr:     &mockNonceManager{next: 152},
+		maxGasPrice:  big.NewInt(1_000_000_000), // 1 gwei baseline
+		stuckTracker: tracker,
+		stuckCfg:     StuckNonceConfig{Threshold: 3, MaxBumps: 3, AutoReplace: true},
+	}
+
+	// 3 consecutive rejections — hit threshold on the 3rd. Each
+	// SubmitBlobTx call broadcasts once (the original); on the 3rd
+	// call the threshold triggers an ADDITIONAL replacement broadcast.
+	for i := 0; i < 3; i++ {
+		_, err := submitter.SubmitBlobTx(context.Background(), []byte("ciphertext"))
+		require.Error(t, err)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	// 3 originals + 1 replacement = 4 total broadcasts.
+	require.Len(t, captured, 4, "expected 3 original broadcasts + 1 replacement on threshold hit")
+
+	// The replacement is the 4th capture. Verify it targets the same
+	// nonce with ALL three fee fields bumped by 2× (first bump).
+	replacement := captured[3]
+	assert.Equal(t, uint64(152), replacement.Nonce(),
+		"replacement must target the stuck nonce, not a fresh one")
+	assert.Equal(t, types.BlobTxType, int(replacement.Type()),
+		"replacement must be a blob tx — go-ethereum blobpool refuses non-blob replacements")
+	// GasTipCap bumped from 100 (suggested) to 200 (2×).
+	assert.Equal(t, "200", replacement.GasTipCap().String())
+	// GasFeeCap bumped from 1 gwei to 2 gwei.
+	assert.Equal(t, "2000000000", replacement.GasFeeCap().String())
+	// BlobFeeCap bumped from 1 gwei baseline to 2 gwei.
+	assert.Equal(t, "2000000000", replacement.BlobGasFeeCap().String())
+
+	assert.Equal(t, 1, tracker.BumpAttemptsUsed(),
+		"exactly one bump attempt must be recorded after first threshold trigger")
+}
+
+// TestBlobTxSubmitter_StopsReplacingAfterMaxBumps asserts that once
+// MaxBumps replacements have been attempted, further threshold hits log
+// loudly but do NOT broadcast additional replacements. Protects against
+// runaway fee bumps draining the worker's balance when the pool is
+// genuinely unable to accept the tx at any price (e.g. EL RPC broken).
+func TestBlobTxSubmitter_StopsReplacingAfterMaxBumps(t *testing.T) {
+	t.Parallel()
+
+	var sendCalls atomic.Int32
+	backend := &capturingBlobTxBackend{
+		gasTipCap: big.NewInt(100),
+		sendErr:   errors.New("eth_sendRawTransaction: address already reserved"),
+		onSend:    func(*types.Transaction) { sendCalls.Add(1) },
+	}
+	tracker := workerchain.NewStuckNonceTracker()
+	submitter := &BlobTxSubmitter{
+		txBackend:    backend,
+		signingKey:   testSigningKey(t),
+		chainID:      big.NewInt(1),
+		nonceMgr:     &mockNonceManager{next: 152},
+		maxGasPrice:  big.NewInt(1_000_000_000),
+		stuckTracker: tracker,
+		stuckCfg:     StuckNonceConfig{Threshold: 2, MaxBumps: 2, AutoReplace: true},
+	}
+
+	// 4 submissions — threshold=2, so after submission 2, 3, 4 each
+	// hits the threshold. MaxBumps=2 caps replacements at 2.
+	for i := 0; i < 4; i++ {
+		_, err := submitter.SubmitBlobTx(context.Background(), []byte("ciphertext"))
+		require.Error(t, err)
+	}
+
+	// Breakdown: 4 originals + 2 replacements = 6 total broadcasts.
+	// The 3rd and 4th threshold hits do NOT produce new replacements
+	// because BumpAttemptsUsed has reached MaxBumps.
+	assert.Equal(t, int32(6), sendCalls.Load(),
+		"expected exactly MaxBumps replacements (2), not one per threshold hit")
+	assert.Equal(t, 2, tracker.BumpAttemptsUsed())
+}
+
+// TestBlobTxSubmitter_ReplacementHonorsAutoReplaceDisabled asserts the
+// operator kill-switch: when AutoReplace is false, the tracker still
+// records hits and the ERROR log fires, but no replacement tx is broadcast.
+func TestBlobTxSubmitter_ReplacementHonorsAutoReplaceDisabled(t *testing.T) {
+	t.Parallel()
+
+	var sendCalls atomic.Int32
+	backend := &capturingBlobTxBackend{
+		gasTipCap: big.NewInt(100),
+		sendErr:   errors.New("eth_sendRawTransaction: address already reserved"),
+		onSend:    func(*types.Transaction) { sendCalls.Add(1) },
+	}
+	tracker := workerchain.NewStuckNonceTracker()
+	submitter := &BlobTxSubmitter{
+		txBackend:    backend,
+		signingKey:   testSigningKey(t),
+		chainID:      big.NewInt(1),
+		nonceMgr:     &mockNonceManager{next: 152},
+		maxGasPrice:  big.NewInt(1_000_000_000),
+		stuckTracker: tracker,
+		stuckCfg:     StuckNonceConfig{Threshold: 2, MaxBumps: 3, AutoReplace: false},
+	}
+
+	// 3 submissions, each rejected, threshold hit on the 2nd and 3rd.
+	for i := 0; i < 3; i++ {
+		_, err := submitter.SubmitBlobTx(context.Background(), []byte("ciphertext"))
+		require.Error(t, err)
+	}
+
+	// Only the 3 originals — no replacement broadcasts.
+	assert.Equal(t, int32(3), sendCalls.Load(),
+		"AutoReplace=false must suppress all replacement broadcasts")
+	assert.Equal(t, 0, tracker.BumpAttemptsUsed(),
+		"AutoReplace=false must not call IncrementBumpAttempts either")
+	assert.Equal(t, 3, tracker.ConsecutiveHits(),
+		"detection still happens — the tracker counts regardless of auto-replace")
+}
+
 // TestBlobTxSubmitter_ClearsOnSuccessfulMine asserts that a successful
 // blob tx mining resets the stuck tracker so a subsequent rejection at a
 // different nonce starts from clean state.
@@ -528,6 +667,26 @@ func (m mockBlobTxBackend) SendTransaction(ctx context.Context, _ *types.Transac
 		case <-ctx.Done():
 			return ctx.Err()
 		}
+	}
+	return m.sendErr
+}
+
+// capturingBlobTxBackend is a test backend that invokes onSend on every
+// SendTransaction call and optionally returns a fixed error. Used by
+// replacement tests to capture each broadcast tx and inspect bumped fees.
+type capturingBlobTxBackend struct {
+	gasTipCap *big.Int
+	sendErr   error
+	onSend    func(tx *types.Transaction)
+}
+
+func (m *capturingBlobTxBackend) SuggestGasTipCap(context.Context) (*big.Int, error) {
+	return m.gasTipCap, nil
+}
+
+func (m *capturingBlobTxBackend) SendTransaction(_ context.Context, tx *types.Transaction) error {
+	if m.onSend != nil {
+		m.onSend(tx)
 	}
 	return m.sendErr
 }
