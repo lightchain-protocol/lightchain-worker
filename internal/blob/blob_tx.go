@@ -237,6 +237,30 @@ func (s *BlobTxSubmitter) SubmitBlobTx(ctx context.Context, data []byte) ([][32]
 	waitStart := time.Now()
 	receipt, err := waitMined(ctx, s.ethClient, signedTx)
 	if err != nil {
+		// SendTransaction already succeeded: the tx is on the wire and the
+		// local NonceManager counter has advanced past this nonce. If
+		// WaitMined failed (ctx deadline, dead EL connection, propagation
+		// blip), the next broadcast at counter+1 would desync from the
+		// chain's pending nonce — producing the cascading gap observed in
+		// the 2026-04-23 testnet incident. Force the next NextNonce() to
+		// refetch pending from chain instead. On refetch we either (a)
+		// see the pool evicted the stuck tx, (b) see it still reserved
+		// and hit "address already reserved" (now reset-eligible via
+		// Commit A), or (c) see it mined — all recoverable.
+		//
+		// NOT reset on receipt.Status != Successful below, because a
+		// reverted receipt means the tx landed on-chain; the nonce was
+		// consumed for real.
+		s.nonceMgr.ResetNonce()
+		if s.logger != nil {
+			s.logger.Warn("blob tx WaitMined failed, resetting nonce for retry",
+				"stage", "submit_blob",
+				"txHash", signedTx.Hash().Hex(),
+				"nonce", nonce,
+				"waitMs", time.Since(waitStart).Milliseconds(),
+				"error", err,
+			)
+		}
 		return nil, fmt.Errorf("wait for blob tx %s: %w", signedTx.Hash().Hex(), err)
 	}
 	if receipt.Status != types.ReceiptStatusSuccessful {

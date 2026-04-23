@@ -314,6 +314,36 @@ func TestBlobTxSubmitter_CtxCancelDuringWaitMined(t *testing.T) {
 		"second call must reach SendTransaction — slot was released after first call returned")
 }
 
+// TestBlobTxSubmitter_ResetsNonceOnWaitMinedFailure asserts that when
+// WaitMined returns an error after a successful broadcast, the local nonce
+// counter is reset so the next NextNonce() refetches from chain. Without
+// this reset, the NonceManager accumulates persistent gaps from chain
+// whenever a blob tx is stuck in the mempool past the ctx deadline — the
+// cascading-gap failure reproduced in the 2026-04-23 testnet incident.
+func TestBlobTxSubmitter_ResetsNonceOnWaitMinedFailure(t *testing.T) {
+	t.Parallel()
+
+	nonceMgr := &mockNonceManager{next: 50}
+	waitMined := func(ctx context.Context, _ bind.DeployBackend, _ *types.Transaction) (*types.Receipt, error) {
+		return nil, errors.New("simulated waitMined failure")
+	}
+
+	submitter := &BlobTxSubmitter{
+		txBackend:   mockBlobTxBackend{gasTipCap: big.NewInt(1)},
+		signingKey:  testSigningKey(t),
+		waitMined:   waitMined,
+		chainID:     big.NewInt(1),
+		nonceMgr:    nonceMgr,
+		maxGasPrice: big.NewInt(2),
+	}
+
+	_, err := submitter.SubmitBlobTx(context.Background(), []byte("ciphertext"))
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "wait for blob tx")
+	assert.Equal(t, 1, nonceMgr.resetCalls,
+		"ResetNonce must fire on WaitMined failure so next broadcast refetches chain pending")
+}
+
 // Compile-time assertion
 var _ BlobSubmitter = (*BlobTxSubmitter)(nil)
 

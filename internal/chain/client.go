@@ -228,6 +228,16 @@ func (c *ChainClient) submitPreparedTx(
 
 	receipt, err := bind.WaitMined(ctx, c.ethClient, tx)
 	if err != nil {
+		// Symmetric with BlobTxSubmitter.SubmitBlobTx: SendTransaction
+		// already succeeded, so the tx is on the wire and the local nonce
+		// has advanced past it. A WaitMined failure (ctx deadline, dead
+		// EL) without a reset here leaves the counter drifting from chain
+		// pending, which is the same cascading-gap failure mode seen on
+		// testnet. Reset forces the next NextNonce() to refetch pending
+		// from chain. Unlike the blob path, no logger is threaded through
+		// ChainClient — the chain-refetch on subsequent NextNonce is
+		// currently silent, tracked as a separate observability follow-up.
+		c.nonceMgr.ResetNonce()
 		return fmt.Errorf("wait for %s tx %s: %w", txName, tx.Hash().Hex(), err)
 	}
 	if err := checkReceipt(receipt, txName); err != nil {
