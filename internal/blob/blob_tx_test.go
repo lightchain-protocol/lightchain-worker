@@ -157,16 +157,23 @@ func TestBlobTxSubmitter_SerializesBroadcast(t *testing.T) {
 // the slot acquire, the queued goroutine would be stuck until the prior
 // holder's WaitMined returns.
 //
-// Synchronization relies on the signTx hook firing after KZG/signing but
-// before the slot acquire select, giving the test a deterministic moment
-// at which G2 is about to block on the slot.
+// Synchronization relies on the gas-tip hook firing after KZG but before the
+// slot acquire select, giving the test a deterministic moment at which G2 is
+// about to block on the slot.
 func TestBlobTxSubmitter_CtxCancelDuringSlotWait(t *testing.T) {
 	t.Parallel()
 
 	var sendCalls atomic.Int32
+	var suggestCount atomic.Int32
+	g2ReadyForSlot := make(chan struct{})
 	backend := mockBlobTxBackend{
 		gasTipCap: big.NewInt(1),
 		sendCalls: &sendCalls,
+		onSuggest: func() {
+			if suggestCount.Add(1) == 2 {
+				close(g2ReadyForSlot)
+			}
+		},
 	}
 
 	g1InSlot := make(chan struct{})
@@ -181,23 +188,9 @@ func TestBlobTxSubmitter_CtxCancelDuringSlotWait(t *testing.T) {
 		}
 	}
 
-	// signTx hook: fires g2Signed on the 2nd call (G2's), giving us a
-	// deterministic signal that G2 has finished KZG+signing and is about
-	// to enter the slot acquire select.
-	var signCount atomic.Int32
-	g2Signed := make(chan struct{})
-	signTxStub := func(tx *types.Transaction, signer types.Signer, key *ecdsa.PrivateKey) (*types.Transaction, error) {
-		result, err := types.SignTx(tx, signer, key)
-		if signCount.Add(1) == 2 {
-			close(g2Signed)
-		}
-		return result, err
-	}
-
 	submitter := &BlobTxSubmitter{
 		txBackend:   backend,
 		signingKey:  testSigningKey(t),
-		signTx:      signTxStub,
 		waitMined:   waitMined,
 		chainID:     big.NewInt(1),
 		nonceMgr:    &mockNonceManager{next: 7},
@@ -229,14 +222,14 @@ func TestBlobTxSubmitter_CtxCancelDuringSlotWait(t *testing.T) {
 		g2ErrCh <- err
 	}()
 
-	// Wait until G2 has signed — it's now at the slot acquire select,
-	// blocked because G1 still holds the slot.
+	// Wait until G2 has finished KZG/gas suggestion — it's now at the slot
+	// acquire select, blocked because G1 still holds the slot.
 	select {
-	case <-g2Signed:
+	case <-g2ReadyForSlot:
 	case <-time.After(30 * time.Second):
 		close(g1Release)
 		<-g1Done
-		t.Fatal("g2 did not finish signing within 30s")
+		t.Fatal("g2 did not reach slot acquire within 30s")
 	}
 
 	// Now cancel. With the ctx-aware slot, G2 exits promptly. Without
@@ -569,10 +562,20 @@ func TestBlobTxSubmitter_BlocksOnExternallyHeldSlot(t *testing.T) {
 	t.Parallel()
 
 	var sendCalls atomic.Int32
+	readyForSlot := make(chan struct{})
+	var suggestCount atomic.Int32
 	serializer := workerchain.NewBroadcastSerializer()
 	submitter := &BlobTxSubmitter{
-		txBackend:   mockBlobTxBackend{gasTipCap: big.NewInt(1), sendCalls: &sendCalls},
-		signingKey:  testSigningKey(t),
+		txBackend: mockBlobTxBackend{
+			gasTipCap: big.NewInt(1),
+			sendCalls: &sendCalls,
+			onSuggest: func() {
+				if suggestCount.Add(1) == 1 {
+					close(readyForSlot)
+				}
+			},
+		},
+		signingKey: testSigningKey(t),
 		waitMined: func(ctx context.Context, _ bind.DeployBackend, tx *types.Transaction) (*types.Receipt, error) {
 			return &types.Receipt{Status: types.ReceiptStatusSuccessful, TxHash: tx.Hash()}, nil
 		},
@@ -592,9 +595,16 @@ func TestBlobTxSubmitter_BlocksOnExternallyHeldSlot(t *testing.T) {
 		submitDone <- err
 	}()
 
-	// Wait past the ~9s KZG overhead so we know the submitter has
-	// reached the slot acquire select, then verify it's blocked.
-	time.Sleep(11 * time.Second)
+	// Wait until the submitter has finished KZG/gas suggestion and reached
+	// the slot acquire select, then verify it's blocked.
+	select {
+	case <-readyForSlot:
+	case <-time.After(30 * time.Second):
+		serializer.Release()
+		err := <-submitDone
+		require.NoError(t, err)
+		t.Fatal("SubmitBlobTx did not reach slot acquire within 30s")
+	}
 	assert.Equal(t, int32(0), sendCalls.Load(),
 		"SubmitBlobTx must not reach SendTransaction while external holder owns the shared serializer")
 
@@ -641,9 +651,13 @@ type mockBlobTxBackend struct {
 	maxInFlight *atomic.Int32
 	sendDelay   time.Duration
 	sendCalls   *atomic.Int32
+	onSuggest   func()
 }
 
 func (m mockBlobTxBackend) SuggestGasTipCap(context.Context) (*big.Int, error) {
+	if m.onSuggest != nil {
+		m.onSuggest()
+	}
 	return m.gasTipCap, nil
 }
 

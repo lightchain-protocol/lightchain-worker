@@ -243,8 +243,8 @@ func TestSubmitPreparedTx_BlocksOnExternallyHeldSlot(t *testing.T) {
 		})
 	}()
 
-	// Give the goroutine time to progress past NextNonce+build and arrive
-	// at the serializer.Acquire select — then verify it's blocked.
+	// Give the goroutine time to arrive at the serializer.Acquire select,
+	// then verify it's blocked before SendTransaction.
 	time.Sleep(100 * time.Millisecond)
 	assert.Equal(t, 0, client.jobTxBackend.(*mockJobTxBackend).sendCalls,
 		"submitPreparedTx must not reach SendTransaction while external holder owns the shared serializer")
@@ -299,6 +299,8 @@ func TestSubmitPreparedTx_CtxCancelDuringSlotWait(t *testing.T) {
 			"submitPreparedTx must exit within 500ms of ctx cancel")
 		assert.Equal(t, 0, client.jobTxBackend.(*mockJobTxBackend).sendCalls,
 			"SendTransaction must not fire when ctx is cancelled during slot wait")
+		assert.False(t, client.nonceMgr.initialized,
+			"cancelled slot wait must not reserve a nonce")
 	case <-time.After(2 * time.Second):
 		t.Fatal("submitPreparedTx did not return within 2s of ctx cancel — serializer.Acquire is not ctx-aware")
 	}

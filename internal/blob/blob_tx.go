@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"log/slog"
 	"math/big"
-	"strings"
 	"sync"
 	"time"
 
@@ -47,6 +46,39 @@ type BlobTxBackend interface {
 // original. Go-ethereum's blobpool requires a valid KZG commitment + proof,
 // so we still run the full blob encoding over this single byte.
 var replacementBlobPayload = []byte{0x00}
+
+const defaultBlobFeeCapWei = 1_000_000_000
+
+type blobTxPayload struct {
+	blob          kzg4844.Blob
+	commitment    kzg4844.Commitment
+	proof         kzg4844.Proof
+	versionedHash common.Hash
+}
+
+func encodeBlobTxPayload(data []byte, label string) (*blobTxPayload, error) {
+	b, err := pkgblob.EncodeBlobData(data)
+	if err != nil {
+		return nil, fmt.Errorf("encode %s: %w", label, err)
+	}
+
+	commitment, err := kzg4844.BlobToCommitment(&b)
+	if err != nil {
+		return nil, fmt.Errorf("compute %s KZG commitment: %w", label, err)
+	}
+
+	proof, err := kzg4844.ComputeBlobProof(&b, commitment)
+	if err != nil {
+		return nil, fmt.Errorf("compute %s KZG proof: %w", label, err)
+	}
+
+	return &blobTxPayload{
+		blob:          b,
+		commitment:    commitment,
+		proof:         proof,
+		versionedHash: pkgblob.VersionedHash(commitment[:]),
+	}, nil
+}
 
 // BlobTxSubmitter builds and submits type-3 (EIP-4844) blob transactions.
 //
@@ -146,6 +178,36 @@ func NewBlobTxSubmitter(
 	}
 }
 
+func (s *BlobTxSubmitter) signBlobTx(
+	payload *blobTxPayload,
+	nonce uint64,
+	gasTipCap *big.Int,
+	gasFeeCap *big.Int,
+	blobFeeCap *big.Int,
+	signTx func(tx *types.Transaction, signer types.Signer, key *ecdsa.PrivateKey) (*types.Transaction, error),
+) (*types.Transaction, error) {
+	senderAddr := crypto.PubkeyToAddress(s.signingKey.PublicKey)
+	signer := types.NewCancunSigner(s.chainID)
+
+	tx := types.NewTx(&types.BlobTx{
+		ChainID:    uint256.MustFromBig(s.chainID),
+		Nonce:      nonce,
+		GasTipCap:  uint256.MustFromBig(gasTipCap),
+		GasFeeCap:  uint256.MustFromBig(gasFeeCap),
+		Gas:        21000,
+		To:         senderAddr,
+		BlobFeeCap: uint256.MustFromBig(blobFeeCap),
+		BlobHashes: []common.Hash{payload.versionedHash},
+		Sidecar: &types.BlobTxSidecar{
+			Blobs:       []kzg4844.Blob{payload.blob},
+			Commitments: []kzg4844.Commitment{payload.commitment},
+			Proofs:      []kzg4844.Proof{payload.proof},
+		},
+	})
+
+	return signTx(tx, signer, s.signingKey)
+}
+
 // SubmitBlobTx creates a type-3 blob transaction containing the given data.
 // Returns the versioned hashes of the submitted blobs.
 func (s *BlobTxSubmitter) SubmitBlobTx(ctx context.Context, data []byte) ([][32]byte, error) {
@@ -162,65 +224,19 @@ func (s *BlobTxSubmitter) SubmitBlobTx(ctx context.Context, data []byte) ([][32]
 		waitMined = bind.WaitMined
 	}
 
-	b, err := pkgblob.EncodeBlobData(data)
+	payload, err := encodeBlobTxPayload(data, "blob payload")
 	if err != nil {
-		return nil, fmt.Errorf("encode blob payload: %w", err)
+		return nil, err
 	}
-
-	commitment, err := kzg4844.BlobToCommitment(&b)
-	if err != nil {
-		return nil, fmt.Errorf("compute KZG commitment: %w", err)
-	}
-
-	proof, err := kzg4844.ComputeBlobProof(&b, commitment)
-	if err != nil {
-		return nil, fmt.Errorf("compute KZG proof: %w", err)
-	}
-
-	versionedHash := pkgblob.VersionedHash(commitment[:])
 
 	gasTipCap, err := txBackend.SuggestGasTipCap(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("suggest gas tip cap: %w", err)
 	}
 
-	nonce, err := s.nonceMgr.NextNonce(ctx)
-	if err != nil {
-		return nil, fmt.Errorf("get nonce for blob tx: %w", err)
-	}
-
-	senderAddr := crypto.PubkeyToAddress(s.signingKey.PublicKey)
-	signer := types.NewCancunSigner(s.chainID)
-
-	tx := types.NewTx(&types.BlobTx{
-		ChainID:    uint256.MustFromBig(s.chainID),
-		Nonce:      nonce,
-		GasTipCap:  uint256.MustFromBig(gasTipCap),
-		GasFeeCap:  uint256.MustFromBig(s.maxGasPrice),
-		Gas:        21000,
-		To:         senderAddr,
-		BlobFeeCap: uint256.NewInt(1_000_000_000), // 1 gwei blob fee cap
-		BlobHashes: []common.Hash{versionedHash},
-		Sidecar: &types.BlobTxSidecar{
-			Blobs:       []kzg4844.Blob{b},
-			Commitments: []kzg4844.Commitment{commitment},
-			Proofs:      []kzg4844.Proof{proof},
-		},
-	})
-
-	signedTx, err := signTx(tx, signer, s.signingKey)
-	if err != nil {
-		s.nonceMgr.ResetNonce()
-		return nil, fmt.Errorf("sign blob tx: %w", err)
-	}
-
-	txHash := signedTx.Hash()
-
 	if s.logger != nil {
 		s.logger.Debug("acquiring blob broadcast slot",
 			"stage", "submit_blob",
-			"txHash", txHash.Hex(),
-			"nonce", nonce,
 		)
 	}
 	serializer := s.broadcastSerializer()
@@ -230,8 +246,6 @@ func (s *BlobTxSubmitter) SubmitBlobTx(ctx context.Context, data []byte) ([][32]
 		if s.logger != nil {
 			s.logger.Warn("ctx cancelled waiting for broadcast slot",
 				"stage", "submit_blob",
-				"txHash", txHash.Hex(),
-				"nonce", nonce,
 				"mutexWaitMs", mutexWaitMs,
 				"error", err,
 			)
@@ -241,84 +255,30 @@ func (s *BlobTxSubmitter) SubmitBlobTx(ctx context.Context, data []byte) ([][32]
 	defer serializer.Release()
 	mutexWaitMs := time.Since(mutexWaitStart).Milliseconds()
 
+	if err := ctx.Err(); err != nil {
+		return nil, fmt.Errorf("wait for blob broadcast slot: %w", err)
+	}
+
+	nonce, err := s.nonceMgr.NextNonce(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("get nonce for blob tx: %w", err)
+	}
+
+	signedTx, err := s.signBlobTx(payload, nonce, gasTipCap, s.maxGasPrice, big.NewInt(defaultBlobFeeCapWei), signTx)
+	if err != nil {
+		s.nonceMgr.ResetNonce()
+		return nil, fmt.Errorf("sign blob tx: %w", err)
+	}
+	if err := ctx.Err(); err != nil {
+		s.nonceMgr.ResetNonce()
+		return nil, fmt.Errorf("broadcast blob tx: %w", err)
+	}
+
+	txHash := signedTx.Hash()
+
 	broadcastStart := time.Now()
 	if err := txBackend.SendTransaction(ctx, signedTx); err != nil {
-		resetNonce := workerchain.ShouldResetNonceOnSendError(err)
-		if resetNonce {
-			s.nonceMgr.ResetNonce()
-		}
-		// Stuck-nonce detection (Hazard B): when the rejection reason is
-		// "address already reserved" at the same nonce repeatedly, it
-		// indicates a tx stuck in the mempool that ResetNonce+refetch
-		// cannot clear. Record a hit on the shared tracker and log
-		// distinctly once we cross the threshold — Commit I activates
-		// automated replacement in this branch.
-		stuckHits := 0
-		stuck := strings.Contains(err.Error(), "address already reserved")
-		if stuck {
-			stuckHits = s.stuckNonceTracker().Record(nonce)
-		}
-		if s.logger != nil {
-			s.logger.Warn("blob tx rejected by SendTransaction",
-				"stage", "submit_blob",
-				"txHash", txHash.Hex(),
-				"nonce", nonce,
-				"mutexWaitMs", mutexWaitMs,
-				"nonceReset", resetNonce,
-				"stuckHits", stuckHits,
-				"error", err,
-			)
-		}
-
-		// Stuck-nonce recovery (Hazard B automated branch). When
-		// threshold is met, attempt an eviction by broadcasting a
-		// replacement blob tx at the SAME nonce with 2^N-bumped fees.
-		// Still holds the serializer slot (defer hasn't run), so the
-		// replacement broadcast is covered by the same sender-wide lock
-		// as the original.
-		if stuck && s.stuckCfg.Threshold > 0 && stuckHits >= s.stuckCfg.Threshold {
-			if !s.stuckCfg.AutoReplace {
-				if s.logger != nil {
-					s.logger.Error("stuck-nonce threshold reached; auto-replace disabled, manual intervention required",
-						"stage", "submit_blob",
-						"nonce", nonce,
-						"consecutiveHits", stuckHits,
-						"threshold", s.stuckCfg.Threshold,
-					)
-				}
-			} else {
-				tracker := s.stuckNonceTracker()
-				bumpsUsed := tracker.BumpAttemptsUsed()
-				if bumpsUsed >= s.stuckCfg.MaxBumps {
-					if s.logger != nil {
-						s.logger.Error("stuck-nonce replacement bumps exhausted; manual intervention required",
-							"stage", "submit_blob",
-							"nonce", nonce,
-							"bumpsUsed", bumpsUsed,
-							"maxBumps", s.stuckCfg.MaxBumps,
-						)
-					}
-				} else if rErr := s.submitReplacementBlobTx(ctx, txBackend, signTx, nonce, bumpsUsed+1); rErr != nil {
-					if s.logger != nil {
-						s.logger.Error("stuck-nonce replacement broadcast failed",
-							"stage", "submit_blob",
-							"nonce", nonce,
-							"bumpNumber", bumpsUsed+1,
-							"error", rErr,
-						)
-					}
-				} else if s.logger != nil {
-					s.logger.Warn("stuck-nonce replacement broadcast successfully",
-						"stage", "submit_blob",
-						"nonce", nonce,
-						"bumpNumber", bumpsUsed+1,
-						"maxBumps", s.stuckCfg.MaxBumps,
-						"hint", "next asynq retry should either succeed or hit fresh address-reserved; tracker will increment bumpNumber again",
-					)
-				}
-			}
-		}
-
+		s.handleSendError(ctx, txBackend, signTx, err, nonce, txHash, mutexWaitMs)
 		return nil, fmt.Errorf("send blob tx: %w", err)
 	}
 
@@ -379,7 +339,104 @@ func (s *BlobTxSubmitter) SubmitBlobTx(ctx context.Context, data []byte) ([][32]
 		)
 	}
 
-	return [][32]byte{versionedHash}, nil
+	return [][32]byte{[32]byte(payload.versionedHash)}, nil
+}
+
+func (s *BlobTxSubmitter) handleSendError(
+	ctx context.Context,
+	txBackend BlobTxBackend,
+	signTx func(tx *types.Transaction, signer types.Signer, key *ecdsa.PrivateKey) (*types.Transaction, error),
+	err error,
+	nonce uint64,
+	txHash common.Hash,
+	mutexWaitMs int64,
+) {
+	resetNonce := workerchain.ShouldResetNonceOnSendError(err)
+	if resetNonce {
+		s.nonceMgr.ResetNonce()
+	}
+
+	stuckHits := 0
+	stuck := workerchain.IsAlreadyReservedError(err)
+	if stuck {
+		stuckHits = s.stuckNonceTracker().Record(nonce)
+	}
+
+	if s.logger != nil {
+		s.logger.Warn("blob tx rejected by SendTransaction",
+			"stage", "submit_blob",
+			"txHash", txHash.Hex(),
+			"nonce", nonce,
+			"mutexWaitMs", mutexWaitMs,
+			"nonceReset", resetNonce,
+			"stuckHits", stuckHits,
+			"error", err,
+		)
+	}
+
+	if stuck {
+		s.maybeSubmitReplacementBlobTx(ctx, txBackend, signTx, nonce, stuckHits)
+	}
+}
+
+func (s *BlobTxSubmitter) maybeSubmitReplacementBlobTx(
+	ctx context.Context,
+	txBackend BlobTxBackend,
+	signTx func(tx *types.Transaction, signer types.Signer, key *ecdsa.PrivateKey) (*types.Transaction, error),
+	nonce uint64,
+	stuckHits int,
+) {
+	if s.stuckCfg.Threshold <= 0 || stuckHits < s.stuckCfg.Threshold {
+		return
+	}
+	if !s.stuckCfg.AutoReplace {
+		if s.logger != nil {
+			s.logger.Error("stuck-nonce threshold reached; auto-replace disabled, manual intervention required",
+				"stage", "submit_blob",
+				"nonce", nonce,
+				"consecutiveHits", stuckHits,
+				"threshold", s.stuckCfg.Threshold,
+			)
+		}
+		return
+	}
+
+	tracker := s.stuckNonceTracker()
+	bumpsUsed := tracker.BumpAttemptsUsed()
+	if bumpsUsed >= s.stuckCfg.MaxBumps {
+		if s.logger != nil {
+			s.logger.Error("stuck-nonce replacement bumps exhausted; manual intervention required",
+				"stage", "submit_blob",
+				"nonce", nonce,
+				"bumpsUsed", bumpsUsed,
+				"maxBumps", s.stuckCfg.MaxBumps,
+			)
+		}
+		return
+	}
+
+	bumpNumber := bumpsUsed + 1
+	if err := s.submitReplacementBlobTx(ctx, txBackend, signTx, nonce, bumpNumber); err != nil {
+		if s.logger != nil {
+			s.logger.Error("stuck-nonce replacement broadcast failed",
+				"stage", "submit_blob",
+				"nonce", nonce,
+				"bumpNumber", bumpNumber,
+				"error", err,
+			)
+		}
+		return
+	}
+
+	if s.logger != nil {
+		s.logger.Warn("stuck-nonce replacement broadcast succeeded",
+			"stage", "submit_blob",
+			"nonce", nonce,
+			"bumpNumber", bumpNumber,
+			"maxBumps", s.stuckCfg.MaxBumps,
+			"hint", "next asynq retry should observe the replacement result",
+		)
+	}
 }
 
 // submitReplacementBlobTx broadcasts a bumped-fee blob tx at the given
@@ -389,8 +446,8 @@ func (s *BlobTxSubmitter) SubmitBlobTx(ctx context.Context, data []byte) ([][32]
 //
 // Fee bumps are 2^bumpNumber × the configured baseline. First replacement
 // (bumpNumber=1) is 2× everything, second (bumpNumber=2) is 4×, etc. Cap
-// is enforced by the caller via stuckCfg.MaxBumps — each successful
-// broadcast here increments the tracker's bump counter.
+// is enforced by the caller via stuckCfg.MaxBumps — each broadcast
+// attempt here increments the tracker's bump counter.
 //
 // Go-ethereum blobpool replacement rules: same sender + same nonce + ALL
 // three fee fields bumped by at least the configured minimum (100% by
@@ -412,20 +469,14 @@ func (s *BlobTxSubmitter) submitReplacementBlobTx(
 	if bumpNumber < 1 {
 		return fmt.Errorf("bumpNumber must be >= 1, got %d", bumpNumber)
 	}
+	if err := ctx.Err(); err != nil {
+		return fmt.Errorf("replacement context done before build: %w", err)
+	}
 
-	b, err := pkgblob.EncodeBlobData(replacementBlobPayload)
+	payload, err := encodeBlobTxPayload(replacementBlobPayload, "replacement blob payload")
 	if err != nil {
-		return fmt.Errorf("encode replacement blob payload: %w", err)
+		return err
 	}
-	commitment, err := kzg4844.BlobToCommitment(&b)
-	if err != nil {
-		return fmt.Errorf("compute replacement KZG commitment: %w", err)
-	}
-	proof, err := kzg4844.ComputeBlobProof(&b, commitment)
-	if err != nil {
-		return fmt.Errorf("compute replacement KZG proof: %w", err)
-	}
-	versionedHash := pkgblob.VersionedHash(commitment[:])
 
 	tipSuggested, err := txBackend.SuggestGasTipCap(ctx)
 	if err != nil {
@@ -440,31 +491,15 @@ func (s *BlobTxSubmitter) submitReplacementBlobTx(
 	bumpedGasFeeCap := new(big.Int).Mul(s.maxGasPrice, multiplier)
 	// Baseline blob fee cap in the normal path is 1 gwei (hardcoded at
 	// tx build). Bump from there for replacement.
-	baselineBlobFeeCap := big.NewInt(1_000_000_000)
+	baselineBlobFeeCap := big.NewInt(defaultBlobFeeCapWei)
 	bumpedBlobFeeCap := new(big.Int).Mul(baselineBlobFeeCap, multiplier)
 
-	senderAddr := crypto.PubkeyToAddress(s.signingKey.PublicKey)
-	signer := types.NewCancunSigner(s.chainID)
-
-	tx := types.NewTx(&types.BlobTx{
-		ChainID:    uint256.MustFromBig(s.chainID),
-		Nonce:      nonce,
-		GasTipCap:  uint256.MustFromBig(bumpedTip),
-		GasFeeCap:  uint256.MustFromBig(bumpedGasFeeCap),
-		Gas:        21000,
-		To:         senderAddr,
-		BlobFeeCap: uint256.MustFromBig(bumpedBlobFeeCap),
-		BlobHashes: []common.Hash{versionedHash},
-		Sidecar: &types.BlobTxSidecar{
-			Blobs:       []kzg4844.Blob{b},
-			Commitments: []kzg4844.Commitment{commitment},
-			Proofs:      []kzg4844.Proof{proof},
-		},
-	})
-
-	signedTx, err := signTx(tx, signer, s.signingKey)
+	signedTx, err := s.signBlobTx(payload, nonce, bumpedTip, bumpedGasFeeCap, bumpedBlobFeeCap, signTx)
 	if err != nil {
 		return fmt.Errorf("sign replacement blob tx: %w", err)
+	}
+	if err := ctx.Err(); err != nil {
+		return fmt.Errorf("replacement context done before broadcast: %w", err)
 	}
 
 	if s.logger != nil {

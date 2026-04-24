@@ -5,7 +5,6 @@ import (
 	"crypto/ecdsa"
 	"fmt"
 	"math/big"
-	"strings"
 	"sync"
 
 	"github.com/ethereum/go-ethereum/accounts/abi/bind"
@@ -239,6 +238,18 @@ func (c *ChainClient) submitPreparedTx(
 		return fmt.Errorf("suggest gas price: %w", err)
 	}
 
+	// Acquire the shared per-sender broadcast slot before reserving a nonce.
+	// That keeps cancelled waiters from burning local nonce-manager entries
+	// for transactions that never reach SendTransaction.
+	serializer := c.broadcastSerializer()
+	if err := serializer.Acquire(ctx); err != nil {
+		return fmt.Errorf("wait for %s broadcast slot: %w", txName, err)
+	}
+	defer serializer.Release()
+	if err := ctx.Err(); err != nil {
+		return fmt.Errorf("wait for %s broadcast slot: %w", txName, err)
+	}
+
 	auth, err := bind.NewKeyedTransactorWithChainID(c.signingKey, c.chainID)
 	if err != nil {
 		return fmt.Errorf("create transactor: %w", err)
@@ -261,23 +272,10 @@ func (c *ChainClient) submitPreparedTx(
 		return fmt.Errorf("%s transaction: %w", txName, err)
 	}
 
-	// Acquire the shared per-sender broadcast slot before SendTransaction.
-	// Held until after WaitMined returns so no concurrent blob tx from
-	// BlobTxSubmitter can collide with this broadcast on go-ethereum's
-	// sender-wide ErrAlreadyReserved. Ctx-aware so a cancelled task
-	// drops out promptly if another holder is stuck in WaitMined.
-	//
-	// Nonce was allocated above; on ctx cancel here we do NOT reset —
-	// the tx never went out, but another concurrent caller may have
-	// observed a higher nonce downstream and a reset would cause them
-	// to refetch. The allocated nonce simply goes unused; the chain's
-	// PendingNonceAt will not regress, so next NextNonce just proceeds
-	// past it. A retry will reclaim it via ResetNonce if needed.
-	serializer := c.broadcastSerializer()
-	if err := serializer.Acquire(ctx); err != nil {
-		return fmt.Errorf("wait for %s broadcast slot: %w", txName, err)
+	if err := ctx.Err(); err != nil {
+		c.nonceMgr.ResetNonce()
+		return fmt.Errorf("broadcast %s tx: %w", txName, err)
 	}
-	defer serializer.Release()
 
 	if err := backend.SendTransaction(ctx, tx); err != nil {
 		if ShouldResetNonceOnSendError(err) {
@@ -290,7 +288,7 @@ func (c *ChainClient) submitPreparedTx(
 		// evict a stuck blob from the pool (go-ethereum blob pool only
 		// accepts blob replacements), so we defer the actual fix to
 		// the next blob broadcast's decision.
-		if strings.Contains(err.Error(), "address already reserved") {
+		if IsAlreadyReservedError(err) {
 			c.stuckNonceTracker().Record(tx.Nonce())
 		}
 		return fmt.Errorf("send %s tx: %w", txName, err)

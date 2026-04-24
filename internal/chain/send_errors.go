@@ -39,10 +39,20 @@ const (
 	nonceTooLowSubstr     = "nonce too low"
 )
 
-// isNonceDesyncError reports whether err is any of the three known local/chain
-// nonce-desync conditions that should trigger a NonceManager reset so the next
+// IsAlreadyReservedError reports whether err is go-ethereum's sender
+// reservation rejection, including the JSON-RPC wrapped forms where only the
+// message survives.
+func IsAlreadyReservedError(err error) bool {
+	if err == nil {
+		return false
+	}
+	return strings.Contains(err.Error(), alreadyReservedSubstr)
+}
+
+// IsNonceDesyncError reports whether err is any known local/chain nonce
+// desync condition that should trigger a NonceManager reset so the next
 // NextNonce() refetches the chain's pending nonce.
-func isNonceDesyncError(err error) bool {
+func IsNonceDesyncError(err error) bool {
 	if err == nil {
 		return false
 	}
@@ -55,7 +65,7 @@ func isNonceDesyncError(err error) bool {
 // ShouldResetNonceOnSendError reports whether a SendTransaction failure was a
 // definite pre-broadcast rejection and the locally reserved nonce should be discarded.
 func ShouldResetNonceOnSendError(err error) bool {
-	if isNonceDesyncError(err) {
+	if IsNonceDesyncError(err) {
 		return true
 	}
 
