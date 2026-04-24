@@ -50,13 +50,26 @@ type Config struct {
 	BeaconAPIURL string
 
 	// Job execution
-	MaxConcurrentJobs int
-	AckTxTimeout      time.Duration
-	BlobTxTimeout     time.Duration
-	BlobFetchTimeout  time.Duration
-	BlobFetchRetries  int
-	SessionKeyFile    string
+	MaxConcurrentJobs   int
+	AckTxTimeout        time.Duration
+	BlobTxTimeout       time.Duration
+	BlobFetchTimeout    time.Duration
+	BlobFetchRetries    int
+	SessionKeyFile      string
 	ReceiptPollInterval time.Duration
+
+	// JobCheckpoint — retry-safety cache for stages 2-6.
+	//
+	// CheckpointTTL is how long a checkpoint record lives after the first
+	// write. Chosen generously (2h) so asynq retries over long backoffs
+	// still hit the cache; a shorter TTL is applied after on-chain
+	// completion (see Tombstone).
+	//
+	// CheckpointMaxBytes caps the cached ciphertext size. Oversized
+	// responses are refused and fall through to per-retry re-inference.
+	// Default 256 KiB comfortably fits llama-scale responses with headroom.
+	CheckpointTTL      time.Duration
+	CheckpointMaxBytes int
 
 	// Stuck-nonce recovery (Hazard B). When the worker's signing key has a
 	// tx stuck in the mempool — e.g. BlobFeeCap underbid the current blob
@@ -73,9 +86,9 @@ type Config struct {
 	//
 	// StuckNonceAutoReplace — operator kill-switch. When false the tracker
 	// still detects and logs, but no replacement tx is submitted.
-	StuckNonceThreshold    int
-	StuckNonceMaxBumps     int
-	StuckNonceAutoReplace  bool
+	StuckNonceThreshold   int
+	StuckNonceMaxBumps    int
+	StuckNonceAutoReplace bool
 
 	// Shutdown
 	ShutdownTimeout time.Duration
@@ -205,6 +218,10 @@ func Load() (*Config, error) {
 	cfg.StuckNonceThreshold = parseInt("WORKER_STUCK_NONCE_THRESHOLD", 5, &errs)
 	cfg.StuckNonceMaxBumps = parseInt("WORKER_STUCK_NONCE_MAX_BUMPS", 3, &errs)
 	cfg.StuckNonceAutoReplace = parseBool("WORKER_STUCK_NONCE_AUTOREPLACE", true, &errs)
+
+	// Job checkpoint (retry-safety cache)
+	cfg.CheckpointTTL = parseDuration("WORKER_CHECKPOINT_TTL", "2h", &errs)
+	cfg.CheckpointMaxBytes = parseInt("WORKER_CHECKPOINT_MAX_BYTES", 262144, &errs)
 
 	if len(errs) > 0 {
 		return nil, fmt.Errorf("config load errors:\n  - %s", strings.Join(errs, "\n  - "))

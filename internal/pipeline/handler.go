@@ -85,23 +85,28 @@ type ResponsePublisher interface {
 
 // JobHandler processes inference jobs received from Asynq.
 type JobHandler struct {
-	chainClient        JobExecutionClient
-	blobFetcher        BlobFetcher
-	blobSubmitter      BlobSubmitter
-	keyStore           SessionKeyGetter
-	ollamaClient       InferenceClient
-	redisClient        *redis.Client
-	responsePublisher  ResponsePublisher
-	signingKey         *ecdsa.PrivateKey
-	ecdhKey            *ecdh.PrivateKey
-	jobCounter         *atomic.Int32
-	logger             *slog.Logger
-	cfg                HandlerConfig
-	modelIDToName      map[string]string
+	chainClient   JobExecutionClient
+	blobFetcher   BlobFetcher
+	blobSubmitter BlobSubmitter
+	keyStore      SessionKeyGetter
+	ollamaClient  InferenceClient
+	redisClient   *redis.Client
+	signingKey    *ecdsa.PrivateKey
+	ecdhKey       *ecdh.PrivateKey
+	jobCounter    *atomic.Int32
+	logger        *slog.Logger
+	cfg           HandlerConfig
+	modelIDToName map[string]string
+	// checkpoints is optional. When nil, the handler runs without retry
+	// caching — equivalent to pre-PR-2 behavior. Production wires a
+	// Redis-backed store here; tests that exercise the cache path do the
+	// same via miniredis.
+	checkpoints *CheckpointStore
 }
 
-// NewJobHandler creates a handler wired with all dependencies.
-// If publisher is nil, a RedisResponsePublisher is created from redisClient.
+// NewJobHandler creates a handler wired with all dependencies. checkpoints
+// may be nil — when nil, the handler skips the retry-safety cache (stages
+// 2-6 re-run on every asynq retry, same as pre-checkpoint behavior).
 func NewJobHandler(
 	chainClient JobExecutionClient,
 	blobFetcher BlobFetcher,
@@ -114,18 +119,27 @@ func NewJobHandler(
 	jobCounter *atomic.Int32,
 	logger *slog.Logger,
 	cfg HandlerConfig,
-	publisher ...ResponsePublisher,
+	checkpoints *CheckpointStore,
 ) *JobHandler {
 	modelIDToName := make(map[string]string, len(cfg.ModelIDToName))
 	for k, v := range cfg.ModelIDToName {
 		modelIDToName[normalizeModelLookupKey(k)] = v
 	}
 
-	var rp ResponsePublisher
-	if len(publisher) > 0 && publisher[0] != nil {
-		rp = publisher[0]
-	} else if redisClient != nil {
-		rp = &RedisResponsePublisher{client: redisClient, logger: logger}
+	return &JobHandler{
+		chainClient:   chainClient,
+		blobFetcher:   blobFetcher,
+		blobSubmitter: blobSubmitter,
+		keyStore:      keyStore,
+		ollamaClient:  ollamaClient,
+		redisClient:   redisClient,
+		signingKey:    signingKey,
+		ecdhKey:       ecdhKey,
+		jobCounter:    jobCounter,
+		logger:        logger,
+		cfg:           cfg,
+		modelIDToName: modelIDToName,
+		checkpoints:   checkpoints,
 	}
 
 	return &JobHandler{
@@ -307,32 +321,218 @@ func (h *JobHandler) processJob(ctx context.Context, p JobPayload) error {
 		"durationMs", time.Since(stageStart).Milliseconds(),
 	)
 
-	// Stage 2: Fetch the prompt blob from the consensus layer. Post-audit
-	// each job carries a single bytes32 prompt blob hash.
-	if p.PromptBlobHash == (common.Hash{}) {
-		return fmt.Errorf("stage 2 (fetch blob): prompt blob hash is zero")
+	// Read checkpoint once after stage 1. The result determines whether
+	// stages 2-6 (inference), 7 (redis publish), and 8a (blob submit) can
+	// be skipped on a retry. Nil handler or Get error => treat as cache
+	// miss and run the full pipeline — same as pre-checkpoint behavior.
+	ckpt := h.readCheckpoint(ctx, logger, p.JobID)
+
+	var ciphertext []byte
+
+	if ckpt.HasCiphertext() {
+		logger.Info("checkpoint hit, skipping stages 2-6",
+			"stage", "checkpoint",
+			"reason", "inference_cached",
+			"ciphertextBytes", len(ckpt.Ciphertext),
+		)
+		ciphertext = ckpt.Ciphertext
+	} else {
+		// Stage 2: Fetch the prompt blob from the consensus layer. Post-audit
+		// each job carries a single bytes32 prompt blob hash.
+		if p.PromptBlobHash == (common.Hash{}) {
+			return fmt.Errorf("stage 2 (fetch blob): prompt blob hash is zero")
+		}
+		stageStart = time.Now()
+		logger.Info("stage 2 starting",
+			"stage", "fetch_blob",
+			"promptBlobHash", p.PromptBlobHash.Hex(),
+			"blockNumber", p.BlockNumber,
+		)
+		blobData, err := h.blobFetcher.FetchBlob(ctx, p.PromptBlobHash, p.BlockNumber)
+		if err != nil {
+			return fmt.Errorf("stage 2 (fetch blob %s): %w", p.PromptBlobHash.Hex(), err)
+		}
+		logger.Info("stage 2 complete",
+			"stage", "fetch_blob",
+			"blobBytes", len(blobData),
+			"durationMs", time.Since(stageStart).Milliseconds(),
+		)
+
+		// Stages 3-6 produce ciphertext; they're wrapped in a helper so the
+		// old inlined code keeps its exact stage-boundary logging but the
+		// checkpoint branching stays readable.
+		producedCiphertext, err := h.runInferencePipeline(ctx, logger, p, blobData)
+		if err != nil {
+			return err
+		}
+		ciphertext = producedCiphertext
+
+		// Persist canonical ciphertext. Under a concurrent retry on the
+		// same jobID, SetCiphertextIfAbsent returns the earlier writer's
+		// bytes — we overwrite our local with canonical so stage 7's
+		// publish and stage 8b's hash match what the user already received.
+		if h.checkpoints != nil {
+			canonical, wasSet, cErr := h.checkpoints.SetCiphertextIfAbsent(ctx, p.JobID, ciphertext)
+			switch {
+			case cErr != nil:
+				logger.Warn("failed to persist ciphertext to checkpoint",
+					"stage", "checkpoint",
+					"error", cErr,
+				)
+			case !wasSet:
+				logger.Warn("checkpoint race lost, using canonical ciphertext",
+					"stage", "checkpoint",
+					"localBytes", len(ciphertext),
+					"canonicalBytes", len(canonical),
+				)
+				ciphertext = canonical
+			default:
+				logger.Debug("ciphertext persisted to checkpoint",
+					"stage", "checkpoint",
+					"ciphertextBytes", len(ciphertext),
+				)
+			}
+		}
 	}
+
+	// Stage 7: Publish to Redis (non-fatal on error). Skipped on retry if
+	// the checkpoint records delivered=true so relay subscribers don't see
+	// a duplicate complete frame.
+	if ckpt.Delivered {
+		logger.Info("checkpoint hit, skipping stage 7",
+			"stage", "checkpoint",
+			"reason", "delivered",
+		)
+	} else {
+		stageStart = time.Now()
+		h.publishToRedis(ctx, logger, p.JobID, p.SessionID, p.CorrelationID, ciphertext)
+		logger.Info("stage 7 complete",
+			"stage", "redis_publish",
+			"durationMs", time.Since(stageStart).Milliseconds(),
+		)
+		if h.checkpoints != nil {
+			if err := h.checkpoints.MarkDelivered(ctx, p.JobID); err != nil {
+				logger.Warn("failed to mark delivered on checkpoint",
+					"stage", "checkpoint",
+					"error", err,
+				)
+			}
+		}
+	}
+
+	// Stage 8a: Submit blob TX.
+	// Post-audit the contract's completeJob takes a single bytes32
+	// responseBlobHash and enforces `blobhash(0) == responseBlobHash`, so the
+	// blob TX must carry exactly one blob.
+	//
+	// Wrap in BlobTxTimeout so a stuck WaitMined (e.g. dead EL websocket)
+	// cannot hold the broadcast slot indefinitely and starve other jobs.
+	// Matches the AckTxTimeout pattern above.
+	var versionedHash common.Hash
+	if ckpt.HasVersionedHash() {
+		logger.Info("checkpoint hit, skipping stage 8a",
+			"stage", "checkpoint",
+			"reason", "blob_submitted",
+			"versionedHash", ckpt.VersionedHash.Hex(),
+		)
+		versionedHash = ckpt.VersionedHash
+	} else {
+		stageStart = time.Now()
+		logger.Info("stage 8a starting",
+			"stage", "submit_blob",
+			"ciphertextBytes", len(ciphertext),
+			"timeout", h.cfg.BlobTxTimeout.String(),
+		)
+		submitCtx, submitCancel := context.WithTimeout(ctx, h.cfg.BlobTxTimeout)
+		blobHashes, err := h.blobSubmitter.SubmitBlobTx(submitCtx, ciphertext)
+		submitCancel()
+		if err != nil {
+			return fmt.Errorf("stage 8 (submit blob): %w", err)
+		}
+		if len(blobHashes) != 1 {
+			return fmt.Errorf("stage 8 (submit blob): expected exactly 1 blob hash, got %d", len(blobHashes))
+		}
+		versionedHash = common.Hash(blobHashes[0])
+		logger.Info("stage 8a complete",
+			"stage", "submit_blob",
+			"versionedHash", versionedHash.Hex(),
+			"durationMs", time.Since(stageStart).Milliseconds(),
+		)
+		if h.checkpoints != nil {
+			if err := h.checkpoints.SetVersionedHash(ctx, p.JobID, versionedHash); err != nil {
+				logger.Warn("failed to persist versionedHash on checkpoint",
+					"stage", "checkpoint",
+					"error", err,
+				)
+			}
+		}
+	}
+
+	// Stage 8b: Complete job on-chain.
 	stageStart = time.Now()
-	logger.Info("stage 2 starting",
-		"stage", "fetch_blob",
-		"promptBlobHash", p.PromptBlobHash.Hex(),
-		"blockNumber", p.BlockNumber,
+	responseCiphertextHash := crypto.Keccak256Hash(ciphertext)
+	logger.Info("stage 8b starting",
+		"stage", "complete_job",
+		"versionedHash", versionedHash.Hex(),
+		"ciphertextHash", responseCiphertextHash.Hex(),
 	)
-	blobData, err := h.blobFetcher.FetchBlob(ctx, p.PromptBlobHash, p.BlockNumber)
-	if err != nil {
-		return fmt.Errorf("stage 2 (fetch blob %s): %w", p.PromptBlobHash.Hex(), err)
+	if err := h.completeJob(ctx, logger, p.JobID, versionedHash, responseCiphertextHash); err != nil {
+		return fmt.Errorf("stage 8 (complete job): %w", err)
 	}
-	logger.Info("stage 2 complete",
-		"stage", "fetch_blob",
-		"blobBytes", len(blobData),
+	logger.Info("stage 8b complete",
+		"stage", "complete_job",
 		"durationMs", time.Since(stageStart).Milliseconds(),
 	)
 
+	// Tombstone the checkpoint after a successful stage 8b. A short TTL
+	// lets any straggler retry observe "completed" before the record
+	// disappears; outright Delete would race concurrent retries.
+	if h.checkpoints != nil {
+		if err := h.checkpoints.Tombstone(ctx, p.JobID); err != nil {
+			logger.Warn("failed to tombstone checkpoint after completion",
+				"stage", "checkpoint",
+				"error", err,
+			)
+		}
+	}
+
+	return nil
+}
+
+// readCheckpoint returns the cached checkpoint for jobID, or a zero
+// JobCheckpoint on nil handler / miss / error. Errors are logged and
+// downgraded so a flaky Redis doesn't break job processing.
+func (h *JobHandler) readCheckpoint(ctx context.Context, logger *slog.Logger, jobID uint64) JobCheckpoint {
+	if h.checkpoints == nil {
+		return JobCheckpoint{}
+	}
+	ckpt, err := h.checkpoints.Get(ctx, jobID)
+	if err != nil {
+		logger.Warn("failed to read checkpoint; treating as cache miss",
+			"stage", "checkpoint",
+			"error", err,
+		)
+		return JobCheckpoint{}
+	}
+	return ckpt
+}
+
+// runInferencePipeline runs stages 3-6: session key fetch, prompt
+// decryption, Ollama inference (with optional conversation history),
+// and response encryption. Returns the ciphertext that stages 7 and 8a
+// will publish/submit. All stage-boundary log lines are preserved
+// verbatim against the pre-checkpoint implementation.
+func (h *JobHandler) runInferencePipeline(
+	ctx context.Context,
+	logger *slog.Logger,
+	p JobPayload,
+	blobData []byte,
+) ([]byte, error) {
 	// Stage 3: Get session key (cache miss → chain fetch → store)
-	stageStart = time.Now()
+	stageStart := time.Now()
 	sessionKey, err := h.getOrDeriveSessionKey(ctx, logger, p.SessionID)
 	if err != nil {
-		return fmt.Errorf("stage 3 (session key): %w", err)
+		return nil, fmt.Errorf("stage 3 (session key): %w", err)
 	}
 	logger.Info("stage 3 complete",
 		"stage", "session_key",
@@ -354,12 +554,12 @@ func (h *JobHandler) processJob(ctx context.Context, p JobPayload) error {
 		)
 		refreshed, refreshErr := h.refreshSessionKey(ctx, logger, p.SessionID)
 		if refreshErr != nil {
-			return fmt.Errorf("stage 4 (decrypt prompt): %w (refresh failed: %v)", err, refreshErr)
+			return nil, fmt.Errorf("stage 4 (decrypt prompt): %w (refresh failed: %v)", err, refreshErr)
 		}
 		sessionKey = refreshed
 		prompt, err = pkgcrypto.Decrypt(sessionKey, blobData)
 		if err != nil {
-			return fmt.Errorf("stage 4 (decrypt prompt after key refresh): %w", err)
+			return nil, fmt.Errorf("stage 4 (decrypt prompt after key refresh): %w", err)
 		}
 	}
 	logger.Info("stage 4 complete",
@@ -371,7 +571,7 @@ func (h *JobHandler) processJob(ctx context.Context, p JobPayload) error {
 	// Stage 5: AI inference (with conversation history if prior jobs exist)
 	modelName, err := h.resolveModelName(p.ModelID)
 	if err != nil {
-		return fmt.Errorf("stage 5 (resolve model): %w", err)
+		return nil, fmt.Errorf("stage 5 (resolve model): %w", err)
 	}
 
 	var response string
@@ -399,12 +599,12 @@ func (h *JobHandler) processJob(ctx context.Context, p JobPayload) error {
 		messages := append(history, ollama.ChatMessage{Role: "user", Content: string(prompt)})
 		response, err = h.ollamaClient.Chat(ctx, modelName, messages)
 		if err != nil {
-			return fmt.Errorf("stage 5 (chat inference): %w", err)
+			return nil, fmt.Errorf("stage 5 (chat inference): %w", err)
 		}
 	} else {
 		response, err = h.ollamaClient.Generate(ctx, modelName, string(prompt))
 		if err != nil {
-			return fmt.Errorf("stage 5 (inference): %w", err)
+			return nil, fmt.Errorf("stage 5 (inference): %w", err)
 		}
 	}
 	logger.Info("stage 5 complete",
@@ -418,7 +618,7 @@ func (h *JobHandler) processJob(ctx context.Context, p JobPayload) error {
 	stageStart = time.Now()
 	ciphertext, err := pkgcrypto.Encrypt(sessionKey, []byte(response))
 	if err != nil {
-		return fmt.Errorf("stage 6 (encrypt response): %w", err)
+		return nil, fmt.Errorf("stage 6 (encrypt response): %w", err)
 	}
 	logger.Info("stage 6 complete",
 		"stage", "encrypt",
@@ -426,61 +626,7 @@ func (h *JobHandler) processJob(ctx context.Context, p JobPayload) error {
 		"durationMs", time.Since(stageStart).Milliseconds(),
 	)
 
-	// Stage 7: Publish to Redis (non-fatal on error)
-	stageStart = time.Now()
-	h.publishToRedis(ctx, logger, p.JobID, p.SessionID, p.CorrelationID, ciphertext)
-	logger.Info("stage 7 complete",
-		"stage", "redis_publish",
-		"durationMs", time.Since(stageStart).Milliseconds(),
-	)
-
-	// Stage 8a: Submit blob TX.
-	// Post-audit the contract's completeJob takes a single bytes32
-	// responseBlobHash and enforces `blobhash(0) == responseBlobHash`, so the
-	// blob TX must carry exactly one blob.
-	//
-	// Wrap in BlobTxTimeout so a stuck WaitMined (e.g. dead EL websocket)
-	// cannot hold the broadcast slot indefinitely and starve other jobs.
-	// Matches the AckTxTimeout pattern above.
-	stageStart = time.Now()
-	logger.Info("stage 8a starting",
-		"stage", "submit_blob",
-		"ciphertextBytes", len(ciphertext),
-		"timeout", h.cfg.BlobTxTimeout.String(),
-	)
-	submitCtx, submitCancel := context.WithTimeout(ctx, h.cfg.BlobTxTimeout)
-	blobHashes, err := h.blobSubmitter.SubmitBlobTx(submitCtx, ciphertext)
-	submitCancel()
-	if err != nil {
-		return fmt.Errorf("stage 8 (submit blob): %w", err)
-	}
-	if len(blobHashes) != 1 {
-		return fmt.Errorf("stage 8 (submit blob): expected exactly 1 blob hash, got %d", len(blobHashes))
-	}
-	versionedHash := common.Hash(blobHashes[0])
-	logger.Info("stage 8a complete",
-		"stage", "submit_blob",
-		"versionedHash", versionedHash.Hex(),
-		"durationMs", time.Since(stageStart).Milliseconds(),
-	)
-
-	// Stage 8b: Complete job on-chain.
-	stageStart = time.Now()
-	responseCiphertextHash := crypto.Keccak256Hash(ciphertext)
-	logger.Info("stage 8b starting",
-		"stage", "complete_job",
-		"versionedHash", versionedHash.Hex(),
-		"ciphertextHash", responseCiphertextHash.Hex(),
-	)
-	if err := h.completeJob(ctx, logger, p.JobID, blobHashes[0], responseCiphertextHash); err != nil {
-		return fmt.Errorf("stage 8 (complete job): %w", err)
-	}
-	logger.Info("stage 8b complete",
-		"stage", "complete_job",
-		"durationMs", time.Since(stageStart).Milliseconds(),
-	)
-
-	return nil
+	return ciphertext, nil
 }
 
 func (h *JobHandler) ensureAcknowledged(ctx context.Context, logger *slog.Logger, jobID uint64) error {

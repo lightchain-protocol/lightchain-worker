@@ -237,6 +237,18 @@ func New(cfg *config.Config) (*Service, error) {
 	// Shared job counter between pipeline handler and heartbeat monitor
 	jobCounter := &atomic.Int32{}
 
+	// Retry-safety checkpoint store. Backed by the same Redis client so
+	// cache records ride the same connection pool as heartbeat and
+	// response pub/sub. Tombstone TTL is fixed at 10 minutes — long enough
+	// that a late retry observes "completed" via the cached record, short
+	// enough that stale entries don't accumulate.
+	checkpoints := pipeline.NewCheckpointStore(
+		redisClient,
+		cfg.CheckpointTTL,
+		10*time.Minute,
+		cfg.CheckpointMaxBytes,
+	)
+
 	// Job pipeline handler
 	handler := pipeline.NewJobHandler(
 		chainClient,
@@ -256,6 +268,7 @@ func New(cfg *config.Config) (*Service, error) {
 			ChainID:         big.NewInt(cfg.ChainID),
 			JobRegistryAddr: cfg.JobRegistryAddress,
 		},
+		checkpoints,
 	)
 
 	// --- Gateway mode: skip Asynq and direct Redis heartbeat ---

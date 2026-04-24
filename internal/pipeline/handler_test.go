@@ -12,6 +12,7 @@ import (
 	"log/slog"
 	"math/big"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -82,6 +83,7 @@ func (m *mockBlobSubmitter) SubmitBlobTx(ctx context.Context, data []byte) ([][3
 }
 
 type mockKeyStore struct {
+	mu   sync.Mutex
 	keys map[uint64][]byte
 }
 
@@ -90,6 +92,8 @@ func newMockKeyStore() *mockKeyStore {
 }
 
 func (m *mockKeyStore) GetKey(sessionID uint64) ([]byte, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	k, ok := m.keys[sessionID]
 	if !ok {
 		return nil, fmt.Errorf("not found")
@@ -98,6 +102,8 @@ func (m *mockKeyStore) GetKey(sessionID uint64) ([]byte, error) {
 }
 
 func (m *mockKeyStore) StoreKey(sessionID uint64, key []byte) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	m.keys[sessionID] = key
 	return nil
 }
@@ -203,6 +209,7 @@ func newTestHandlerWithConfig(
 		chain, fetcher, submitter, keyStore, ollama,
 		redisClient, testSigningKey(t), testECDHKey(t), counter, logger,
 		cfg,
+		nil, // checkpoints — disabled in most handler tests; see TestHandleTask_Checkpoint* for coverage
 	)
 }
 
@@ -277,6 +284,7 @@ func TestHandleTask_FullPipelineSuccess(t *testing.T) {
 				expectedModelID: "llama3-8b",
 			},
 		},
+		nil, // checkpoints disabled for this test
 	)
 
 	payload := testPayload(t)
@@ -389,7 +397,7 @@ func TestHandleTask_SessionKeyCacheHit(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(io.Discard, &slog.HandlerOptions{Level: slog.LevelError}))
 	handler := NewJobHandler(chain, fetcher, submitter, ks, ollama, rc,
 		testSigningKey(t), ecdhKey, counter, logger,
-		HandlerConfig{AckTxTimeout: 5 * time.Second, BlobTxTimeout: 60 * time.Second})
+		HandlerConfig{AckTxTimeout: 5 * time.Second, BlobTxTimeout: 60 * time.Second}, nil)
 
 	payload := testPayload(t)
 	data, _ := json.Marshal(payload)
@@ -435,7 +443,7 @@ func TestHandleTask_SessionKeyCacheMiss_FetchAndStore(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(io.Discard, &slog.HandlerOptions{Level: slog.LevelError}))
 	handler := NewJobHandler(chain, fetcher, submitter, ks, ollama, rc,
 		testSigningKey(t), ecdhKey, counter, logger,
-		HandlerConfig{AckTxTimeout: 5 * time.Second, BlobTxTimeout: 60 * time.Second})
+		HandlerConfig{AckTxTimeout: 5 * time.Second, BlobTxTimeout: 60 * time.Second}, nil)
 
 	payload := testPayload(t)
 	data, _ := json.Marshal(payload)
@@ -503,7 +511,7 @@ func TestHandleTask_SessionKeyRotated_Refreshes(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(io.Discard, &slog.HandlerOptions{Level: slog.LevelError}))
 	handler := NewJobHandler(chain, fetcher, submitter, ks, ollama, rc,
 		testSigningKey(t), ecdhKey, counter, logger,
-		HandlerConfig{AckTxTimeout: 5 * time.Second, BlobTxTimeout: 60 * time.Second})
+		HandlerConfig{AckTxTimeout: 5 * time.Second, BlobTxTimeout: 60 * time.Second}, nil)
 
 	payload := testPayload(t)
 	data, _ := json.Marshal(payload)
@@ -557,7 +565,7 @@ func TestHandleTask_CompleteJobFailure(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(io.Discard, &slog.HandlerOptions{Level: slog.LevelError}))
 	handler := NewJobHandler(chain, fetcher, submitter, ks, ollama, rc,
 		testSigningKey(t), ecdhKey, counter, logger,
-		HandlerConfig{AckTxTimeout: 5 * time.Second, BlobTxTimeout: 60 * time.Second})
+		HandlerConfig{AckTxTimeout: 5 * time.Second, BlobTxTimeout: 60 * time.Second}, nil)
 
 	payload := testPayload(t)
 	data, _ := json.Marshal(payload)
@@ -592,7 +600,7 @@ func TestHandleTask_JobCounterIncrementDecrement(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(io.Discard, &slog.HandlerOptions{Level: slog.LevelError}))
 	handler := NewJobHandler(chain, fetcher, submitter, newMockKeyStore(), ollama, rc,
 		testSigningKey(t), testECDHKey(t), counter, logger,
-		HandlerConfig{AckTxTimeout: 5 * time.Second, BlobTxTimeout: 60 * time.Second})
+		HandlerConfig{AckTxTimeout: 5 * time.Second, BlobTxTimeout: 60 * time.Second}, nil)
 
 	payload := testPayload(t)
 	data, _ := json.Marshal(payload)
@@ -638,7 +646,7 @@ func TestHandleTask_RedisPublishFailure_NonFatal(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(io.Discard, &slog.HandlerOptions{Level: slog.LevelError}))
 	handler := NewJobHandler(chain, fetcher, submitter, ks, ollama, rc,
 		testSigningKey(t), ecdhKey, counter, logger,
-		HandlerConfig{AckTxTimeout: 5 * time.Second, BlobTxTimeout: 60 * time.Second})
+		HandlerConfig{AckTxTimeout: 5 * time.Second, BlobTxTimeout: 60 * time.Second}, nil)
 
 	payload := testPayload(t)
 	data, _ := json.Marshal(payload)
@@ -796,4 +804,285 @@ func TestHandleTask_CompleteAlreadyMined_TreatsRetryAsSuccess(t *testing.T) {
 
 	err = handler.HandleTask(context.Background(), asynq.NewTask(TaskTypeJobInference, data))
 	require.NoError(t, err)
+}
+
+// -----------------------------------------------------------------------
+// JobCheckpoint tests — PR 2
+// -----------------------------------------------------------------------
+
+// TestHandleTask_CheckpointHit_SkipsInference pre-populates a checkpoint
+// with a canonical ciphertext, then runs the handler. Stages 2-6 must be
+// skipped (fetchBlob / inference never called), but stages 7 and 8
+// must still execute against the cached ciphertext. This is the core
+// "skip re-inference on retry" behavior.
+func TestHandleTask_CheckpointHit_SkipsInference(t *testing.T) {
+	t.Parallel()
+	mr := miniredis.RunT(t)
+	rc := redis.NewClient(&redis.Options{Addr: mr.Addr()})
+	t.Cleanup(func() { rc.Close() })
+
+	sessionKey := testSessionKey(t)
+	ecdhKey := testECDHKey(t)
+	// The cached ciphertext is what stages 2-6 WOULD have produced; we
+	// hand it in directly so we can prove inference never runs.
+	cachedCiphertext, err := pkgcrypto.Encrypt(sessionKey, []byte("cached response"))
+	require.NoError(t, err)
+
+	store := NewCheckpointStore(rc, 2*time.Hour, 10*time.Minute, 256*1024)
+	_, wasSet, err := store.SetCiphertextIfAbsent(context.Background(), 42, cachedCiphertext)
+	require.NoError(t, err)
+	require.True(t, wasSet)
+
+	var fetchCalls, inferCalls atomic.Int32
+	var submitted []byte
+
+	chain := &mockChainClient{
+		ackJobFn:      func(_ context.Context, _ uint64) error { return nil },
+		completeJobFn: func(_ context.Context, _ uint64, _ [32]byte, _ [32]byte) error { return nil },
+		// getEncWorkerKeyFn returns a not-used-by-this-test value; stage 3
+		// should NOT be reached on checkpoint hit, so an unimplemented
+		// callback here would surface as a nil-call panic if the skip logic
+		// was wrong.
+		getEncWorkerKeyFn: func(_ context.Context, _ uint64) ([]byte, error) {
+			return encryptSessionKeyForWorker(t, sessionKey, ecdhKey), nil
+		},
+	}
+	fetcher := &mockBlobFetcher{fetchFn: func(_ context.Context, _ common.Hash, _ uint64) ([]byte, error) {
+		fetchCalls.Add(1)
+		return nil, fmt.Errorf("fetch must NOT be called on checkpoint hit")
+	}}
+	submitter := &mockBlobSubmitter{submitFn: func(_ context.Context, data []byte) ([][32]byte, error) {
+		submitted = append([]byte(nil), data...)
+		return [][32]byte{{0x07}}, nil
+	}}
+	ollama := &mockOllama{generateFn: func(_ context.Context, _, _ string) (string, error) {
+		inferCalls.Add(1)
+		return "", fmt.Errorf("inference must NOT be called on checkpoint hit")
+	}}
+
+	counter := &atomic.Int32{}
+	logger := slog.New(slog.NewTextHandler(io.Discard, &slog.HandlerOptions{Level: slog.LevelError}))
+	handler := NewJobHandler(
+		chain, fetcher, submitter, newMockKeyStore(), ollama,
+		rc, testSigningKey(t), ecdhKey, counter, logger,
+		HandlerConfig{AckTxTimeout: 5 * time.Second, BlobTxTimeout: 60 * time.Second},
+		store,
+	)
+
+	payload := testPayload(t)
+	data, err := json.Marshal(payload)
+	require.NoError(t, err)
+	err = handler.HandleTask(context.Background(), asynq.NewTask(TaskTypeJobInference, data))
+	require.NoError(t, err)
+
+	assert.Equal(t, int32(0), fetchCalls.Load(), "stage 2 must be skipped")
+	assert.Equal(t, int32(0), inferCalls.Load(), "stage 5 must be skipped")
+	assert.Equal(t, cachedCiphertext, submitted,
+		"stage 8a must submit the CACHED ciphertext (not a fresh encryption)")
+}
+
+// TestHandleTask_CheckpointRaceLoserUsesCanonical starts two goroutines
+// on the same jobID concurrently. Each would produce a different
+// ciphertext (AES-GCM nonces are fresh each encrypt). The winner of
+// SetCiphertextIfAbsent writes its bytes; the loser refreshes to the
+// canonical ciphertext before stage 8a. The critical invariant: both
+// SubmitBlobTx calls must see BYTE-IDENTICAL ciphertext, so the two
+// on-chain hashes agree.
+func TestHandleTask_CheckpointRaceLoserUsesCanonical(t *testing.T) {
+	t.Parallel()
+	mr := miniredis.RunT(t)
+	rc := redis.NewClient(&redis.Options{Addr: mr.Addr()})
+	t.Cleanup(func() { rc.Close() })
+
+	sessionKey := testSessionKey(t)
+	ecdhKey := testECDHKey(t)
+	encSessionKey := encryptSessionKeyForWorker(t, sessionKey, ecdhKey)
+	promptCiphertext, err := pkgcrypto.Encrypt(sessionKey, []byte("hello"))
+	require.NoError(t, err)
+
+	store := NewCheckpointStore(rc, 2*time.Hour, 10*time.Minute, 256*1024)
+
+	// Gate inference so both goroutines call Encrypt back-to-back, fighting
+	// for the SETNX. Without this barrier the race would usually be
+	// trivially won by the first goroutine before the second starts.
+	barrier := make(chan struct{}, 2)
+	release := make(chan struct{})
+	chain := &mockChainClient{
+		ackJobFn:          func(_ context.Context, _ uint64) error { return nil },
+		completeJobFn:     func(_ context.Context, _ uint64, _ [32]byte, _ [32]byte) error { return nil },
+		getEncWorkerKeyFn: func(_ context.Context, _ uint64) ([]byte, error) { return encSessionKey, nil },
+	}
+	fetcher := &mockBlobFetcher{fetchFn: func(_ context.Context, _ common.Hash, _ uint64) ([]byte, error) {
+		return promptCiphertext, nil
+	}}
+	var submittedMu sync.Mutex
+	var submittedCiphertexts [][]byte
+	submitter := &mockBlobSubmitter{submitFn: func(_ context.Context, data []byte) ([][32]byte, error) {
+		submittedMu.Lock()
+		submittedCiphertexts = append(submittedCiphertexts, append([]byte(nil), data...))
+		submittedMu.Unlock()
+		return [][32]byte{{0x42}}, nil
+	}}
+	ollama := &mockOllama{generateFn: func(_ context.Context, _, _ string) (string, error) {
+		// Both goroutines park here until released, so they're both poised
+		// to encrypt + race on SETNX with minimal inter-goroutine skew.
+		barrier <- struct{}{}
+		<-release
+		return "response", nil
+	}}
+
+	counter := &atomic.Int32{}
+	logger := slog.New(slog.NewTextHandler(io.Discard, &slog.HandlerOptions{Level: slog.LevelError}))
+	handler := NewJobHandler(
+		chain, fetcher, submitter, newMockKeyStore(), ollama,
+		rc, testSigningKey(t), ecdhKey, counter, logger,
+		HandlerConfig{AckTxTimeout: 5 * time.Second, BlobTxTimeout: 60 * time.Second},
+		store,
+	)
+
+	payload := testPayload(t)
+	data, err := json.Marshal(payload)
+	require.NoError(t, err)
+
+	var wg sync.WaitGroup
+	errs := make([]error, 2)
+	for i := 0; i < 2; i++ {
+		wg.Add(1)
+		go func(idx int) {
+			defer wg.Done()
+			errs[idx] = handler.HandleTask(context.Background(), asynq.NewTask(TaskTypeJobInference, data))
+		}(i)
+	}
+
+	// Wait for both to reach the inference barrier, then release.
+	for len(barrier) < 2 {
+		time.Sleep(5 * time.Millisecond)
+	}
+	close(release)
+	wg.Wait()
+
+	for i, e := range errs {
+		require.NoError(t, e, "goroutine %d", i)
+	}
+
+	submittedMu.Lock()
+	defer submittedMu.Unlock()
+	require.Len(t, submittedCiphertexts, 2)
+	assert.Equal(t, submittedCiphertexts[0], submittedCiphertexts[1],
+		"both SubmitBlobTx calls must observe BYTE-IDENTICAL canonical ciphertext — loser must refresh from SETNX")
+}
+
+// TestHandleTask_CheckpointTombstonedAfterCompletion asserts that a
+// successful run shrinks the checkpoint TTL so a straggler retry can
+// still see it for a short window while stale entries age out.
+func TestHandleTask_CheckpointTombstonedAfterCompletion(t *testing.T) {
+	t.Parallel()
+	mr := miniredis.RunT(t)
+	rc := redis.NewClient(&redis.Options{Addr: mr.Addr()})
+	t.Cleanup(func() { rc.Close() })
+
+	sessionKey := testSessionKey(t)
+	ecdhKey := testECDHKey(t)
+	encSessionKey := encryptSessionKeyForWorker(t, sessionKey, ecdhKey)
+	promptCiphertext, err := pkgcrypto.Encrypt(sessionKey, []byte("hello"))
+	require.NoError(t, err)
+
+	// Redis TTL resolution is whole seconds, so the tombstone TTL must be
+	// >= 1s. Use 1s and FastForward past it to verify expiry.
+	store := NewCheckpointStore(rc, 2*time.Hour, 1*time.Second, 256*1024)
+
+	chain := &mockChainClient{
+		ackJobFn:          func(_ context.Context, _ uint64) error { return nil },
+		completeJobFn:     func(_ context.Context, _ uint64, _ [32]byte, _ [32]byte) error { return nil },
+		getEncWorkerKeyFn: func(_ context.Context, _ uint64) ([]byte, error) { return encSessionKey, nil },
+	}
+	fetcher := &mockBlobFetcher{fetchFn: func(_ context.Context, _ common.Hash, _ uint64) ([]byte, error) {
+		return promptCiphertext, nil
+	}}
+	submitter := &mockBlobSubmitter{submitFn: func(_ context.Context, _ []byte) ([][32]byte, error) {
+		return [][32]byte{{0x99}}, nil
+	}}
+	ollama := &mockOllama{generateFn: func(_ context.Context, _, _ string) (string, error) { return "r", nil }}
+
+	counter := &atomic.Int32{}
+	logger := slog.New(slog.NewTextHandler(io.Discard, &slog.HandlerOptions{Level: slog.LevelError}))
+	handler := NewJobHandler(
+		chain, fetcher, submitter, newMockKeyStore(), ollama,
+		rc, testSigningKey(t), ecdhKey, counter, logger,
+		HandlerConfig{AckTxTimeout: 5 * time.Second, BlobTxTimeout: 60 * time.Second},
+		store,
+	)
+
+	payload := testPayload(t)
+	data, err := json.Marshal(payload)
+	require.NoError(t, err)
+	require.NoError(t, handler.HandleTask(context.Background(), asynq.NewTask(TaskTypeJobInference, data)))
+
+	// Immediately after completion the record is still present under the
+	// short tombstone TTL.
+	ckpt, err := store.Get(context.Background(), payload.JobID)
+	require.NoError(t, err)
+	assert.False(t, ckpt.IsEmpty(), "tombstoned checkpoint must still be readable briefly")
+
+	// Fast-forward past the tombstone TTL; the key must be GC'd.
+	mr.FastForward(2 * time.Second)
+	ckpt, err = store.Get(context.Background(), payload.JobID)
+	require.NoError(t, err)
+	assert.True(t, ckpt.IsEmpty(), "tombstoned checkpoint must expire within tombstone TTL")
+}
+
+// TestHandleTask_CheckpointRetained_WhenStage8bFails asserts that a
+// failure in stage 8b (completeJob) leaves the checkpoint INTACT so the
+// asynq retry can fast-forward through stages 2-8a.
+func TestHandleTask_CheckpointRetained_WhenStage8bFails(t *testing.T) {
+	t.Parallel()
+	mr := miniredis.RunT(t)
+	rc := redis.NewClient(&redis.Options{Addr: mr.Addr()})
+	t.Cleanup(func() { rc.Close() })
+
+	sessionKey := testSessionKey(t)
+	ecdhKey := testECDHKey(t)
+	encSessionKey := encryptSessionKeyForWorker(t, sessionKey, ecdhKey)
+	promptCiphertext, err := pkgcrypto.Encrypt(sessionKey, []byte("hello"))
+	require.NoError(t, err)
+
+	store := NewCheckpointStore(rc, 2*time.Hour, 10*time.Minute, 256*1024)
+
+	chain := &mockChainClient{
+		ackJobFn: func(_ context.Context, _ uint64) error { return nil },
+		completeJobFn: func(_ context.Context, _ uint64, _ [32]byte, _ [32]byte) error {
+			return fmt.Errorf("simulated stage 8b failure")
+		},
+		getEncWorkerKeyFn: func(_ context.Context, _ uint64) ([]byte, error) { return encSessionKey, nil },
+	}
+	fetcher := &mockBlobFetcher{fetchFn: func(_ context.Context, _ common.Hash, _ uint64) ([]byte, error) {
+		return promptCiphertext, nil
+	}}
+	submitter := &mockBlobSubmitter{submitFn: func(_ context.Context, _ []byte) ([][32]byte, error) {
+		return [][32]byte{{0xab}}, nil
+	}}
+	ollama := &mockOllama{generateFn: func(_ context.Context, _, _ string) (string, error) { return "r", nil }}
+
+	counter := &atomic.Int32{}
+	logger := slog.New(slog.NewTextHandler(io.Discard, &slog.HandlerOptions{Level: slog.LevelError}))
+	handler := NewJobHandler(
+		chain, fetcher, submitter, newMockKeyStore(), ollama,
+		rc, testSigningKey(t), ecdhKey, counter, logger,
+		HandlerConfig{AckTxTimeout: 5 * time.Second, BlobTxTimeout: 60 * time.Second},
+		store,
+	)
+
+	payload := testPayload(t)
+	data, err := json.Marshal(payload)
+	require.NoError(t, err)
+	err = handler.HandleTask(context.Background(), asynq.NewTask(TaskTypeJobInference, data))
+	require.Error(t, err, "stage 8b failure must propagate so asynq retries")
+
+	// Checkpoint must still hold ciphertext + versionedHash so the retry
+	// can skip stages 2-8a and go straight to stage 8b.
+	ckpt, err := store.Get(context.Background(), payload.JobID)
+	require.NoError(t, err)
+	assert.True(t, ckpt.HasCiphertext(), "ciphertext must survive stage 8b failure")
+	assert.True(t, ckpt.HasVersionedHash(), "versionedHash must survive stage 8b failure")
+	assert.True(t, ckpt.Delivered, "stage 7 ran successfully before 8b, so delivered must be set")
 }

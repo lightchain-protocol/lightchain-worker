@@ -169,6 +169,10 @@ func New(t testing.TB, opts Options) *Harness {
 	queueName := workerQueueName(workerAddr)
 
 	jobCounter := &atomic.Int32{}
+	// Real CheckpointStore backed by the same Redis the test provides —
+	// using miniredis in handler tests gives us actual SET NX semantics
+	// instead of a mock.
+	checkpoints := pipeline.NewCheckpointStore(opts.RedisClient, 2*time.Hour, 10*time.Minute, 256*1024)
 	handler := pipeline.NewJobHandler(
 		opts.ChainClient,
 		opts.BlobFetcher,
@@ -186,6 +190,7 @@ func New(t testing.TB, opts Options) *Harness {
 			ChainID:         opts.ChainID,
 			JobRegistryAddr: opts.JobRegistryAddr,
 		},
+		checkpoints,
 	)
 
 	redisConnOpt := asynq.RedisClientOpt{

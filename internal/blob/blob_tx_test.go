@@ -102,23 +102,38 @@ func TestBlobTxSubmitter_ResetNonceOnPreBroadcastSendFailure(t *testing.T) {
 // window — they both enter the coordinator under ClassBlob, and geth's
 // blobpool orders them by nonce internally. This is the throughput win
 // over the old single-slot BroadcastSerializer.
+//
+// KZG runs ~9s outside the critical section. To avoid a race where G1's
+// entire tx completes before G2 even finishes KZG, we block both inside
+// SendTransaction via a countdown barrier: neither proceeds past Send
+// until both have arrived. That guarantees both are simultaneously
+// "in flight" for the maxInFlight check.
 func TestBlobTxSubmitter_ParallelBlobBroadcasts(t *testing.T) {
 	t.Parallel()
 
+	const goroutines = 2
 	var inFlight, maxInFlight atomic.Int32
+	barrier := make(chan struct{}, goroutines)
+
+	sendFn := func() error {
+		// Signal arrival and wait for the other goroutine.
+		barrier <- struct{}{}
+		// Hold until both have arrived. A full barrier has N entries, so
+		// we spin-observe until the channel is full.
+		for len(barrier) < goroutines {
+			time.Sleep(5 * time.Millisecond)
+		}
+		return nil
+	}
+
 	backend := mockBlobTxBackend{
 		gasTipCap:   big.NewInt(1),
 		inFlight:    &inFlight,
 		maxInFlight: &maxInFlight,
-		sendDelay:   50 * time.Millisecond,
+		sendFn:      sendFn,
 	}
 
 	waitMined := func(ctx context.Context, _ bind.DeployBackend, tx *types.Transaction) (*types.Receipt, error) {
-		select {
-		case <-time.After(50 * time.Millisecond):
-		case <-ctx.Done():
-			return nil, ctx.Err()
-		}
 		return &types.Receipt{Status: types.ReceiptStatusSuccessful, TxHash: tx.Hash()}, nil
 	}
 
@@ -135,7 +150,6 @@ func TestBlobTxSubmitter_ParallelBlobBroadcasts(t *testing.T) {
 		coordinator: coordinator,
 	}
 
-	const goroutines = 2
 	var wg sync.WaitGroup
 	errs := make([]error, goroutines)
 	wg.Add(goroutines)
@@ -626,6 +640,11 @@ type mockBlobTxBackend struct {
 	sendDelay   time.Duration
 	sendCalls   *atomic.Int32
 	onSuggest   func()
+	// sendFn, if set, runs inside SendTransaction AFTER in-flight bookkeeping
+	// and BEFORE sendDelay. Used by concurrency tests to synchronize two
+	// goroutines at the broadcast boundary so maxInFlight sampling is
+	// deterministic.
+	sendFn func() error
 }
 
 func (m mockBlobTxBackend) SuggestGasTipCap(context.Context) (*big.Int, error) {
@@ -647,6 +666,11 @@ func (m mockBlobTxBackend) SendTransaction(ctx context.Context, _ *types.Transac
 			if cur <= peak || m.maxInFlight.CompareAndSwap(peak, cur) {
 				break
 			}
+		}
+	}
+	if m.sendFn != nil {
+		if err := m.sendFn(); err != nil {
+			return err
 		}
 	}
 	if m.sendDelay > 0 {
