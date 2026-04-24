@@ -98,7 +98,11 @@ func (c *Client) Authenticate(ctx context.Context) error {
 		return fmt.Errorf("decode auth response: %w", err)
 	}
 
-	expiry, _ := time.Parse(time.RFC3339, result.ExpiresAt)
+	expiry, err := time.Parse(time.RFC3339, result.ExpiresAt)
+	if err != nil {
+		c.logger.Warn("failed to parse token expiry, using 30m default", "raw", result.ExpiresAt, "error", err)
+		expiry = time.Now().Add(30 * time.Minute)
+	}
 
 	c.mu.Lock()
 	c.token = result.Token

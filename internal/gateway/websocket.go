@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/coder/websocket"
@@ -49,9 +50,15 @@ func (c *Client) StreamJobs(ctx context.Context, maxConcurrentJobs int, handler 
 			return
 		}
 
-		err := c.streamOnce(ctx, maxConcurrentJobs, handler)
+		connected, err := c.streamOnce(ctx, maxConcurrentJobs, handler)
 		if ctx.Err() != nil {
 			return
+		}
+
+		// Reset backoff after a successful connection — the next disconnect
+		// should start with the minimum delay, not continue from a previous one.
+		if connected {
+			backoff = time.Second
 		}
 
 		c.logger.Warn("websocket disconnected, reconnecting", "error", err, "backoff", backoff)
@@ -69,9 +76,11 @@ func (c *Client) StreamJobs(ctx context.Context, maxConcurrentJobs int, handler 
 }
 
 // streamOnce runs a single WebSocket session: connect, send ready, receive jobs.
-func (c *Client) streamOnce(ctx context.Context, maxConcurrentJobs int, handler JobHandler) error {
+// Returns (connected, error) — connected is true if the WebSocket was established
+// (used by the caller to reset backoff).
+func (c *Client) streamOnce(ctx context.Context, maxConcurrentJobs int, handler JobHandler) (connected bool, err error) {
 	if err := c.ensureAuth(ctx); err != nil {
-		return fmt.Errorf("auth: %w", err)
+		return false, fmt.Errorf("auth: %w", err)
 	}
 
 	// Build WebSocket URL from base HTTP URL.
@@ -86,9 +95,8 @@ func (c *Client) streamOnce(ctx context.Context, maxConcurrentJobs int, handler 
 		HTTPHeader: headers,
 	})
 	if err != nil {
-		return fmt.Errorf("websocket dial: %w", err)
+		return false, fmt.Errorf("websocket dial: %w", err)
 	}
-	defer conn.CloseNow()
 
 	c.logger.Info("websocket connected to gateway")
 
@@ -98,14 +106,21 @@ func (c *Client) streamOnce(ctx context.Context, maxConcurrentJobs int, handler 
 		Slots: maxConcurrentJobs,
 	})
 	if err := conn.Write(ctx, websocket.MessageText, readyMsg); err != nil {
-		return fmt.Errorf("send ready: %w", err)
+		conn.CloseNow()
+		return true, fmt.Errorf("send ready: %w", err)
 	}
+
+	// Track in-flight handler goroutines so we can drain them before closing.
+	var wg sync.WaitGroup
 
 	// Read loop: receive jobs, dispatch to handler.
 	for {
 		_, data, err := conn.Read(ctx)
 		if err != nil {
-			return fmt.Errorf("read: %w", err)
+			// Wait for in-flight handlers to finish before closing the connection.
+			wg.Wait()
+			conn.CloseNow()
+			return true, fmt.Errorf("read: %w", err)
 		}
 
 		var msg wsIncoming
@@ -128,13 +143,17 @@ func (c *Client) streamOnce(ctx context.Context, maxConcurrentJobs int, handler 
 		// ACK immediately — we've received the job.
 		ackMsg, _ := json.Marshal(wsOutgoing{Type: wsTypeAck, JobID: msg.JobID})
 		if err := conn.Write(ctx, websocket.MessageText, ackMsg); err != nil {
-			return fmt.Errorf("send ack for job %d: %w", msg.JobID, err)
+			wg.Wait()
+			conn.CloseNow()
+			return true, fmt.Errorf("send ack for job %d: %w", msg.JobID, err)
 		}
 
 		c.logger.Info("ws_job_received", "jobId", msg.JobID)
 
 		// Process in goroutine, send done when finished.
+		wg.Add(1)
 		go func(jobID uint64) {
+			defer wg.Done()
 			handler(ctx, job)
 
 			doneMsg, _ := json.Marshal(wsOutgoing{Type: wsTypeDone, JobID: jobID})
