@@ -282,6 +282,7 @@ func New(cfg *config.Config) (*Service, error) {
 			logger,
 			pipeline.HandlerConfig{
 				AckTxTimeout:    cfg.AckTxTimeout,
+				BlobTxTimeout:   cfg.BlobTxTimeout,
 				ModelIDToName:   modelIDToName,
 				ChainID:         big.NewInt(cfg.ChainID),
 				JobRegistryAddr: cfg.JobRegistryAddress,
