@@ -25,6 +25,7 @@ import (
 	"github.com/lightchain/worker/internal/blob"
 	"github.com/lightchain/worker/internal/chain"
 	"github.com/lightchain/worker/internal/config"
+	gw "github.com/lightchain/worker/internal/gateway"
 	"github.com/lightchain/worker/internal/heartbeat"
 	"github.com/lightchain/worker/internal/keystore"
 	"github.com/lightchain/worker/internal/ollama"
@@ -47,6 +48,10 @@ type Service struct {
 	sessionKeyStore *keystore.SessionKeyStore
 	jobCounter      *atomic.Int32
 	logger          *slog.Logger
+
+	// Gateway mode (non-nil when WORKER_GATEWAY_URL is set)
+	gwClient  *gw.Client
+	gwHandler *pipeline.JobHandler
 }
 
 // New initializes all components: loads keys, dials chain + Redis, registers on-chain,
@@ -159,23 +164,25 @@ func New(cfg *config.Config) (*Service, error) {
 		logger.Warn("ollama model verification failed (non-fatal)", "error", err)
 	}
 
-	// Dial Redis (before blob setup — RedisBlobFetcher needs the client)
-	redisOpts, err := redis.ParseURL(cfg.RedisURL)
-	if err != nil {
-		chainClient.Close()
-		return nil, fmt.Errorf("parse Redis URL %q: %w", cfg.RedisURL, err)
-	}
-	if cfg.RedisPassword != "" {
-		redisOpts.Password = cfg.RedisPassword
-	}
-	redisClient := redis.NewClient(redisOpts)
-
 	// Blob fetcher + submitter (mode-dependent)
 	blobMode := strings.ToLower(strings.TrimSpace(os.Getenv("BLOB_MODE")))
 	var blobFetcher blob.BlobFetcher
 	var blobSubmitter blob.BlobSubmitter
+	var redisClient *redis.Client
+	var redisOpts *redis.Options
+
 	switch blobMode {
 	case "redis":
+		// Redis blob mode requires a Redis connection for blob I/O.
+		redisOpts, err = redis.ParseURL(cfg.RedisURL)
+		if err != nil {
+			chainClient.Close()
+			return nil, fmt.Errorf("parse Redis URL %q: %w", cfg.RedisURL, err)
+		}
+		if cfg.RedisPassword != "" {
+			redisOpts.Password = cfg.RedisPassword
+		}
+		redisClient = redis.NewClient(redisOpts)
 		blobFetcher = blob.NewRedisBlobFetcher(redisClient)
 		blobSubmitter = blob.NewRedisBlobSubmitter(redisClient)
 		logger.Info("blob mode: redis (dev)")
@@ -203,9 +210,23 @@ func New(cfg *config.Config) (*Service, error) {
 		)
 		logger.Info("blob mode: eip-4844 (beacon)")
 	default:
-		_ = redisClient.Close()
 		chainClient.Close()
 		return nil, fmt.Errorf("unsupported BLOB_MODE %q", blobMode)
+	}
+
+	// In direct Redis mode (non-gateway), we always need a Redis client for
+	// heartbeat, Asynq job queue, and response publishing. Create it now if
+	// blob mode didn't already create one.
+	if cfg.WorkerGatewayURL == "" && redisClient == nil {
+		redisOpts, err = redis.ParseURL(cfg.RedisURL)
+		if err != nil {
+			chainClient.Close()
+			return nil, fmt.Errorf("parse Redis URL %q: %w", cfg.RedisURL, err)
+		}
+		if cfg.RedisPassword != "" {
+			redisOpts.Password = cfg.RedisPassword
+		}
+		redisClient = redis.NewClient(redisOpts)
 	}
 
 	// Redis already dialed above
@@ -233,6 +254,60 @@ func New(cfg *config.Config) (*Service, error) {
 			JobRegistryAddr: cfg.JobRegistryAddress,
 		},
 	)
+
+	// --- Gateway mode: skip Asynq and direct Redis heartbeat ---
+	if cfg.WorkerGatewayURL != "" {
+		gwClient := gw.NewClient(cfg.WorkerGatewayURL, signingKey, logger)
+
+		gwCtx, gwCancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer gwCancel()
+		if err := gwClient.Authenticate(gwCtx); err != nil {
+			_ = redisClient.Close()
+			chainClient.Close()
+			return nil, fmt.Errorf("authenticate with worker-gateway: %w", err)
+		}
+
+		// Create handler with a gateway-based response publisher
+		gwPublisher := &gatewayResponsePublisher{client: gwClient, logger: logger}
+		gwHandler := pipeline.NewJobHandler(
+			chainClient,
+			blobFetcher,
+			blobSubmitter,
+			sessionKeyStore,
+			ollamaClient,
+			redisClient,
+			signingKey,
+			ecdhKey,
+			jobCounter,
+			logger,
+			pipeline.HandlerConfig{
+				AckTxTimeout:    cfg.AckTxTimeout,
+				ModelIDToName:   modelIDToName,
+				ChainID:         big.NewInt(cfg.ChainID),
+				JobRegistryAddr: cfg.JobRegistryAddress,
+			},
+			gwPublisher,
+		)
+
+		logger.Info("worker service initialized (gateway mode)",
+			"address", workerAddr.Hex(),
+			"gateway", cfg.WorkerGatewayURL,
+			"models", len(modelIDs),
+		)
+
+		return &Service{
+			cfg:             cfg,
+			chainClient:     chainClient,
+			redis:           redisClient,
+			sessionKeyStore: sessionKeyStore,
+			jobCounter:      jobCounter,
+			logger:          logger,
+			gwClient:        gwClient,
+			gwHandler:       gwHandler,
+		}, nil
+	}
+
+	// --- Direct Redis mode (default) ---
 
 	// Asynq server — listens on worker-specific queue
 	// Queue name must match dispatcher's workerQueueName(): "worker:{lowercase_hex_with_0x}"
@@ -291,21 +366,45 @@ func New(cfg *config.Config) (*Service, error) {
 	}, nil
 }
 
-// Run starts the heartbeat goroutine and Asynq server, waits for SIGINT/SIGTERM,
-// then gracefully shuts down. Shutdown must complete within cfg.ShutdownTimeout.
+// gatewayResponsePublisher publishes responses via the worker-gateway HTTP API.
+type gatewayResponsePublisher struct {
+	client *gw.Client
+	logger *slog.Logger
+}
+
+func (p *gatewayResponsePublisher) PublishResponse(
+	ctx context.Context,
+	jobID, sessionID uint64,
+	correlationID string,
+	signature string,
+	ciphertext []byte,
+) {
+	if err := p.client.PublishResponse(ctx, jobID, sessionID, correlationID, signature, ciphertext); err != nil {
+		p.logger.Warn("gateway response publish failed (non-fatal)", "jobID", jobID, "error", err)
+	}
+}
+
+// Run starts the heartbeat goroutine and Asynq server (or gateway poll loop),
+// waits for SIGINT/SIGTERM, then gracefully shuts down.
 func (s *Service) Run(ctx context.Context) error {
 	runCtx, runCancel := context.WithCancel(ctx)
 	defer runCancel()
 
+	sigCtx, stop := signal.NotifyContext(runCtx, syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+
+	// Gateway mode: poll loop + gateway heartbeat
+	if s.gwClient != nil {
+		return s.runGatewayMode(sigCtx, runCancel)
+	}
+
+	// Direct Redis mode
 	s.monitor.Start(runCtx)
 
 	asynqErrCh := make(chan error, 1)
 	go func() {
 		asynqErrCh <- s.asynqServer.Run(s.asynqMux)
 	}()
-
-	sigCtx, stop := signal.NotifyContext(runCtx, syscall.SIGINT, syscall.SIGTERM)
-	defer stop()
 
 	s.logger.Info("worker sidecar running — waiting for shutdown signal")
 	var runErr error
@@ -341,12 +440,56 @@ func (s *Service) Run(ctx context.Context) error {
 	return runErr
 }
 
+// runGatewayMode runs the worker in gateway mode: connects to the worker-gateway
+// via WebSocket for instant job delivery, and sends heartbeats via HTTP.
+func (s *Service) runGatewayMode(ctx context.Context, cancel context.CancelFunc) error {
+	s.logger.Info("worker sidecar running (gateway mode) — waiting for shutdown signal")
+
+	// Heartbeat loop (HTTP POST, unchanged)
+	go func() {
+		ticker := time.NewTicker(s.cfg.HeartbeatInterval)
+		defer ticker.Stop()
+		for {
+			payload := gw.HeartbeatPayload{
+				ActiveJobs:   int(s.jobCounter.Load()),
+				MaxJobs:      s.cfg.MaxConcurrentJobs,
+				OllamaStatus: "ready",
+				Uptime:       0, // simplified for MVP
+			}
+			if err := s.gwClient.SendHeartbeat(ctx, payload); err != nil {
+				s.logger.Warn("gateway heartbeat failed", "error", err)
+			}
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+			}
+		}
+	}()
+
+	// Job stream via WebSocket (BRPOP-backed, instant delivery)
+	go s.gwClient.StreamJobs(ctx, s.cfg.MaxConcurrentJobs, func(jobCtx context.Context, job pipeline.JobPayload) {
+		if err := s.gwHandler.HandleJobPayload(jobCtx, job); err != nil {
+			s.logger.Error("gateway job processing failed", "jobID", job.JobID, "error", err)
+		}
+	})
+
+	<-ctx.Done()
+	s.logger.Info("shutdown signal received, stopping gracefully")
+
+	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), s.cfg.ShutdownTimeout)
+	defer shutdownCancel()
+	return s.shutdown(shutdownCtx)
+}
+
 // shutdown coordinates all cleanup steps within the given context deadline.
 func (s *Service) shutdown(ctx context.Context) error {
 	var shutdownErr error
 
-	// Stop Asynq server — waits for in-flight jobs
-	s.asynqServer.Shutdown()
+	// Stop Asynq server — waits for in-flight jobs (nil in gateway mode)
+	if s.asynqServer != nil {
+		s.asynqServer.Shutdown()
+	}
 
 	// Zero all session keys
 	if err := s.sessionKeyStore.ZeroAll(); err != nil {
@@ -354,19 +497,24 @@ func (s *Service) shutdown(ctx context.Context) error {
 		shutdownErr = errors.Join(shutdownErr, fmt.Errorf("zero session keys: %w", err))
 	}
 
-	monitorDone := make(chan struct{})
-	go func() {
-		s.monitor.Stop()
-		close(monitorDone)
-	}()
-	select {
-	case <-monitorDone:
-	case <-ctx.Done():
-		s.logger.Warn("heartbeat monitor stop timed out")
+	// Stop heartbeat monitor (nil in gateway mode)
+	if s.monitor != nil {
+		monitorDone := make(chan struct{})
+		go func() {
+			s.monitor.Stop()
+			close(monitorDone)
+		}()
+		select {
+		case <-monitorDone:
+		case <-ctx.Done():
+			s.logger.Warn("heartbeat monitor stop timed out")
+		}
 	}
 
-	if err := s.redis.Close(); err != nil {
-		s.logger.Warn("redis close error", "error", err)
+	if s.redis != nil {
+		if err := s.redis.Close(); err != nil {
+			s.logger.Warn("redis close error", "error", err)
+		}
 	}
 
 	s.chainClient.Close()

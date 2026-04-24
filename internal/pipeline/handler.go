@@ -76,23 +76,32 @@ type HandlerConfig struct {
 	JobRegistryAddr common.Address
 }
 
+// ResponsePublisher publishes encrypted responses for real-time delivery.
+// Implementations: RedisResponsePublisher (direct Redis PUBLISH) and
+// gateway-based publisher (POST to worker-gateway).
+type ResponsePublisher interface {
+	PublishResponse(ctx context.Context, jobID, sessionID uint64, correlationID string, signature string, ciphertext []byte)
+}
+
 // JobHandler processes inference jobs received from Asynq.
 type JobHandler struct {
-	chainClient   JobExecutionClient
-	blobFetcher   BlobFetcher
-	blobSubmitter BlobSubmitter
-	keyStore      SessionKeyGetter
-	ollamaClient  InferenceClient
-	redisClient   *redis.Client
-	signingKey    *ecdsa.PrivateKey
-	ecdhKey       *ecdh.PrivateKey
-	jobCounter    *atomic.Int32
-	logger        *slog.Logger
-	cfg           HandlerConfig
-	modelIDToName map[string]string
+	chainClient        JobExecutionClient
+	blobFetcher        BlobFetcher
+	blobSubmitter      BlobSubmitter
+	keyStore           SessionKeyGetter
+	ollamaClient       InferenceClient
+	redisClient        *redis.Client
+	responsePublisher  ResponsePublisher
+	signingKey         *ecdsa.PrivateKey
+	ecdhKey            *ecdh.PrivateKey
+	jobCounter         *atomic.Int32
+	logger             *slog.Logger
+	cfg                HandlerConfig
+	modelIDToName      map[string]string
 }
 
 // NewJobHandler creates a handler wired with all dependencies.
+// If publisher is nil, a RedisResponsePublisher is created from redisClient.
 func NewJobHandler(
 	chainClient JobExecutionClient,
 	blobFetcher BlobFetcher,
@@ -105,26 +114,95 @@ func NewJobHandler(
 	jobCounter *atomic.Int32,
 	logger *slog.Logger,
 	cfg HandlerConfig,
+	publisher ...ResponsePublisher,
 ) *JobHandler {
 	modelIDToName := make(map[string]string, len(cfg.ModelIDToName))
 	for k, v := range cfg.ModelIDToName {
 		modelIDToName[normalizeModelLookupKey(k)] = v
 	}
 
-	return &JobHandler{
-		chainClient:   chainClient,
-		blobFetcher:   blobFetcher,
-		blobSubmitter: blobSubmitter,
-		keyStore:      keyStore,
-		ollamaClient:  ollamaClient,
-		redisClient:   redisClient,
-		signingKey:    signingKey,
-		ecdhKey:       ecdhKey,
-		jobCounter:    jobCounter,
-		logger:        logger,
-		cfg:           cfg,
-		modelIDToName: modelIDToName,
+	var rp ResponsePublisher
+	if len(publisher) > 0 && publisher[0] != nil {
+		rp = publisher[0]
+	} else if redisClient != nil {
+		rp = &RedisResponsePublisher{client: redisClient, logger: logger}
 	}
+
+	return &JobHandler{
+		chainClient:       chainClient,
+		blobFetcher:       blobFetcher,
+		blobSubmitter:     blobSubmitter,
+		keyStore:          keyStore,
+		ollamaClient:      ollamaClient,
+		redisClient:       redisClient,
+		responsePublisher: rp,
+		signingKey:        signingKey,
+		ecdhKey:           ecdhKey,
+		jobCounter:        jobCounter,
+		logger:            logger,
+		cfg:               cfg,
+		modelIDToName:     modelIDToName,
+	}
+}
+
+// RedisResponsePublisher publishes responses directly to Redis pub/sub.
+type RedisResponsePublisher struct {
+	client *redis.Client
+	logger *slog.Logger
+}
+
+// PublishResponse signs and publishes the response to the session's Redis channel.
+func (p *RedisResponsePublisher) PublishResponse(
+	ctx context.Context,
+	jobID, sessionID uint64,
+	correlationID string,
+	signature string,
+	ciphertext []byte,
+) {
+	resp := pkgtypes.PubSubMessage{
+		Type:          pkgtypes.MessageTypeComplete,
+		JobID:         pkgtypes.JobID(jobID),
+		SessionID:     pkgtypes.SessionID(sessionID),
+		Sequence:      0,
+		TotalChunks:   1,
+		Payload:       ciphertext,
+		Signature:     signature,
+		CorrelationID: correlationID,
+		Timestamp:     time.Now().Unix(),
+	}
+
+	data, err := json.Marshal(resp)
+	if err != nil {
+		p.logger.Warn("failed to marshal response for Redis", "jobID", jobID, "error", err)
+		return
+	}
+
+	channel := fmt.Sprintf("session:%d:responses", sessionID)
+	if err := p.client.Publish(ctx, channel, data).Err(); err != nil {
+		p.logger.Warn("failed to publish response to Redis", "jobID", jobID, "channel", channel, "error", err)
+	}
+}
+
+// HandleJobPayload processes a job from a raw JobPayload (used in gateway mode
+// where jobs come via HTTP polling instead of Asynq).
+func (h *JobHandler) HandleJobPayload(ctx context.Context, payload JobPayload) error {
+	h.jobCounter.Add(1)
+	defer h.jobCounter.Add(-1)
+
+	h.logger.Info("processing job",
+		"jobID", payload.JobID,
+		"sessionID", payload.SessionID,
+		"model", payload.ModelID,
+		"correlationID", payload.CorrelationID,
+	)
+
+	if err := h.processJob(ctx, payload); err != nil {
+		h.logger.Error("job failed", "jobID", payload.JobID, "error", err)
+		return err
+	}
+
+	h.logger.Info("job completed", "jobID", payload.JobID)
+	return nil
 }
 
 // HandleTask is the Asynq handler entry point.
@@ -551,7 +629,7 @@ func init() {
 	}
 }
 
-// publishToRedis signs and publishes the response to the session's Redis channel.
+// publishToRedis signs and publishes the response via the configured ResponsePublisher.
 // Errors are logged but non-fatal — the on-chain blob is the authoritative response.
 func (h *JobHandler) publishToRedis(
 	ctx context.Context,
@@ -560,44 +638,18 @@ func (h *JobHandler) publishToRedis(
 	correlationID string,
 	ciphertext []byte,
 ) {
+	if h.responsePublisher == nil {
+		return
+	}
+
 	sig, err := signMismatchEvidence(h.cfg.ChainID, h.cfg.JobRegistryAddr, jobID, sessionID, ciphertext, h.signingKey)
 	if err != nil {
-		logger.Warn("failed to sign response for Redis",
-			"stage", "redis_publish",
-			"error", err,
-		)
+		h.logger.Warn("failed to sign response", "jobID", jobID, "error", err)
 		return
 	}
 
-	resp := pkgtypes.PubSubMessage{
-		Type:          pkgtypes.MessageTypeComplete,
-		JobID:         pkgtypes.JobID(jobID),
-		SessionID:     pkgtypes.SessionID(sessionID),
-		Sequence:      0,
-		TotalChunks:   1,
-		Payload:       ciphertext,
-		Signature:     "0x" + hex.EncodeToString(sig),
-		CorrelationID: correlationID,
-		Timestamp:     time.Now().Unix(),
-	}
-
-	data, err := json.Marshal(resp)
-	if err != nil {
-		logger.Warn("failed to marshal response for Redis",
-			"stage", "redis_publish",
-			"error", err,
-		)
-		return
-	}
-
-	channel := fmt.Sprintf("session:%d:responses", sessionID)
-	if err := h.redisClient.Publish(ctx, channel, data).Err(); err != nil {
-		logger.Warn("failed to publish response to Redis",
-			"stage", "redis_publish",
-			"channel", channel,
-			"error", err,
-		)
-	}
+	sigHex := "0x" + hex.EncodeToString(sig)
+	h.responsePublisher.PublishResponse(ctx, jobID, sessionID, correlationID, sigHex, ciphertext)
 }
 
 // signMismatchEvidence produces an EIP-191 worker signature over the domain-separated

@@ -80,6 +80,9 @@ type Config struct {
 	// Shutdown
 	ShutdownTimeout time.Duration
 
+	// Gateway mode (optional — when set, worker uses HTTP gateway instead of direct Redis)
+	WorkerGatewayURL string
+
 	// Logging
 	LogLevel  string
 	LogFormat string
@@ -98,6 +101,7 @@ func Load() (*Config, error) {
 		OllamaURL:              envOrDefault("OLLAMA_URL", "http://localhost:11434"),
 		BeaconAPIURL:           envOrDefault("BEACON_API_URL", "http://localhost:3500"),
 		SessionKeyFile:         envOrDefault("SESSION_KEY_FILE", "data/session-keys.enc"),
+		WorkerGatewayURL:       os.Getenv("WORKER_GATEWAY_URL"),
 		LogLevel:               envOrDefault("LOG_LEVEL", "info"),
 		LogFormat:              envOrDefault("LOG_FORMAT", "json"),
 	}
