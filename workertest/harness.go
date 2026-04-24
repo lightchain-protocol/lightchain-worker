@@ -381,7 +381,7 @@ func NewRealChainClient(t testing.TB, opts RealChainClientOptions) ChainClient {
 		opts.JobRegistryAddress,
 		opts.SigningKey,
 		opts.GasPriceMultiplierBps,
-		workerchain.NewBroadcastSerializer(),
+		workerchain.NewSubpoolCoordinator(nil, 0),
 		workerchain.NewStuckNonceTracker(),
 	)
 	if err != nil {

@@ -82,27 +82,28 @@ func encodeBlobTxPayload(data []byte, label string) (*blobTxPayload, error) {
 
 // BlobTxSubmitter builds and submits type-3 (EIP-4844) blob transactions.
 //
-// The SendTransaction..WaitMined window is serialized by a shared
-// chain.BroadcastSerializer (see internal/chain/broadcast.go). The
-// serializer is per-signing-key, so the same instance is injected into
-// BOTH this submitter and ChainClient — go-ethereum's txpool reservation
-// is sender-wide, meaning a blob tx pending for sender S blocks any
-// concurrent non-blob tx from S as well.
+// Broadcast concurrency is governed by a shared
+// chain.SubpoolCoordinator (see internal/chain/subpool_coordinator.go),
+// which serializes ACROSS tx classes (blob vs legacy) but allows
+// unbounded within-class parallelism. Within the blobpool, geth already
+// orders multiple pending blob txs from the same sender by nonce — the
+// coordinator just prevents cross-subpool reservation conflicts with
+// legacy (ACK, CompleteJob) txs from this same signing key.
 //
-// serializerOnce lazy-initializes the serializer when constructed via
+// coordinatorOnce lazy-initializes the coordinator when constructed via
 // struct literal without one (the NewBlobTxSubmitter constructor injects
 // the shared instance from the service layer).
 type BlobTxSubmitter struct {
-	ethClient      *ethclient.Client
-	txBackend      BlobTxBackend
-	signingKey     *ecdsa.PrivateKey
-	signTx         func(tx *types.Transaction, signer types.Signer, key *ecdsa.PrivateKey) (*types.Transaction, error)
-	waitMined      func(ctx context.Context, b bind.DeployBackend, tx *types.Transaction) (*types.Receipt, error)
-	chainID        *big.Int
-	nonceMgr       NonceManager
-	maxGasPrice    *big.Int
-	serializer     *workerchain.BroadcastSerializer
-	serializerOnce sync.Once
+	ethClient       *ethclient.Client
+	txBackend       BlobTxBackend
+	signingKey      *ecdsa.PrivateKey
+	signTx          func(tx *types.Transaction, signer types.Signer, key *ecdsa.PrivateKey) (*types.Transaction, error)
+	waitMined       func(ctx context.Context, b bind.DeployBackend, tx *types.Transaction) (*types.Receipt, error)
+	chainID         *big.Int
+	nonceMgr        NonceManager
+	maxGasPrice     *big.Int
+	coordinator     *workerchain.SubpoolCoordinator
+	coordinatorOnce sync.Once
 	// stuckTracker is the shared per-sender stuck-nonce tracker. Nil-safe
 	// via stuckNonceTracker() lazy init for tests that don't inject one.
 	stuckTracker     *workerchain.StuckNonceTracker
@@ -122,16 +123,16 @@ type StuckNonceConfig struct {
 	AutoReplace bool
 }
 
-// broadcastSerializer returns the shared serializer, lazy-initializing a
+// broadcastCoordinator returns the shared coordinator, lazy-initializing a
 // private one if none was injected (useful for tests that construct via
 // struct literal and don't care about cross-submitter sharing).
-func (s *BlobTxSubmitter) broadcastSerializer() *workerchain.BroadcastSerializer {
-	s.serializerOnce.Do(func() {
-		if s.serializer == nil {
-			s.serializer = workerchain.NewBroadcastSerializer()
+func (s *BlobTxSubmitter) broadcastCoordinator() *workerchain.SubpoolCoordinator {
+	s.coordinatorOnce.Do(func() {
+		if s.coordinator == nil {
+			s.coordinator = workerchain.NewSubpoolCoordinator(nil, 0)
 		}
 	})
-	return s.serializer
+	return s.coordinator
 }
 
 // stuckNonceTracker returns the shared tracker, lazy-initializing a private
@@ -149,7 +150,7 @@ func (s *BlobTxSubmitter) stuckNonceTracker() *workerchain.StuckNonceTracker {
 
 // NewBlobTxSubmitter creates a BlobTxSubmitter. The logger may be nil; when
 // nil, structured logs are suppressed (useful for tests that inject their own
-// instrumentation via struct literals). The serializer and stuckTracker must
+// instrumentation via struct literals). The coordinator and stuckTracker must
 // be the shared per-signing-key instances — see their package docs.
 func NewBlobTxSubmitter(
 	ethClient *ethclient.Client,
@@ -157,7 +158,7 @@ func NewBlobTxSubmitter(
 	chainID *big.Int,
 	nonceMgr NonceManager,
 	maxGasPrice *big.Int,
-	serializer *workerchain.BroadcastSerializer,
+	coordinator *workerchain.SubpoolCoordinator,
 	stuckTracker *workerchain.StuckNonceTracker,
 	stuckCfg StuckNonceConfig,
 	logger *slog.Logger,
@@ -171,7 +172,7 @@ func NewBlobTxSubmitter(
 		chainID:      chainID,
 		nonceMgr:     nonceMgr,
 		maxGasPrice:  maxGasPrice,
-		serializer:   serializer,
+		coordinator:  coordinator,
 		stuckTracker: stuckTracker,
 		stuckCfg:     stuckCfg,
 		logger:       logger,
@@ -239,9 +240,10 @@ func (s *BlobTxSubmitter) SubmitBlobTx(ctx context.Context, data []byte) ([][32]
 			"stage", "submit_blob",
 		)
 	}
-	serializer := s.broadcastSerializer()
+	coordinator := s.broadcastCoordinator()
 	mutexWaitStart := time.Now()
-	if err := serializer.Acquire(ctx); err != nil {
+	token, err := coordinator.Enter(ctx, workerchain.ClassBlob)
+	if err != nil {
 		mutexWaitMs := time.Since(mutexWaitStart).Milliseconds()
 		if s.logger != nil {
 			s.logger.Warn("ctx cancelled waiting for broadcast slot",
@@ -252,7 +254,8 @@ func (s *BlobTxSubmitter) SubmitBlobTx(ctx context.Context, data []byte) ([][32]
 		}
 		return nil, fmt.Errorf("wait for blob broadcast slot: %w", err)
 	}
-	defer serializer.Release()
+	// Token.Done is idempotent; deferring is safe across every return path.
+	defer token.Done()
 	mutexWaitMs := time.Since(mutexWaitStart).Milliseconds()
 
 	if err := ctx.Err(); err != nil {
@@ -281,6 +284,11 @@ func (s *BlobTxSubmitter) SubmitBlobTx(ctx context.Context, data []byte) ([][32]
 		s.handleSendError(ctx, txBackend, signTx, err, nonce, txHash, mutexWaitMs)
 		return nil, fmt.Errorf("send blob tx: %w", err)
 	}
+
+	// Broadcast accepted by the pool — record the hash on the coordinator
+	// token so janitor eviction logs can identify a stuck entry by tx hash
+	// if this goroutine leaks.
+	token.Registered(txHash)
 
 	if s.logger != nil {
 		s.logger.Info("blob tx broadcast, waiting for receipt",

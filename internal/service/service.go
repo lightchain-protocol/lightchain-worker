@@ -41,6 +41,7 @@ const startupHeartbeatTimeout = 5 * time.Second
 type Service struct {
 	cfg             *config.Config
 	chainClient     *chain.ChainClient
+	coordinator     *chain.SubpoolCoordinator
 	redis           *redis.Client
 	monitor         *heartbeat.Monitor
 	asynqServer     *asynq.Server
@@ -112,11 +113,12 @@ func New(cfg *config.Config) (*Service, error) {
 		modelIDToName[strings.TrimPrefix(strings.ToLower(modelHex), "0x")] = cfg.SupportedModels[i]
 	}
 
-	// Per-signing-key broadcast serializer. ONE instance is shared across
-	// every tx submission path (BlobTxSubmitter and ChainClient) so
-	// go-ethereum's sender-wide txpool reservation can't produce blob-vs-ACK
-	// or blob-vs-CompleteJob collisions under concurrent jobs.
-	broadcastSerializer := chain.NewBroadcastSerializer()
+	// Per-signing-key subpool coordinator. ONE instance is shared across
+	// every tx submission path (BlobTxSubmitter and ChainClient). It
+	// serializes ACROSS tx classes (blob vs legacy) — which geth requires
+	// at the sender-reservation boundary — while allowing unbounded
+	// within-class concurrency. See internal/chain/subpool_coordinator.go.
+	coordinator := chain.NewSubpoolCoordinator(logger, 0)
 
 	// Per-signing-key stuck-nonce tracker. Shared across submitters so
 	// "address already reserved" hits from ACK/CompleteJob broadcasts
@@ -132,10 +134,11 @@ func New(cfg *config.Config) (*Service, error) {
 		cfg.JobRegistryAddress,
 		signingKey,
 		cfg.GasPriceMultiplierBps,
-		broadcastSerializer,
+		coordinator,
 		stuckTracker,
 	)
 	if err != nil {
+		coordinator.Close()
 		return nil, fmt.Errorf("connect to chain: %w", err)
 	}
 
@@ -199,7 +202,7 @@ func New(cfg *config.Config) (*Service, error) {
 			big.NewInt(cfg.ChainID),
 			chainClient.NonceManager(),
 			cfg.MaxGasPrice,
-			broadcastSerializer,
+			coordinator,
 			stuckTracker,
 			blob.StuckNonceConfig{
 				Threshold:   cfg.StuckNonceThreshold,
@@ -354,9 +357,28 @@ func New(cfg *config.Config) (*Service, error) {
 		"stuckNonceAutoReplace", cfg.StuckNonceAutoReplace,
 	)
 
+	// Seed the coordinator from the chain's pending-vs-latest nonce gap.
+	// If the previous process crashed between SendTransaction and WaitMined,
+	// geth's reserver still holds those pending txs and our fresh in-memory
+	// coordinator must block cross-class broadcasts until the pool drains.
+	seedCtx, seedCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	pendingNonce, perr := chainClient.EthClient().PendingNonceAt(seedCtx, workerAddr)
+	latestNonce, lerr := chainClient.EthClient().NonceAt(seedCtx, workerAddr, nil)
+	seedCancel()
+	if perr == nil && lerr == nil {
+		coordinator.Seed(pendingNonce, latestNonce)
+	} else {
+		logger.Warn("coordinator seed skipped — pending/latest nonce read failed",
+			"pendingErr", perr,
+			"latestErr", lerr,
+			"hint", "first legacy broadcast may race a stuck pool tx; existing ShouldResetNonceOnSendError will recover",
+		)
+	}
+
 	return &Service{
 		cfg:             cfg,
 		chainClient:     chainClient,
+		coordinator:     coordinator,
 		redis:           redisClient,
 		monitor:         monitor,
 		asynqServer:     asynqSrv,
@@ -519,6 +541,9 @@ func (s *Service) shutdown(ctx context.Context) error {
 	}
 
 	s.chainClient.Close()
+	if s.coordinator != nil {
+		s.coordinator.Close()
+	}
 
 	select {
 	case <-ctx.Done():

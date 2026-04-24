@@ -38,11 +38,13 @@ type ChainClient struct {
 	chainID         *big.Int
 	gasPriceMulBps  int
 	nonceMgr        *NonceManager
-	// serializer is the per-sender broadcast serializer, shared with
+	// coordinator is the shared per-signing-key subpool coordinator. It
+	// serializes broadcasts ACROSS tx classes (blob vs legacy) while
+	// allowing unbounded within-class parallelism. Shared with
 	// BlobTxSubmitter via injection at the service layer. Nil-safe via
-	// broadcastSerializer() lazy init for tests that don't inject one.
-	serializer     *BroadcastSerializer
-	serializerOnce sync.Once
+	// broadcastCoordinator() lazy init for tests that don't inject one.
+	coordinator     *SubpoolCoordinator
+	coordinatorOnce sync.Once
 	// stuckTracker is the shared per-sender stuck-nonce tracker. Also
 	// shared with BlobTxSubmitter. Nil-safe via stuckNonceTracker()
 	// lazy init for tests that don't inject one.
@@ -57,7 +59,7 @@ type jobTxBackend interface {
 
 // NewChainClient dials the RPC endpoint, instantiates the contract bindings, and
 // returns a ChainClient ready to submit registration and job transactions.
-// serializer and stuckTracker must be the shared per-signing-key instances.
+// coordinator and stuckTracker must be the shared per-signing-key instances.
 func NewChainClient(
 	rpcURL string,
 	chainID int64,
@@ -66,7 +68,7 @@ func NewChainClient(
 	jobRegistryAddr common.Address,
 	signingKey *ecdsa.PrivateKey,
 	gasMulBps int,
-	serializer *BroadcastSerializer,
+	coordinator *SubpoolCoordinator,
 	stuckTracker *StuckNonceTracker,
 ) (*ChainClient, error) {
 	if signingKey == nil {
@@ -120,21 +122,21 @@ func NewChainClient(
 		chainID:         big.NewInt(chainID),
 		gasPriceMulBps:  gasMulBps,
 		nonceMgr:        nonceMgr,
-		serializer:      serializer,
+		coordinator:     coordinator,
 		stuckTracker:    stuckTracker,
 	}, nil
 }
 
-// broadcastSerializer returns the shared serializer, lazy-initializing a
+// broadcastCoordinator returns the shared coordinator, lazy-initializing a
 // private one if none was injected (useful for tests that construct
 // ChainClient via struct literal and don't need cross-submitter sharing).
-func (c *ChainClient) broadcastSerializer() *BroadcastSerializer {
-	c.serializerOnce.Do(func() {
-		if c.serializer == nil {
-			c.serializer = NewBroadcastSerializer()
+func (c *ChainClient) broadcastCoordinator() *SubpoolCoordinator {
+	c.coordinatorOnce.Do(func() {
+		if c.coordinator == nil {
+			c.coordinator = NewSubpoolCoordinator(nil, 0)
 		}
 	})
-	return c.serializer
+	return c.coordinator
 }
 
 // stuckNonceTracker returns the shared tracker, lazy-initializing a private
@@ -238,17 +240,17 @@ func (c *ChainClient) submitPreparedTx(
 		return fmt.Errorf("suggest gas price: %w", err)
 	}
 
-	// Acquire the shared per-sender broadcast slot before reserving a nonce.
-	// That keeps cancelled waiters from burning local nonce-manager entries
-	// for transactions that never reach SendTransaction.
-	serializer := c.broadcastSerializer()
-	if err := serializer.Acquire(ctx); err != nil {
+	// Enter the coordinator's legacy lane before reserving a nonce. This
+	// blocks only if the BLOB lane has pending txs (cross-subpool exclusion
+	// required by geth's sender reservation). Same-class callers run in
+	// parallel — geth's legacypool orders them by nonce.
+	coordinator := c.broadcastCoordinator()
+	token, err := coordinator.Enter(ctx, ClassLegacy)
+	if err != nil {
 		return fmt.Errorf("wait for %s broadcast slot: %w", txName, err)
 	}
-	defer serializer.Release()
-	if err := ctx.Err(); err != nil {
-		return fmt.Errorf("wait for %s broadcast slot: %w", txName, err)
-	}
+	// Token.Done is idempotent, so deferring on every exit path is safe.
+	defer token.Done()
 
 	auth, err := bind.NewKeyedTransactorWithChainID(c.signingKey, c.chainID)
 	if err != nil {
@@ -288,11 +290,22 @@ func (c *ChainClient) submitPreparedTx(
 		// evict a stuck blob from the pool (go-ethereum blob pool only
 		// accepts blob replacements), so we defer the actual fix to
 		// the next blob broadcast's decision.
+		//
+		// Under the SubpoolCoordinator, IsAlreadyReservedError in
+		// normal flow is an anomaly — the coordinator should have
+		// prevented cross-subpool contention. A hit here suggests an
+		// orphaned blob token in the coordinator (previous pipeline
+		// crashed between Send and release). The tracker's per-nonce
+		// counter makes this detectable.
 		if IsAlreadyReservedError(err) {
 			c.stuckNonceTracker().Record(tx.Nonce())
 		}
 		return fmt.Errorf("send %s tx: %w", txName, err)
 	}
+
+	// Broadcast succeeded — record the hash on the token so janitor
+	// eviction logs can identify stuck entries by tx hash.
+	token.Registered(tx.Hash())
 
 	receipt, err := bind.WaitMined(ctx, c.ethClient, tx)
 	if err != nil {

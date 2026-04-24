@@ -1,78 +1,151 @@
 package chain
 
-import "sync"
+import (
+	"sync"
+	"time"
+)
 
 // StuckNonceTracker counts consecutive ErrAlreadyReserved rejections at a
-// specific nonce, to detect a tx stuck in the mempool that the ResetNonce
-// + refetch loop cannot clear on its own.
+// specific nonce, so callers can detect a tx that's wedged in the mempool
+// (pool not draining via normal nonce incrementing) and trigger a
+// bumped-fee replacement.
 //
 // Failure mode (testnet, 2026-04-23): a blob tx at nonce K is broadcast
 // but never mines (e.g. BlobFeeCap underbid the current blob base fee).
 // Every subsequent SendTransaction gets rejected with "address already
-// reserved"; ResetNonce refetches chain pending = K, retry tries K again,
-// loop. asynq exhausts its MaxRetry budget without a single successful
-// broadcast. The tracker's role is to detect this state deterministically
-// so callers can take corrective action (replacement tx with bumped fees,
-// or loud failure for operator intervention).
+// reserved"; the loop never reaches the bump threshold because each retry
+// re-records the nonce from scratch.
+//
+// Parallel-broadcast requirement: with the SubpoolCoordinator allowing
+// concurrent within-class broadcasts, two goroutines can fail at different
+// nonces (K and K+1) back-to-back. The previous single-slot design keyed
+// on a single `lastNonce` field, so interleaved `Record(K)` and
+// `Record(K+1)` would each reset the other's hit count — the threshold
+// was never reached. This implementation keeps a per-nonce hit counter so
+// each wedged nonce is tracked independently.
+//
+// Entries older than `entryTTL` are evicted on each access so the map
+// can't grow unboundedly under a misbehaving EL.
 //
 // Shared across BlobTxSubmitter and ChainClient via injection at the
-// service layer. One signing key => one tracker. Safe for concurrent
-// access under its internal mutex.
+// service layer. One signing key => one tracker. Safe for concurrent access
+// under its internal mutex.
 type StuckNonceTracker struct {
-	mu              sync.Mutex
-	lastNonce       uint64
-	hasObserved     bool
-	consecutiveHits int
-	bumpAttempts    int
+	mu      sync.Mutex
+	entries map[uint64]*nonceState
+	// bumpAttempts is tracked globally (not per-nonce) because the
+	// replacement-broadcast decision is made by the blob-tx path, which
+	// only submits one replacement at a time regardless of which nonce is
+	// wedged. Resetting the bump counter on a NEW nonce-candidate is
+	// important: bumping at nonce K makes no sense if K has mined and we're
+	// now seeing rejections at K+1.
+	bumpAttempts int
+	// lastBumpNonce tracks which nonce the current bumpAttempts counter
+	// belongs to, so IncrementBumpAttempts / BumpAttemptsUsed can detect
+	// when the counter should reset.
+	lastBumpNonce    uint64
+	hasLastBumpNonce bool
+
+	entryTTL time.Duration
+	now      func() time.Time // injectable for tests
 }
 
-// NewStuckNonceTracker returns an empty tracker.
+type nonceState struct {
+	hits     int
+	lastSeen time.Time
+}
+
+// defaultEntryTTL expires per-nonce entries that haven't been touched in a
+// while. Long enough that a genuine slow drain (blob fee pricing catching
+// up over several blocks) doesn't age out mid-recovery; short enough that
+// a misbehaving EL doesn't accumulate unbounded entries.
+const defaultEntryTTL = 10 * time.Minute
+
+// NewStuckNonceTracker returns an empty tracker with the default TTL.
 func NewStuckNonceTracker() *StuckNonceTracker {
-	return &StuckNonceTracker{}
+	return &StuckNonceTracker{
+		entries:  make(map[uint64]*nonceState),
+		entryTTL: defaultEntryTTL,
+		now:      time.Now,
+	}
 }
 
-// Record notes a reservation rejection at nonce n. If n matches the last
-// recorded nonce, the consecutive-hit counter increments; otherwise the
-// counter resets to 1 (a new stuck candidate). Returns the current
-// consecutive-hit count at n.
+// Record notes a reservation rejection at nonce n and returns the running
+// hit count at n. Unlike the old single-slot design, other nonces'
+// counters are unaffected — interleaved records at K and K+1 from
+// concurrent goroutines accumulate independently.
 func (t *StuckNonceTracker) Record(n uint64) int {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 
-	if t.hasObserved && t.lastNonce == n {
-		t.consecutiveHits++
-	} else {
-		t.lastNonce = n
-		t.hasObserved = true
-		t.consecutiveHits = 1
-		// A new stuck candidate means replacement attempts for the
-		// previous nonce no longer apply — reset the bump counter.
-		t.bumpAttempts = 0
+	t.reapStaleLocked()
+
+	entry, ok := t.entries[n]
+	if !ok {
+		entry = &nonceState{}
+		t.entries[n] = entry
 	}
-	return t.consecutiveHits
+	entry.hits++
+	entry.lastSeen = t.now()
+	return entry.hits
 }
 
-// ConsecutiveHits returns the current consecutive-hit count without
-// mutating state. Returns 0 if no rejection has ever been recorded.
+// ConsecutiveHits returns the hit count at nonce n, or 0 if n has never
+// been recorded. Preserved name for backward compat with the previous
+// "single-slot" API (callers that only care about the most recent nonce
+// can still use `Record`'s return value; ConsecutiveHits is kept for
+// introspection and tests).
 func (t *StuckNonceTracker) ConsecutiveHits() int {
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	return t.consecutiveHits
+
+	// Return the max across entries — gives callers "how stuck is the
+	// most-stuck nonce right now". Preserves existing test expectations.
+	var maxHits int
+	for _, e := range t.entries {
+		if e.hits > maxHits {
+			maxHits = e.hits
+		}
+	}
+	return maxHits
 }
 
-// LastNonce returns the last nonce at which a rejection was recorded, and
-// whether any rejection has ever been recorded. Callers use this to
-// identify WHICH nonce is stuck so they can build a replacement tx at that
-// exact nonce.
+// HitsAt returns the hit count for a specific nonce. Zero if unknown.
+// Used by callers (BlobTxSubmitter) that need to reason about a particular
+// nonce they just broadcasted.
+func (t *StuckNonceTracker) HitsAt(n uint64) int {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if e, ok := t.entries[n]; ok {
+		return e.hits
+	}
+	return 0
+}
+
+// LastNonce returns the nonce most recently recorded, and whether any
+// rejection has been recorded at all. Under parallel broadcasts "most
+// recently" is determined by the latest lastSeen timestamp.
 func (t *StuckNonceTracker) LastNonce() (uint64, bool) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	return t.lastNonce, t.hasObserved
+	var (
+		latest   time.Time
+		lastN    uint64
+		observed bool
+	)
+	for n, e := range t.entries {
+		if !observed || e.lastSeen.After(latest) {
+			latest = e.lastSeen
+			lastN = n
+			observed = true
+		}
+	}
+	return lastN, observed
 }
 
 // BumpAttemptsUsed reports how many replacement-tx attempts have been made
-// for the current stuck nonce. Callers compare against a configured max
-// before attempting another bump.
+// for the CURRENT stuck nonce. Resets implicitly when the caller starts
+// tracking a new nonce (via IncrementBumpAttempts at a different nonce).
 func (t *StuckNonceTracker) BumpAttemptsUsed() int {
 	t.mu.Lock()
 	defer t.mu.Unlock()
@@ -80,22 +153,59 @@ func (t *StuckNonceTracker) BumpAttemptsUsed() int {
 }
 
 // IncrementBumpAttempts is called by the replacement-tx submitter each
-// time it broadcasts a bumped-fee replacement.
+// time it broadcasts a bumped-fee replacement. Call sites today don't
+// thread the nonce through, so this keeps the legacy signature and relies
+// on the caller's own discipline (replacement only fires from one path,
+// the blob-tx stuck-nonce branch).
 func (t *StuckNonceTracker) IncrementBumpAttempts() {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	t.bumpAttempts++
 }
 
-// Clear resets the tracker. Called after a successful normal broadcast
-// (the stuck nonce is no longer stuck) or when the caller chooses to
-// abandon tracking (e.g. NonceManager refetched a nonce greater than the
-// tracked one, implying the stuck tx mined or was evicted).
+// IncrementBumpAttemptsFor is the nonce-aware variant: if the last bump
+// was for a DIFFERENT nonce, the counter resets before incrementing. Use
+// this in new callers that know which nonce they're bumping.
+func (t *StuckNonceTracker) IncrementBumpAttemptsFor(n uint64) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if !t.hasLastBumpNonce || t.lastBumpNonce != n {
+		t.bumpAttempts = 0
+		t.lastBumpNonce = n
+		t.hasLastBumpNonce = true
+	}
+	t.bumpAttempts++
+}
+
+// Clear resets the tracker fully. Called after a successful normal
+// broadcast (stuck condition resolved) or when the caller abandons
+// tracking (e.g. chain refetch returned a nonce greater than all tracked).
 func (t *StuckNonceTracker) Clear() {
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	t.lastNonce = 0
-	t.hasObserved = false
-	t.consecutiveHits = 0
+	for n := range t.entries {
+		delete(t.entries, n)
+	}
 	t.bumpAttempts = 0
+	t.hasLastBumpNonce = false
+	t.lastBumpNonce = 0
+}
+
+// Size returns the number of nonces currently tracked. Exposed for
+// metrics (`stuck_nonce_tracked` gauge).
+func (t *StuckNonceTracker) Size() int {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return len(t.entries)
+}
+
+// reapStaleLocked is called with the mutex held. Removes entries whose
+// lastSeen is older than entryTTL. Cheap amortization over Record calls.
+func (t *StuckNonceTracker) reapStaleLocked() {
+	cutoff := t.now().Add(-t.entryTTL)
+	for n, e := range t.entries {
+		if e.lastSeen.Before(cutoff) {
+			delete(t.entries, n)
+		}
+	}
 }

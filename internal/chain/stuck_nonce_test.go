@@ -3,6 +3,7 @@ package chain
 import (
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 )
@@ -15,31 +16,59 @@ func TestStuckNonceTracker_SameNonceIncrements(t *testing.T) {
 	assert.Equal(t, 2, tr.Record(152))
 	assert.Equal(t, 3, tr.Record(152))
 	assert.Equal(t, 3, tr.ConsecutiveHits())
+	assert.Equal(t, 3, tr.HitsAt(152))
 
 	n, ok := tr.LastNonce()
 	assert.True(t, ok)
 	assert.Equal(t, uint64(152), n)
 }
 
-func TestStuckNonceTracker_DifferentNonceResets(t *testing.T) {
+func TestStuckNonceTracker_DifferentNoncesAccumulateIndependently(t *testing.T) {
 	t.Parallel()
 
+	// Critical regression: under parallel broadcasts, Record(K) and
+	// Record(K+1) MUST NOT reset each other's counters. The old single-
+	// slot design did exactly that, causing the bump threshold to never
+	// trigger under concurrency.
 	tr := NewStuckNonceTracker()
 	tr.Record(152)
 	tr.Record(152)
 	tr.Record(152)
-	tr.IncrementBumpAttempts()
-	tr.IncrementBumpAttempts()
+
+	tr.Record(153)
+	tr.Record(153)
+
+	assert.Equal(t, 3, tr.HitsAt(152),
+		"records at 153 must not clobber hits at 152")
+	assert.Equal(t, 2, tr.HitsAt(153))
+	assert.Equal(t, 3, tr.ConsecutiveHits(),
+		"ConsecutiveHits returns the max across tracked nonces")
+}
+
+func TestStuckNonceTracker_BumpCounterResetsOnNonceChange(t *testing.T) {
+	t.Parallel()
+
+	tr := NewStuckNonceTracker()
+	tr.IncrementBumpAttemptsFor(152)
+	tr.IncrementBumpAttemptsFor(152)
 	assert.Equal(t, 2, tr.BumpAttemptsUsed())
 
-	// A different nonce appearing means the previous stuck candidate is
-	// no longer a concern (the counter has moved). Hit count and bump
-	// counter must both reset — bumping replacement at nonce 152 makes
-	// no sense once we're trying 153.
-	assert.Equal(t, 1, tr.Record(153))
-	assert.Equal(t, 0, tr.BumpAttemptsUsed())
-	n, _ := tr.LastNonce()
-	assert.Equal(t, uint64(153), n)
+	// Bumping at a new nonce resets — replacement at 152 makes no sense
+	// if we're now bumping 153.
+	tr.IncrementBumpAttemptsFor(153)
+	assert.Equal(t, 1, tr.BumpAttemptsUsed())
+}
+
+func TestStuckNonceTracker_LegacyIncrementBumpAttempts(t *testing.T) {
+	t.Parallel()
+
+	// The legacy nonce-less IncrementBumpAttempts is preserved for the
+	// existing caller (blob_tx.go:521). It increments without resetting.
+	tr := NewStuckNonceTracker()
+	tr.IncrementBumpAttempts()
+	tr.IncrementBumpAttempts()
+	tr.IncrementBumpAttempts()
+	assert.Equal(t, 3, tr.BumpAttemptsUsed())
 }
 
 func TestStuckNonceTracker_Clear(t *testing.T) {
@@ -48,63 +77,69 @@ func TestStuckNonceTracker_Clear(t *testing.T) {
 	tr := NewStuckNonceTracker()
 	tr.Record(152)
 	tr.Record(152)
+	tr.Record(153)
 	tr.IncrementBumpAttempts()
 
 	tr.Clear()
 
 	assert.Equal(t, 0, tr.ConsecutiveHits())
 	assert.Equal(t, 0, tr.BumpAttemptsUsed())
+	assert.Equal(t, 0, tr.Size())
 	_, ok := tr.LastNonce()
 	assert.False(t, ok, "LastNonce must report hasObserved=false after Clear")
 }
 
-func TestStuckNonceTracker_BumpAttemptsIndependentOfHits(t *testing.T) {
+func TestStuckNonceTracker_StaleEntriesEvicted(t *testing.T) {
 	t.Parallel()
 
-	// Bump attempts and consecutive hits are related but independent: a
-	// caller may hit threshold, increment bumps, then record more hits
-	// at the same nonce (replacement didn't evict). Hits continue
-	// counting, bumps track replacement attempts separately.
 	tr := NewStuckNonceTracker()
-	tr.Record(152)
-	tr.Record(152)
-	tr.Record(152)
-	tr.Record(152)
-	tr.Record(152) // threshold hit at 5
-	tr.IncrementBumpAttempts()
-	assert.Equal(t, 5, tr.ConsecutiveHits())
-	assert.Equal(t, 1, tr.BumpAttemptsUsed())
+	tr.entryTTL = 50 * time.Millisecond
+
+	// Inject a frozen clock to avoid flaky timing.
+	clock := time.Now()
+	tr.now = func() time.Time { return clock }
 
 	tr.Record(152)
-	assert.Equal(t, 6, tr.ConsecutiveHits(),
-		"hits keep counting even after a bump is attempted")
-	assert.Equal(t, 1, tr.BumpAttemptsUsed(),
-		"bumps are not incremented by Record — only by IncrementBumpAttempts")
+	tr.Record(153)
+	assert.Equal(t, 2, tr.Size())
+
+	// Advance clock beyond TTL; next Record triggers reap.
+	clock = clock.Add(1 * time.Second)
+	tr.Record(154)
+	assert.Equal(t, 1, tr.Size(), "stale entries must be reaped on access")
+	assert.Equal(t, 0, tr.HitsAt(152))
+	assert.Equal(t, 0, tr.HitsAt(153))
+	assert.Equal(t, 1, tr.HitsAt(154))
 }
 
-func TestStuckNonceTracker_ConcurrentAccess(t *testing.T) {
+func TestStuckNonceTracker_ConcurrentInterleavedNonces(t *testing.T) {
 	t.Parallel()
 
-	// Race-detector exercise: many goroutines hammering the same tracker
-	// at the same nonce must not trip -race.
+	// Race-detector exercise: many goroutines hammering DIFFERENT nonces
+	// simultaneously must all count their hits correctly. This is the
+	// scenario the old single-slot design broke.
 	tr := NewStuckNonceTracker()
-	const goroutines = 16
+	const goroutinesPerNonce = 8
 	const hitsPerGoroutine = 50
+	const nonces = 4
 
 	var wg sync.WaitGroup
-	wg.Add(goroutines)
-	for i := 0; i < goroutines; i++ {
-		go func() {
-			defer wg.Done()
-			for j := 0; j < hitsPerGoroutine; j++ {
-				tr.Record(77)
-				_ = tr.ConsecutiveHits()
-				_, _ = tr.LastNonce()
-			}
-		}()
+	for n := uint64(0); n < nonces; n++ {
+		for g := 0; g < goroutinesPerNonce; g++ {
+			wg.Add(1)
+			nonce := n
+			go func() {
+				defer wg.Done()
+				for j := 0; j < hitsPerGoroutine; j++ {
+					tr.Record(nonce)
+				}
+			}()
+		}
 	}
 	wg.Wait()
 
-	assert.Equal(t, goroutines*hitsPerGoroutine, tr.ConsecutiveHits(),
-		"every Record at the same nonce must increment the counter exactly once")
+	for n := uint64(0); n < nonces; n++ {
+		assert.Equal(t, goroutinesPerNonce*hitsPerGoroutine, tr.HitsAt(n),
+			"hits at nonce %d must equal total parallel records", n)
+	}
 }

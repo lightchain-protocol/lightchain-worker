@@ -97,11 +97,12 @@ func TestBlobTxSubmitter_ResetNonceOnPreBroadcastSendFailure(t *testing.T) {
 	}
 }
 
-// TestBlobTxSubmitter_SerializesBroadcast verifies that concurrent
-// SubmitBlobTx invocations do not overlap in the SendTransaction..WaitMined
-// window. Without the broadcastMu, go-ethereum's txpool would reject the
-// second concurrent blob tx with "address already reserved".
-func TestBlobTxSubmitter_SerializesBroadcast(t *testing.T) {
+// TestBlobTxSubmitter_ParallelBlobBroadcasts verifies that concurrent
+// SubmitBlobTx invocations can overlap inside the SendTransaction..WaitMined
+// window — they both enter the coordinator under ClassBlob, and geth's
+// blobpool orders them by nonce internally. This is the throughput win
+// over the old single-slot BroadcastSerializer.
+func TestBlobTxSubmitter_ParallelBlobBroadcasts(t *testing.T) {
 	t.Parallel()
 
 	var inFlight, maxInFlight atomic.Int32
@@ -113,8 +114,6 @@ func TestBlobTxSubmitter_SerializesBroadcast(t *testing.T) {
 	}
 
 	waitMined := func(ctx context.Context, _ bind.DeployBackend, tx *types.Transaction) (*types.Receipt, error) {
-		// Hold the critical section for a window long enough to expose any
-		// concurrent broadcast if the mutex is broken.
 		select {
 		case <-time.After(50 * time.Millisecond):
 		case <-ctx.Done():
@@ -123,6 +122,9 @@ func TestBlobTxSubmitter_SerializesBroadcast(t *testing.T) {
 		return &types.Receipt{Status: types.ReceiptStatusSuccessful, TxHash: tx.Hash()}, nil
 	}
 
+	coordinator := workerchain.NewSubpoolCoordinator(nil, 0)
+	defer coordinator.Close()
+
 	submitter := &BlobTxSubmitter{
 		txBackend:   backend,
 		signingKey:  testSigningKey(t),
@@ -130,6 +132,7 @@ func TestBlobTxSubmitter_SerializesBroadcast(t *testing.T) {
 		chainID:     big.NewInt(1),
 		nonceMgr:    &mockNonceManager{next: 7},
 		maxGasPrice: big.NewInt(2),
+		coordinator: coordinator,
 	}
 
 	const goroutines = 2
@@ -148,113 +151,84 @@ func TestBlobTxSubmitter_SerializesBroadcast(t *testing.T) {
 	for i, err := range errs {
 		assert.NoError(t, err, "goroutine %d", i)
 	}
-	assert.Equal(t, int32(1), maxInFlight.Load(), "expected broadcast to be serialized, max in-flight was %d", maxInFlight.Load())
+	assert.Equal(t, int32(goroutines), maxInFlight.Load(),
+		"concurrent blob broadcasts must run in parallel (max in-flight %d, want %d)", maxInFlight.Load(), goroutines)
 }
 
-// TestBlobTxSubmitter_CtxCancelDuringSlotWait asserts that a goroutine
-// waiting for the broadcast slot aborts promptly when its context is
-// cancelled, and never reaches SendTransaction. Without ctx-awareness on
-// the slot acquire, the queued goroutine would be stuck until the prior
-// holder's WaitMined returns.
-//
-// Synchronization relies on the gas-tip hook firing after KZG but before the
-// slot acquire select, giving the test a deterministic moment at which G2 is
-// about to block on the slot.
-func TestBlobTxSubmitter_CtxCancelDuringSlotWait(t *testing.T) {
+// TestBlobTxSubmitter_CtxCancelDuringCrossClassWait asserts that a blob
+// broadcast blocked in coordinator.Enter (because a legacy token is held
+// by an external party) aborts promptly on ctx cancel without reaching
+// SendTransaction. Under the SubpoolCoordinator same-class Enters don't
+// block, so the only way to observe a ctx-cancel-during-wait is via a
+// cross-class hold.
+func TestBlobTxSubmitter_CtxCancelDuringCrossClassWait(t *testing.T) {
 	t.Parallel()
 
 	var sendCalls atomic.Int32
 	var suggestCount atomic.Int32
-	g2ReadyForSlot := make(chan struct{})
+	readyForSlot := make(chan struct{})
 	backend := mockBlobTxBackend{
 		gasTipCap: big.NewInt(1),
 		sendCalls: &sendCalls,
 		onSuggest: func() {
-			if suggestCount.Add(1) == 2 {
-				close(g2ReadyForSlot)
+			if suggestCount.Add(1) == 1 {
+				close(readyForSlot)
 			}
 		},
 	}
 
-	g1InSlot := make(chan struct{})
-	g1Release := make(chan struct{})
-	waitMined := func(ctx context.Context, _ bind.DeployBackend, tx *types.Transaction) (*types.Receipt, error) {
-		close(g1InSlot)
-		select {
-		case <-g1Release:
-			return &types.Receipt{Status: types.ReceiptStatusSuccessful, TxHash: tx.Hash()}, nil
-		case <-ctx.Done():
-			return nil, ctx.Err()
-		}
-	}
+	coordinator := workerchain.NewSubpoolCoordinator(nil, 0)
+	defer coordinator.Close()
 
 	submitter := &BlobTxSubmitter{
-		txBackend:   backend,
-		signingKey:  testSigningKey(t),
-		waitMined:   waitMined,
+		txBackend:  backend,
+		signingKey: testSigningKey(t),
+		waitMined: func(ctx context.Context, _ bind.DeployBackend, tx *types.Transaction) (*types.Receipt, error) {
+			return &types.Receipt{Status: types.ReceiptStatusSuccessful, TxHash: tx.Hash()}, nil
+		},
 		chainID:     big.NewInt(1),
 		nonceMgr:    &mockNonceManager{next: 7},
 		maxGasPrice: big.NewInt(2),
+		coordinator: coordinator,
 	}
 
-	// G1 enters the slot and blocks in waitMined.
-	g1Done := make(chan struct{})
-	go func() {
-		defer close(g1Done)
-		_, err := submitter.SubmitBlobTx(context.Background(), []byte("g1-ciphertext"))
-		assert.NoError(t, err, "g1 should succeed after release")
-	}()
+	// External legacy holder keeps the blob lane blocked at Enter.
+	legacyTok, err := coordinator.Enter(context.Background(), workerchain.ClassLegacy)
+	require.NoError(t, err)
+	defer legacyTok.Done()
 
-	// Wait until G1 is holding the slot (generous timeout accounts for ~9s KZG).
-	select {
-	case <-g1InSlot:
-	case <-time.After(30 * time.Second):
-		close(g1Release)
-		<-g1Done
-		t.Fatal("g1 did not enter waitMined within 30s")
-	}
-
-	// G2 attempts acquire with a cancellable ctx.
 	ctx, cancel := context.WithCancel(context.Background())
-	g2ErrCh := make(chan error, 1)
+	errCh := make(chan error, 1)
 	go func() {
 		_, err := submitter.SubmitBlobTx(ctx, []byte("g2-ciphertext"))
-		g2ErrCh <- err
+		errCh <- err
 	}()
 
-	// Wait until G2 has finished KZG/gas suggestion — it's now at the slot
-	// acquire select, blocked because G1 still holds the slot.
+	// Wait until SubmitBlobTx has finished KZG/gas suggestion — it's now
+	// about to call coordinator.Enter(ClassBlob) which will block.
 	select {
-	case <-g2ReadyForSlot:
+	case <-readyForSlot:
 	case <-time.After(30 * time.Second):
-		close(g1Release)
-		<-g1Done
-		t.Fatal("g2 did not reach slot acquire within 30s")
+		t.Fatal("blob submitter did not reach coordinator Enter within 30s")
 	}
 
-	// Now cancel. With the ctx-aware slot, G2 exits promptly. Without
-	// the fix, G2 would block on Lock() indefinitely since G1 still holds.
+	// Give Enter a moment to block on the notify channel, then cancel.
+	time.Sleep(20 * time.Millisecond)
 	cancelAt := time.Now()
 	cancel()
 
 	select {
-	case err := <-g2ErrCh:
+	case err := <-errCh:
 		require.Error(t, err)
 		assert.ErrorIs(t, err, context.Canceled)
 		assert.Less(t, time.Since(cancelAt), 500*time.Millisecond,
-			"g2 should exit within 500ms of cancel — slot must be ctx-aware")
+			"blob Enter must exit within 500ms of ctx cancel — coordinator must be ctx-aware")
 	case <-time.After(5 * time.Second):
-		close(g1Release)
-		<-g1Done
-		t.Fatal("g2 did not return within 5s of cancel — slot acquire is not ctx-aware")
+		t.Fatal("blob submitter did not return within 5s of cancel — Enter is not ctx-aware")
 	}
 
-	assert.Equal(t, int32(1), sendCalls.Load(),
-		"g2 must not reach SendTransaction while blocked on ctx-cancelled slot wait")
-
-	// Release G1 to let the test complete cleanly.
-	close(g1Release)
-	<-g1Done
+	assert.Equal(t, int32(0), sendCalls.Load(),
+		"SendTransaction must not fire when ctx is cancelled during Enter")
 }
 
 // TestBlobTxSubmitter_CtxCancelDuringWaitMined asserts that when the ctx
@@ -552,19 +526,21 @@ func TestBlobTxSubmitter_ClearsOnSuccessfulMine(t *testing.T) {
 		"successful mine must clear the tracked nonce observation")
 }
 
-// TestBlobTxSubmitter_BlocksOnExternallyHeldSlot mirrors the chain-package
-// test on the blob side: when the same BroadcastSerializer is held by an
-// external goroutine (simulating a concurrent ChainClient.submitPreparedTx
-// broadcast), SubmitBlobTx must not reach SendTransaction until released.
-// Together with the chain-side test, this proves the Hazard A invariant
-// end-to-end across both submitter implementations.
-func TestBlobTxSubmitter_BlocksOnExternallyHeldSlot(t *testing.T) {
+// TestBlobTxSubmitter_BlocksOnExternalLegacy asserts cross-class
+// exclusion: when the shared coordinator has a ClassLegacy token held by
+// an external party (simulating a concurrent ChainClient.submitPreparedTx
+// broadcast), SubmitBlobTx — which enters ClassBlob — must wait until the
+// legacy token is released. This is the geth cross-subpool invariant
+// (blobpool.go:336).
+func TestBlobTxSubmitter_BlocksOnExternalLegacy(t *testing.T) {
 	t.Parallel()
 
 	var sendCalls atomic.Int32
 	readyForSlot := make(chan struct{})
 	var suggestCount atomic.Int32
-	serializer := workerchain.NewBroadcastSerializer()
+	coordinator := workerchain.NewSubpoolCoordinator(nil, 0)
+	defer coordinator.Close()
+
 	submitter := &BlobTxSubmitter{
 		txBackend: mockBlobTxBackend{
 			gasTipCap: big.NewInt(1),
@@ -582,12 +558,13 @@ func TestBlobTxSubmitter_BlocksOnExternallyHeldSlot(t *testing.T) {
 		chainID:     big.NewInt(1),
 		nonceMgr:    &mockNonceManager{next: 7},
 		maxGasPrice: big.NewInt(2),
-		serializer:  serializer,
+		coordinator: coordinator,
 	}
 
-	// External holder simulates a concurrent ChainClient broadcast in
-	// its SendTransaction..WaitMined window on the SAME serializer.
-	require.NoError(t, serializer.Acquire(context.Background()))
+	// External Legacy holder — simulates a concurrent ChainClient broadcast
+	// in its SendTransaction..WaitMined window on the SAME coordinator.
+	legacyTok, err := coordinator.Enter(context.Background(), workerchain.ClassLegacy)
+	require.NoError(t, err)
 
 	submitDone := make(chan error, 1)
 	go func() {
@@ -595,29 +572,26 @@ func TestBlobTxSubmitter_BlocksOnExternallyHeldSlot(t *testing.T) {
 		submitDone <- err
 	}()
 
-	// Wait until the submitter has finished KZG/gas suggestion and reached
-	// the slot acquire select, then verify it's blocked.
 	select {
 	case <-readyForSlot:
 	case <-time.After(30 * time.Second):
-		serializer.Release()
+		legacyTok.Done()
 		err := <-submitDone
 		require.NoError(t, err)
-		t.Fatal("SubmitBlobTx did not reach slot acquire within 30s")
+		t.Fatal("SubmitBlobTx did not reach coordinator Enter within 30s")
 	}
 	assert.Equal(t, int32(0), sendCalls.Load(),
-		"SubmitBlobTx must not reach SendTransaction while external holder owns the shared serializer")
+		"SubmitBlobTx must not reach SendTransaction while a legacy token is held")
 
-	// Release; SubmitBlobTx should now proceed to a successful broadcast.
-	serializer.Release()
+	legacyTok.Done()
 
 	select {
 	case err := <-submitDone:
 		require.NoError(t, err)
 		assert.Equal(t, int32(1), sendCalls.Load(),
-			"SendTransaction must fire exactly once after external holder releases")
+			"SendTransaction must fire exactly once after legacy token drains")
 	case <-time.After(5 * time.Second):
-		t.Fatal("SubmitBlobTx did not proceed within 5s of external release — shared slot is not actually shared")
+		t.Fatal("SubmitBlobTx did not proceed within 5s of legacy drain — coordinator is not shared correctly")
 	}
 }
 

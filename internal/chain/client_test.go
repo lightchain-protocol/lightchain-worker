@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"math/big"
+	"sync"
 	"testing"
 	"time"
 
@@ -215,26 +216,25 @@ func TestSubmitPreparedTx_RecordsStuckNonceHitWithoutReplacement(t *testing.T) {
 		"non-blob path must not attempt any replacement bumps")
 }
 
-// TestSubmitPreparedTx_BlocksOnExternallyHeldSlot asserts that the shared
-// BroadcastSerializer actually serializes across submitters: a goroutine
-// holding the serializer (simulating a concurrent BlobTxSubmitter in-flight)
-// prevents submitPreparedTx from reaching SendTransaction. This is the
-// Hazard A invariant — go-ethereum's txpool reservation is sender-wide, so
-// one shared serializer must cover blob AND non-blob paths.
-func TestSubmitPreparedTx_BlocksOnExternallyHeldSlot(t *testing.T) {
+// TestSubmitPreparedTx_BlocksOnBlobInFlight asserts that cross-class
+// serialization works: a blob Enter held in the coordinator (simulating a
+// concurrent BlobTxSubmitter broadcast) prevents submitPreparedTx — which
+// enters ClassLegacy — from reaching SendTransaction. This is the geth
+// cross-subpool exclusion invariant (blobpool.go:336).
+func TestSubmitPreparedTx_BlocksOnBlobInFlight(t *testing.T) {
 	t.Parallel()
 
-	serializer := NewBroadcastSerializer()
+	coordinator := NewSubpoolCoordinator(nil, 0)
+	defer coordinator.Close()
 	client := newTestChainClient(t)
-	client.serializer = serializer
-	// Fail SendTransaction cheaply so submitPreparedTx returns without
-	// needing a real ethClient for WaitMined.
+	client.coordinator = coordinator
 	client.jobTxBackend.(*mockJobTxBackend).sendErr = assert.AnError
 
-	// External holder simulates a concurrent BlobTxSubmitter broadcast in
-	// its SendTransaction..WaitMined window. Same serializer pointer => any
-	// concurrent submitPreparedTx must block.
-	require.NoError(t, serializer.Acquire(context.Background()))
+	// External holder simulates a concurrent BlobTxSubmitter in its
+	// SendTransaction..WaitMined window. Same coordinator pointer => the
+	// Legacy Enter inside submitPreparedTx must block until release.
+	blobTok, err := coordinator.Enter(context.Background(), ClassBlob)
+	require.NoError(t, err)
 
 	submitDone := make(chan error, 1)
 	go func() {
@@ -243,41 +243,91 @@ func TestSubmitPreparedTx_BlocksOnExternallyHeldSlot(t *testing.T) {
 		})
 	}()
 
-	// Give the goroutine time to arrive at the serializer.Acquire select,
-	// then verify it's blocked before SendTransaction.
 	time.Sleep(100 * time.Millisecond)
 	assert.Equal(t, 0, client.jobTxBackend.(*mockJobTxBackend).sendCalls,
-		"submitPreparedTx must not reach SendTransaction while external holder owns the shared serializer")
+		"submitPreparedTx must not reach SendTransaction while a blob is in flight")
 
-	// Release the external holder; submitPreparedTx should now proceed,
-	// fail its SendTransaction (due to injected sendErr), and return.
-	serializer.Release()
+	blobTok.Done()
 
 	select {
 	case err := <-submitDone:
 		require.Error(t, err)
 		assert.Contains(t, err.Error(), "send AcknowledgeJob tx")
 		assert.Equal(t, 1, client.jobTxBackend.(*mockJobTxBackend).sendCalls,
-			"SendTransaction must fire exactly once after external holder releases")
+			"SendTransaction must fire exactly once after blob drains")
 	case <-time.After(2 * time.Second):
-		t.Fatal("submitPreparedTx did not proceed within 2s of external release — shared slot is not actually shared")
+		t.Fatal("submitPreparedTx did not proceed within 2s of blob drain — coordinator is not shared correctly")
 	}
 }
 
-// TestSubmitPreparedTx_CtxCancelDuringSlotWait asserts that a submitPreparedTx
-// call blocked on the shared serializer exits promptly on ctx cancel without
-// reaching SendTransaction. Regression guard for asynq task cancellation
-// propagating through the non-blob broadcast path.
-func TestSubmitPreparedTx_CtxCancelDuringSlotWait(t *testing.T) {
+// TestSubmitPreparedTx_LegacyParallelism asserts that two concurrent legacy
+// broadcasts DO NOT block each other — they share the class, and geth's
+// legacypool handles nonce ordering internally. This is the within-class
+// throughput win over the old single-slot BroadcastSerializer.
+func TestSubmitPreparedTx_LegacyParallelism(t *testing.T) {
 	t.Parallel()
 
-	serializer := NewBroadcastSerializer()
-	client := newTestChainClient(t)
-	client.serializer = serializer
+	coordinator := NewSubpoolCoordinator(nil, 0)
+	defer coordinator.Close()
 
-	// External holder keeps the slot until the test ends.
-	require.NoError(t, serializer.Acquire(context.Background()))
-	defer serializer.Release()
+	// Two independent test clients share ONE coordinator (same signing
+	// key in production). Each client has its own backend so sendCalls
+	// is attributed separately.
+	c1 := newTestChainClient(t)
+	c1.coordinator = coordinator
+	c2 := newTestChainClient(t)
+	c2.coordinator = coordinator
+
+	// Make SendTransaction block on a channel so we can observe both
+	// entering their critical section simultaneously.
+	release := make(chan struct{})
+	blockingSend := func() error {
+		<-release
+		return assert.AnError // fail cheaply so WaitMined isn't called
+	}
+	c1.jobTxBackend.(*mockJobTxBackend).sendFn = blockingSend
+	c2.jobTxBackend.(*mockJobTxBackend).sendFn = blockingSend
+
+	done1 := make(chan error, 1)
+	done2 := make(chan error, 1)
+	go func() {
+		done1 <- c1.submitPreparedTx(context.Background(), "AcknowledgeJob", nil, func(opts *bind.TransactOpts) (*types.Transaction, error) {
+			return types.NewTx(&types.LegacyTx{Nonce: opts.Nonce.Uint64()}), nil
+		})
+	}()
+	go func() {
+		done2 <- c2.submitPreparedTx(context.Background(), "AcknowledgeJob", nil, func(opts *bind.TransactOpts) (*types.Transaction, error) {
+			return types.NewTx(&types.LegacyTx{Nonce: opts.Nonce.Uint64()}), nil
+		})
+	}()
+
+	// Both must reach SendTransaction before we release either — proof
+	// that the coordinator did NOT serialize them.
+	require.Eventually(t, func() bool {
+		return coordinator.Inflight(ClassLegacy) == 2
+	}, 500*time.Millisecond, 10*time.Millisecond,
+		"both legacy broadcasts must be in flight simultaneously")
+
+	close(release)
+	<-done1
+	<-done2
+}
+
+// TestSubmitPreparedTx_CtxCancelDuringEnter asserts that a submitPreparedTx
+// call blocked in coordinator.Enter exits promptly on ctx cancel without
+// reaching SendTransaction.
+func TestSubmitPreparedTx_CtxCancelDuringEnter(t *testing.T) {
+	t.Parallel()
+
+	coordinator := NewSubpoolCoordinator(nil, 0)
+	defer coordinator.Close()
+	client := newTestChainClient(t)
+	client.coordinator = coordinator
+
+	// External blob holder keeps the legacy lane blocked until test end.
+	blobTok, err := coordinator.Enter(context.Background(), ClassBlob)
+	require.NoError(t, err)
+	defer blobTok.Done()
 
 	ctx, cancel := context.WithCancel(context.Background())
 	submitDone := make(chan error, 1)
@@ -298,11 +348,11 @@ func TestSubmitPreparedTx_CtxCancelDuringSlotWait(t *testing.T) {
 		assert.Less(t, time.Since(cancelAt), 500*time.Millisecond,
 			"submitPreparedTx must exit within 500ms of ctx cancel")
 		assert.Equal(t, 0, client.jobTxBackend.(*mockJobTxBackend).sendCalls,
-			"SendTransaction must not fire when ctx is cancelled during slot wait")
+			"SendTransaction must not fire when ctx is cancelled during Enter")
 		assert.False(t, client.nonceMgr.initialized,
-			"cancelled slot wait must not reserve a nonce")
+			"cancelled Enter must not reserve a nonce")
 	case <-time.After(2 * time.Second):
-		t.Fatal("submitPreparedTx did not return within 2s of ctx cancel — serializer.Acquire is not ctx-aware")
+		t.Fatal("submitPreparedTx did not return within 2s of ctx cancel")
 	}
 }
 
@@ -320,6 +370,11 @@ type mockJobTxBackend struct {
 	gasPrice  *big.Int
 	sendErr   error
 	sendCalls int
+	// sendFn, if set, is invoked BEFORE sendErr is returned. Used in
+	// concurrency tests to synchronize multiple goroutines at the
+	// SendTransaction boundary.
+	sendFn func() error
+	mu     sync.Mutex
 }
 
 func (m *mockJobTxBackend) SuggestGasPrice(context.Context) (*big.Int, error) {
@@ -327,8 +382,15 @@ func (m *mockJobTxBackend) SuggestGasPrice(context.Context) (*big.Int, error) {
 }
 
 func (m *mockJobTxBackend) SendTransaction(context.Context, *types.Transaction) error {
+	m.mu.Lock()
 	m.sendCalls++
-	return m.sendErr
+	fn := m.sendFn
+	err := m.sendErr
+	m.mu.Unlock()
+	if fn != nil {
+		return fn()
+	}
+	return err
 }
 
 func newTestChainClient(t *testing.T) *ChainClient {

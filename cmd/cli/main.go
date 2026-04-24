@@ -260,7 +260,10 @@ func dialChain(cfg *config.RegistrationConfig, signingKey *ecdsa.PrivateKey, log
 		common.Address{}, // jobRegistryAddr — not needed for CLI operations
 		signingKey,
 		cfg.GasPriceMultiplierBps,
-		chain.NewBroadcastSerializer(),
+		// CLI is single-threaded — no concurrent broadcasts possible, so
+		// a private coordinator is correct. Not shared with a blob path
+		// because the CLI never submits blobs.
+		chain.NewSubpoolCoordinator(logger, 0),
 		chain.NewStuckNonceTracker(),
 	)
 	if err != nil {
