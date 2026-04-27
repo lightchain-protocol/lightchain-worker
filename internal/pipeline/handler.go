@@ -69,11 +69,12 @@ type BlobSubmitter interface {
 
 // HandlerConfig holds pipeline-specific configuration.
 type HandlerConfig struct {
-	AckTxTimeout    time.Duration
-	BlobTxTimeout   time.Duration
-	ModelIDToName   map[string]string
-	ChainID         *big.Int
-	JobRegistryAddr common.Address
+	AckTxTimeout        time.Duration
+	BlobTxTimeout       time.Duration
+	RedisPublishTimeout time.Duration
+	ModelIDToName       map[string]string
+	ChainID             *big.Int
+	JobRegistryAddr     common.Address
 }
 
 // ResponsePublisher publishes encrypted responses for real-time delivery.
@@ -808,8 +809,39 @@ func (h *JobHandler) publishToRedis(
 		return
 	}
 
-	sigHex := "0x" + hex.EncodeToString(sig)
-	h.responsePublisher.PublishResponse(ctx, jobID, sessionID, correlationID, sigHex, ciphertext)
+	resp := pkgtypes.PubSubMessage{
+		Type:          pkgtypes.MessageTypeComplete,
+		JobID:         pkgtypes.JobID(jobID),
+		SessionID:     pkgtypes.SessionID(sessionID),
+		Sequence:      0,
+		TotalChunks:   1,
+		Payload:       ciphertext,
+		Signature:     "0x" + hex.EncodeToString(sig),
+		CorrelationID: correlationID,
+		Timestamp:     time.Now().Unix(),
+	}
+
+	data, err := json.Marshal(resp)
+	if err != nil {
+		logger.Warn("failed to marshal response for Redis",
+			"stage", "redis_publish",
+			"error", err,
+		)
+		return
+	}
+
+	channel := fmt.Sprintf("session:%d:responses", sessionID)
+	// Bound the PUBLISH so a slow Redis cannot eat into stage 8's
+	// BlobTxTimeout budget (stage 7 is non-fatal but synchronous).
+	pubCtx, pubCancel := context.WithTimeout(ctx, h.cfg.RedisPublishTimeout)
+	defer pubCancel()
+	if err := h.redisClient.Publish(pubCtx, channel, data).Err(); err != nil {
+		logger.Warn("failed to publish response to Redis",
+			"stage", "redis_publish",
+			"channel", channel,
+			"error", err,
+		)
+	}
 }
 
 // signMismatchEvidence produces an EIP-191 worker signature over the domain-separated

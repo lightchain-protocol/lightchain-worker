@@ -186,8 +186,9 @@ func newTestHandler(
 ) *JobHandler {
 	t.Helper()
 	return newTestHandlerWithConfig(t, chain, fetcher, submitter, keyStore, ollama, redisClient, HandlerConfig{
-		AckTxTimeout:  5 * time.Second,
-		BlobTxTimeout: 60 * time.Second,
+		AckTxTimeout:        5 * time.Second,
+		BlobTxTimeout:       60 * time.Second,
+		RedisPublishTimeout: 5 * time.Second,
 	})
 }
 
@@ -278,8 +279,9 @@ func TestHandleTask_FullPipelineSuccess(t *testing.T) {
 		chain, fetcher, submitter, newMockKeyStore(), ollama,
 		rc, testSigningKey(t), ecdhKey, counter, logger,
 		HandlerConfig{
-			AckTxTimeout:  5 * time.Second,
-			BlobTxTimeout: 60 * time.Second,
+			AckTxTimeout:        5 * time.Second,
+			BlobTxTimeout:       60 * time.Second,
+			RedisPublishTimeout: 5 * time.Second,
 			ModelIDToName: map[string]string{
 				expectedModelID: "llama3-8b",
 			},
@@ -397,7 +399,7 @@ func TestHandleTask_SessionKeyCacheHit(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(io.Discard, &slog.HandlerOptions{Level: slog.LevelError}))
 	handler := NewJobHandler(chain, fetcher, submitter, ks, ollama, rc,
 		testSigningKey(t), ecdhKey, counter, logger,
-		HandlerConfig{AckTxTimeout: 5 * time.Second, BlobTxTimeout: 60 * time.Second}, nil)
+		HandlerConfig{AckTxTimeout: 5 * time.Second, BlobTxTimeout: 60 * time.Second, RedisPublishTimeout: 5 * time.Second}, nil)
 
 	payload := testPayload(t)
 	data, _ := json.Marshal(payload)
@@ -443,7 +445,7 @@ func TestHandleTask_SessionKeyCacheMiss_FetchAndStore(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(io.Discard, &slog.HandlerOptions{Level: slog.LevelError}))
 	handler := NewJobHandler(chain, fetcher, submitter, ks, ollama, rc,
 		testSigningKey(t), ecdhKey, counter, logger,
-		HandlerConfig{AckTxTimeout: 5 * time.Second, BlobTxTimeout: 60 * time.Second}, nil)
+		HandlerConfig{AckTxTimeout: 5 * time.Second, BlobTxTimeout: 60 * time.Second, RedisPublishTimeout: 5 * time.Second}, nil)
 
 	payload := testPayload(t)
 	data, _ := json.Marshal(payload)
@@ -511,7 +513,7 @@ func TestHandleTask_SessionKeyRotated_Refreshes(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(io.Discard, &slog.HandlerOptions{Level: slog.LevelError}))
 	handler := NewJobHandler(chain, fetcher, submitter, ks, ollama, rc,
 		testSigningKey(t), ecdhKey, counter, logger,
-		HandlerConfig{AckTxTimeout: 5 * time.Second, BlobTxTimeout: 60 * time.Second}, nil)
+		HandlerConfig{AckTxTimeout: 5 * time.Second, BlobTxTimeout: 60 * time.Second, RedisPublishTimeout: 5 * time.Second}, nil)
 
 	payload := testPayload(t)
 	data, _ := json.Marshal(payload)
@@ -565,7 +567,7 @@ func TestHandleTask_CompleteJobFailure(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(io.Discard, &slog.HandlerOptions{Level: slog.LevelError}))
 	handler := NewJobHandler(chain, fetcher, submitter, ks, ollama, rc,
 		testSigningKey(t), ecdhKey, counter, logger,
-		HandlerConfig{AckTxTimeout: 5 * time.Second, BlobTxTimeout: 60 * time.Second}, nil)
+		HandlerConfig{AckTxTimeout: 5 * time.Second, BlobTxTimeout: 60 * time.Second, RedisPublishTimeout: 5 * time.Second}, nil)
 
 	payload := testPayload(t)
 	data, _ := json.Marshal(payload)
@@ -600,7 +602,7 @@ func TestHandleTask_JobCounterIncrementDecrement(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(io.Discard, &slog.HandlerOptions{Level: slog.LevelError}))
 	handler := NewJobHandler(chain, fetcher, submitter, newMockKeyStore(), ollama, rc,
 		testSigningKey(t), testECDHKey(t), counter, logger,
-		HandlerConfig{AckTxTimeout: 5 * time.Second, BlobTxTimeout: 60 * time.Second}, nil)
+		HandlerConfig{AckTxTimeout: 5 * time.Second, BlobTxTimeout: 60 * time.Second, RedisPublishTimeout: 5 * time.Second}, nil)
 
 	payload := testPayload(t)
 	data, _ := json.Marshal(payload)
@@ -646,7 +648,7 @@ func TestHandleTask_RedisPublishFailure_NonFatal(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(io.Discard, &slog.HandlerOptions{Level: slog.LevelError}))
 	handler := NewJobHandler(chain, fetcher, submitter, ks, ollama, rc,
 		testSigningKey(t), ecdhKey, counter, logger,
-		HandlerConfig{AckTxTimeout: 5 * time.Second, BlobTxTimeout: 60 * time.Second}, nil)
+		HandlerConfig{AckTxTimeout: 5 * time.Second, BlobTxTimeout: 60 * time.Second, RedisPublishTimeout: 5 * time.Second}, nil)
 
 	payload := testPayload(t)
 	data, _ := json.Marshal(payload)
@@ -674,8 +676,9 @@ func TestPublishToRedis_SignsContractCompatibleDigest(t *testing.T) {
 		signingKey:  signingKey,
 		logger:      slog.New(slog.NewTextHandler(io.Discard, &slog.HandlerOptions{Level: slog.LevelError})),
 		cfg: HandlerConfig{
-			ChainID:         chainID,
-			JobRegistryAddr: jobRegistryAddr,
+			ChainID:             chainID,
+			JobRegistryAddr:     jobRegistryAddr,
+			RedisPublishTimeout: 5 * time.Second,
 		},
 	}
 
@@ -715,6 +718,42 @@ func TestPublishToRedis_SignsContractCompatibleDigest(t *testing.T) {
 	pubKey, err := crypto.SigToPub(accounts.TextHash(expectedDigest), sig)
 	require.NoError(t, err)
 	assert.Equal(t, crypto.PubkeyToAddress(signingKey.PublicKey), crypto.PubkeyToAddress(*pubKey))
+}
+
+// TestPublishToRedis_RespectsRedisPublishTimeout asserts that a slow/
+// unreachable Redis cannot block stage 7 indefinitely. Stage 7 is
+// non-fatal but synchronous, so without the bound a hung Publish would
+// eat into stage 8's BlobTxTimeout budget and stall job throughput.
+func TestPublishToRedis_RespectsRedisPublishTimeout(t *testing.T) {
+	t.Parallel()
+
+	// 192.0.2.0/24 is RFC 5737 TEST-NET-1 — guaranteed unroutable, so
+	// the dial blocks until our context cancels it. Use a short
+	// RedisPublishTimeout to keep the test fast; go-redis's default
+	// 5s DialTimeout would otherwise dominate.
+	rc := redis.NewClient(&redis.Options{Addr: "192.0.2.1:6379"})
+	t.Cleanup(func() { rc.Close() })
+
+	handler := &JobHandler{
+		redisClient: rc,
+		signingKey:  testSigningKey(t),
+		logger:      slog.New(slog.NewTextHandler(io.Discard, &slog.HandlerOptions{Level: slog.LevelError})),
+		cfg: HandlerConfig{
+			ChainID:             big.NewInt(31337),
+			JobRegistryAddr:     common.HexToAddress("0x0000000000000000000000000000000000001337"),
+			RedisPublishTimeout: 50 * time.Millisecond,
+		},
+	}
+
+	start := time.Now()
+	handler.publishToRedis(context.Background(), handler.logger, 1, 1, "corr", []byte("ct"))
+	elapsed := time.Since(start)
+
+	// 50ms timeout + scheduling jitter; 1s is generous but well below
+	// go-redis's 5s default DialTimeout, which would dominate if our
+	// context cancellation didn't fire.
+	require.Less(t, elapsed, 1*time.Second,
+		"publishToRedis must return within RedisPublishTimeout, not wait for go-redis DialTimeout")
 }
 
 func TestHandleTask_AckAlreadyMined_SkipsRetryAck(t *testing.T) {

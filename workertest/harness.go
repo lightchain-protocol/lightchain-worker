@@ -185,10 +185,11 @@ func New(t testing.TB, opts Options) *Harness {
 		jobCounter,
 		opts.Logger,
 		pipeline.HandlerConfig{
-			AckTxTimeout:    opts.AckTxTimeout,
-			ModelIDToName:   opts.ModelIDToName,
-			ChainID:         opts.ChainID,
-			JobRegistryAddr: opts.JobRegistryAddr,
+			AckTxTimeout:        opts.AckTxTimeout,
+			RedisPublishTimeout: 5 * time.Second,
+			ModelIDToName:       opts.ModelIDToName,
+			ChainID:             opts.ChainID,
+			JobRegistryAddr:     opts.JobRegistryAddr,
 		},
 		checkpoints,
 	)

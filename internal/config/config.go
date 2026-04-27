@@ -58,6 +58,12 @@ type Config struct {
 	SessionKeyFile      string
 	ReceiptPollInterval time.Duration
 
+	// RedisPublishTimeout bounds stage 7 (redis_publish): a single
+	// PUBLISH on the session response channel. Stage 7 is non-fatal but
+	// runs synchronously inside processJob, so a slow Redis must not be
+	// allowed to eat into stage 8's BlobTxTimeout budget.
+	RedisPublishTimeout time.Duration
+
 	// JobCheckpoint — retry-safety cache for stages 2-6.
 	//
 	// CheckpointTTL is how long a checkpoint record lives after the first
@@ -209,6 +215,7 @@ func Load() (*Config, error) {
 	cfg.BlobTxTimeout = parseDuration("BLOB_TX_TIMEOUT", "90s", &errs)
 	cfg.BlobFetchTimeout = parseDuration("BLOB_FETCH_TIMEOUT", "10s", &errs)
 	cfg.ReceiptPollInterval = parseDuration("RECEIPT_POLL_INTERVAL", "2s", &errs)
+	cfg.RedisPublishTimeout = parseDuration("REDIS_PUBLISH_TIMEOUT", "5s", &errs)
 
 	// Job execution integers
 	cfg.MaxConcurrentJobs = parseInt("MAX_CONCURRENT_JOBS", 2, &errs)
@@ -286,6 +293,9 @@ func (c *Config) Validate() []string {
 	}
 	if c.ReceiptPollInterval <= 0 {
 		errs = append(errs, "RECEIPT_POLL_INTERVAL must be positive")
+	}
+	if c.RedisPublishTimeout <= 0 {
+		errs = append(errs, "REDIS_PUBLISH_TIMEOUT must be positive")
 	}
 	if c.LogFormat != "json" && c.LogFormat != "text" {
 		errs = append(errs, fmt.Sprintf("LOG_FORMAT: must be \"json\" or \"text\", got %q", c.LogFormat))

@@ -262,11 +262,12 @@ func New(cfg *config.Config) (*Service, error) {
 		jobCounter,
 		logger,
 		pipeline.HandlerConfig{
-			AckTxTimeout:    cfg.AckTxTimeout,
-			BlobTxTimeout:   cfg.BlobTxTimeout,
-			ModelIDToName:   modelIDToName,
-			ChainID:         big.NewInt(cfg.ChainID),
-			JobRegistryAddr: cfg.JobRegistryAddress,
+			AckTxTimeout:        cfg.AckTxTimeout,
+			BlobTxTimeout:       cfg.BlobTxTimeout,
+			RedisPublishTimeout: cfg.RedisPublishTimeout,
+			ModelIDToName:       modelIDToName,
+			ChainID:             big.NewInt(cfg.ChainID),
+			JobRegistryAddr:     cfg.JobRegistryAddress,
 		},
 		checkpoints,
 	)
