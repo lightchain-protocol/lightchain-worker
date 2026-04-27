@@ -328,13 +328,13 @@ func (s *BlobTxSubmitter) SubmitBlobTx(ctx context.Context, data []byte) ([][32]
 		if s.logger != nil {
 			s.logger.Warn("blob tx WaitMined failed, resetting nonce for retry",
 				"stage", "submit_blob",
-				"txHash", signedTx.Hash().Hex(),
+				"txHash", txHash.Hex(),
 				"nonce", nonce,
 				"waitMs", time.Since(waitStart).Milliseconds(),
 				"error", err,
 			)
 		}
-		return nil, fmt.Errorf("wait for blob tx %s: %w", signedTx.Hash().Hex(), err)
+		return nil, fmt.Errorf("wait for blob tx %s: %w", txHash.Hex(), err)
 	}
 	if receipt.Status != types.ReceiptStatusSuccessful {
 		return nil, fmt.Errorf("blob tx reverted (status 0, tx %s)", receipt.TxHash.Hex())
