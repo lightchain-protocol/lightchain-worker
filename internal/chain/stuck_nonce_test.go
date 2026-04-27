@@ -15,7 +15,7 @@ func TestStuckNonceTracker_SameNonceIncrements(t *testing.T) {
 	assert.Equal(t, 1, tr.Record(152))
 	assert.Equal(t, 2, tr.Record(152))
 	assert.Equal(t, 3, tr.Record(152))
-	assert.Equal(t, 3, tr.ConsecutiveHits())
+	assert.Equal(t, 3, tr.MaxConsecutiveHits())
 	assert.Equal(t, 3, tr.HitsAt(152))
 
 	n, ok := tr.LastNonce()
@@ -41,8 +41,8 @@ func TestStuckNonceTracker_DifferentNoncesAccumulateIndependently(t *testing.T) 
 	assert.Equal(t, 3, tr.HitsAt(152),
 		"records at 153 must not clobber hits at 152")
 	assert.Equal(t, 2, tr.HitsAt(153))
-	assert.Equal(t, 3, tr.ConsecutiveHits(),
-		"ConsecutiveHits returns the max across tracked nonces")
+	assert.Equal(t, 3, tr.MaxConsecutiveHits(),
+		"MaxConsecutiveHits returns the max across tracked nonces")
 }
 
 func TestStuckNonceTracker_BumpCounterResetsOnNonceChange(t *testing.T) {
@@ -82,7 +82,7 @@ func TestStuckNonceTracker_Clear(t *testing.T) {
 
 	tr.Clear()
 
-	assert.Equal(t, 0, tr.ConsecutiveHits())
+	assert.Equal(t, 0, tr.MaxConsecutiveHits())
 	assert.Equal(t, 0, tr.BumpAttemptsUsed())
 	assert.Equal(t, 0, tr.Size())
 	_, ok := tr.LastNonce()

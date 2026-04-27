@@ -210,7 +210,7 @@ func TestSubmitPreparedTx_RecordsStuckNonceHitWithoutReplacement(t *testing.T) {
 		assert.Contains(t, err.Error(), "address already reserved")
 	}
 
-	assert.Equal(t, 3, tracker.ConsecutiveHits(),
+	assert.Equal(t, 3, tracker.MaxConsecutiveHits(),
 		"three consecutive reservation rejections must accumulate in the shared tracker")
 	assert.Equal(t, 0, tracker.BumpAttemptsUsed(),
 		"non-blob path must not attempt any replacement bumps")

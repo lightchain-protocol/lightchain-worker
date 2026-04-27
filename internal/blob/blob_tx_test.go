@@ -356,7 +356,7 @@ func TestBlobTxSubmitter_DetectsStuckNonce_BelowThreshold(t *testing.T) {
 		assert.Contains(t, err.Error(), "address already reserved")
 	}
 
-	assert.Equal(t, 4, tracker.ConsecutiveHits(),
+	assert.Equal(t, 4, tracker.MaxConsecutiveHits(),
 		"4 consecutive rejections at same nonce must produce 4 tracker hits")
 	n, ok := tracker.LastNonce()
 	assert.True(t, ok)
@@ -528,7 +528,7 @@ func TestBlobTxSubmitter_ReplacementHonorsAutoReplaceDisabled(t *testing.T) {
 		"AutoReplace=false must suppress all replacement broadcasts")
 	assert.Equal(t, 0, tracker.BumpAttemptsUsed(),
 		"AutoReplace=false must not call IncrementBumpAttempts either")
-	assert.Equal(t, 3, tracker.ConsecutiveHits(),
+	assert.Equal(t, 3, tracker.MaxConsecutiveHits(),
 		"detection still happens — the tracker counts regardless of auto-replace")
 }
 
@@ -543,7 +543,7 @@ func TestBlobTxSubmitter_ClearsOnSuccessfulMine(t *testing.T) {
 	tracker.Record(151)
 	tracker.Record(151)
 	tracker.Record(151)
-	require.Equal(t, 3, tracker.ConsecutiveHits())
+	require.Equal(t, 3, tracker.MaxConsecutiveHits())
 
 	submitter := &BlobTxSubmitter{
 		txBackend:  mockBlobTxBackend{gasTipCap: big.NewInt(1)},
@@ -561,7 +561,7 @@ func TestBlobTxSubmitter_ClearsOnSuccessfulMine(t *testing.T) {
 	_, err := submitter.SubmitBlobTx(context.Background(), []byte("ciphertext"))
 	require.NoError(t, err)
 
-	assert.Equal(t, 0, tracker.ConsecutiveHits(),
+	assert.Equal(t, 0, tracker.MaxConsecutiveHits(),
 		"successful mine must clear the tracker")
 	_, ok := tracker.LastNonce()
 	assert.False(t, ok,

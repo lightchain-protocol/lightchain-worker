@@ -90,17 +90,14 @@ func (t *StuckNonceTracker) Record(n uint64) int {
 	return entry.hits
 }
 
-// ConsecutiveHits returns the hit count at nonce n, or 0 if n has never
-// been recorded. Preserved name for backward compat with the previous
-// "single-slot" API (callers that only care about the most recent nonce
-// can still use `Record`'s return value; ConsecutiveHits is kept for
-// introspection and tests).
-func (t *StuckNonceTracker) ConsecutiveHits() int {
+// MaxConsecutiveHits returns the largest hit count across all currently
+// tracked nonces — i.e. "how stuck is the most-stuck nonce right now".
+// Returns 0 when nothing has been recorded. Callers that need the count
+// for a specific nonce should use HitsAt(n) instead.
+func (t *StuckNonceTracker) MaxConsecutiveHits() int {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 
-	// Return the max across entries — gives callers "how stuck is the
-	// most-stuck nonce right now". Preserves existing test expectations.
 	var maxHits int
 	for _, e := range t.entries {
 		if e.hits > maxHits {
