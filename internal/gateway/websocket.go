@@ -32,10 +32,12 @@ type wsOutgoing struct {
 	Type  string `json:"type"`
 	JobID uint64 `json:"jobId,omitempty"`
 	Slots int    `json:"slots,omitempty"`
+	Error string `json:"error,omitempty"`
 }
 
 // JobHandler is called for each job received via WebSocket.
-type JobHandler func(ctx context.Context, job pipeline.JobPayload)
+// A non-nil error signals the gateway that the job failed and should be retried.
+type JobHandler func(ctx context.Context, job pipeline.JobPayload) error
 
 // StreamJobs connects to the worker-gateway via WebSocket and receives jobs.
 // It handles reconnection with exponential backoff. Jobs are dispatched to
@@ -154,9 +156,13 @@ func (c *Client) streamOnce(ctx context.Context, maxConcurrentJobs int, handler 
 		wg.Add(1)
 		go func(jobID uint64) {
 			defer wg.Done()
-			handler(ctx, job)
+			handlerErr := handler(ctx, job)
 
-			doneMsg, _ := json.Marshal(wsOutgoing{Type: wsTypeDone, JobID: jobID})
+			done := wsOutgoing{Type: wsTypeDone, JobID: jobID}
+			if handlerErr != nil {
+				done.Error = handlerErr.Error()
+			}
+			doneMsg, _ := json.Marshal(done)
 			if writeErr := conn.Write(ctx, websocket.MessageText, doneMsg); writeErr != nil {
 				c.logger.Warn("send done failed", "jobId", jobID, "error", writeErr)
 			}

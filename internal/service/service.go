@@ -527,10 +527,12 @@ func (s *Service) runGatewayMode(ctx context.Context, cancel context.CancelFunc)
 	}()
 
 	// Job stream via WebSocket (BRPOP-backed, instant delivery)
-	go s.gwClient.StreamJobs(ctx, s.cfg.MaxConcurrentJobs, func(jobCtx context.Context, job pipeline.JobPayload) {
+	go s.gwClient.StreamJobs(ctx, s.cfg.MaxConcurrentJobs, func(jobCtx context.Context, job pipeline.JobPayload) error {
 		if err := s.gwHandler.HandleJobPayload(jobCtx, job); err != nil {
 			s.logger.Error("gateway job processing failed", "jobID", job.JobID, "error", err)
+			return err
 		}
+		return nil
 	})
 
 	<-ctx.Done()
