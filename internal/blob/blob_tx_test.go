@@ -426,6 +426,34 @@ func TestBlobTxSubmitter_TriggersReplacementAtThreshold(t *testing.T) {
 		"exactly one bump attempt must be recorded after first threshold trigger")
 }
 
+// TestBlobTxSubmitter_RejectsBumpNumberAboveSafetyCeiling asserts that
+// submitReplacementBlobTx refuses to broadcast when the requested bump
+// exponent exceeds the in-function safety ceiling. The caller already gates
+// on stuckCfg.MaxBumps, but a misconfigured MaxBumps must not be allowed
+// to drive 2^N fee inflation past the documented cap.
+func TestBlobTxSubmitter_RejectsBumpNumberAboveSafetyCeiling(t *testing.T) {
+	t.Parallel()
+
+	var sendCalls atomic.Int32
+	backend := &capturingBlobTxBackend{
+		gasTipCap: big.NewInt(100),
+		onSend:    func(*types.Transaction) { sendCalls.Add(1) },
+	}
+	submitter := &BlobTxSubmitter{
+		txBackend:   backend,
+		signingKey:  testSigningKey(t),
+		chainID:     big.NewInt(1),
+		nonceMgr:    &mockNonceManager{next: 152},
+		maxGasPrice: big.NewInt(1_000_000_000),
+	}
+
+	err := submitter.submitReplacementBlobTx(context.Background(), backend, nil, 152, maxAllowedBumpNumber+1)
+	require.Error(t, err, "bumpNumber above ceiling must be refused")
+	assert.Contains(t, err.Error(), "exceeds safety ceiling")
+	assert.Equal(t, int32(0), sendCalls.Load(),
+		"refused replacement must not broadcast — fee inflation must stop here")
+}
+
 // TestBlobTxSubmitter_StopsReplacingAfterMaxBumps asserts that once
 // MaxBumps replacements have been attempted, further threshold hits log
 // loudly but do NOT broadcast additional replacements. Protects against

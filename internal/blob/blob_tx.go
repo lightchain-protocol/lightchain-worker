@@ -49,6 +49,13 @@ var replacementBlobPayload = []byte{0x00}
 
 const defaultBlobFeeCapWei = 1_000_000_000
 
+// maxAllowedBumpNumber is a defense-in-depth ceiling on the exponent used in
+// submitReplacementBlobTx's 2^N fee multiplier. The caller already gates on
+// stuckCfg.MaxBumps, but a misconfigured MaxBumps (env-var typo, accidental
+// large value) could otherwise produce absurd fees or, at >=64, overflow the
+// big.Int shift. 2^8 = 256× is well past any sane retry budget.
+const maxAllowedBumpNumber = 8
+
 type blobTxPayload struct {
 	blob          kzg4844.Blob
 	commitment    kzg4844.Commitment
@@ -455,7 +462,8 @@ func (s *BlobTxSubmitter) maybeSubmitReplacementBlobTx(
 // Fee bumps are 2^bumpNumber × the configured baseline. First replacement
 // (bumpNumber=1) is 2× everything, second (bumpNumber=2) is 4×, etc. Cap
 // is enforced by the caller via stuckCfg.MaxBumps — each broadcast
-// attempt here increments the tracker's bump counter.
+// attempt here increments the tracker's bump counter. As a belt-and-braces
+// safeguard, this function also rejects bumpNumber > maxAllowedBumpNumber.
 //
 // Go-ethereum blobpool replacement rules: same sender + same nonce + ALL
 // three fee fields bumped by at least the configured minimum (100% by
@@ -476,6 +484,9 @@ func (s *BlobTxSubmitter) submitReplacementBlobTx(
 ) error {
 	if bumpNumber < 1 {
 		return fmt.Errorf("bumpNumber must be >= 1, got %d", bumpNumber)
+	}
+	if bumpNumber > maxAllowedBumpNumber {
+		return fmt.Errorf("bumpNumber %d exceeds safety ceiling %d", bumpNumber, maxAllowedBumpNumber)
 	}
 	if err := ctx.Err(); err != nil {
 		return fmt.Errorf("replacement context done before build: %w", err)
