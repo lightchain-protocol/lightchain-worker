@@ -421,51 +421,9 @@ func (h *JobHandler) processJob(ctx context.Context, p JobPayload) error {
 	}
 
 	// Stage 8a: Submit blob TX.
-	// Post-audit the contract's completeJob takes a single bytes32
-	// responseBlobHash and enforces `blobhash(0) == responseBlobHash`, so the
-	// blob TX must carry exactly one blob.
-	//
-	// Wrap in BlobTxTimeout so a stuck WaitMined (e.g. dead EL websocket)
-	// cannot hold the broadcast slot indefinitely and starve other jobs.
-	// Matches the AckTxTimeout pattern above.
-	var versionedHash common.Hash
-	if ckpt.HasVersionedHash() {
-		logger.Info("checkpoint hit, skipping stage 8a",
-			"stage", "checkpoint",
-			"reason", "blob_submitted",
-			"versionedHash", ckpt.VersionedHash.Hex(),
-		)
-		versionedHash = ckpt.VersionedHash
-	} else {
-		stageStart = time.Now()
-		logger.Info("stage 8a starting",
-			"stage", "submit_blob",
-			"ciphertextBytes", len(ciphertext),
-			"timeout", h.cfg.BlobTxTimeout.String(),
-		)
-		submitCtx, submitCancel := context.WithTimeout(ctx, h.cfg.BlobTxTimeout)
-		blobHashes, err := h.blobSubmitter.SubmitBlobTx(submitCtx, ciphertext)
-		submitCancel()
-		if err != nil {
-			return fmt.Errorf("stage 8 (submit blob): %w", err)
-		}
-		if len(blobHashes) != 1 {
-			return fmt.Errorf("stage 8 (submit blob): expected exactly 1 blob hash, got %d", len(blobHashes))
-		}
-		versionedHash = common.Hash(blobHashes[0])
-		logger.Info("stage 8a complete",
-			"stage", "submit_blob",
-			"versionedHash", versionedHash.Hex(),
-			"durationMs", time.Since(stageStart).Milliseconds(),
-		)
-		if h.checkpoints != nil {
-			if err := h.checkpoints.SetVersionedHash(ctx, p.JobID, versionedHash); err != nil {
-				logger.Warn("failed to persist versionedHash on checkpoint",
-					"stage", "checkpoint",
-					"error", err,
-				)
-			}
-		}
+	versionedHash, err := h.ensureBlobSubmitted(ctx, logger, p.JobID, ckpt, ciphertext)
+	if err != nil {
+		return err
 	}
 
 	// Stage 8b: Complete job on-chain.
@@ -667,6 +625,62 @@ func (h *JobHandler) ensureAcknowledged(ctx context.Context, logger *slog.Logger
 	}
 
 	return nil
+}
+
+// ensureBlobSubmitted is the stage-8a equivalent of ensureAcknowledged: it
+// returns the cached versioned hash from the checkpoint when stage 8a has
+// already run on a prior attempt, or it submits the blob tx (with the
+// per-stage BlobTxTimeout that prevents a stuck WaitMined from holding the
+// broadcast slot indefinitely) and persists the resulting hash. Post-audit
+// the contract's completeJob takes a single bytes32 responseBlobHash and
+// enforces blobhash(0) == responseBlobHash, so the blob tx must carry
+// exactly one blob — that invariant is checked here.
+func (h *JobHandler) ensureBlobSubmitted(
+	ctx context.Context,
+	logger *slog.Logger,
+	jobID uint64,
+	ckpt JobCheckpoint,
+	ciphertext []byte,
+) (common.Hash, error) {
+	if ckpt.HasVersionedHash() {
+		logger.Info("checkpoint hit, skipping stage 8a",
+			"stage", "checkpoint",
+			"reason", "blob_submitted",
+			"versionedHash", ckpt.VersionedHash.Hex(),
+		)
+		return ckpt.VersionedHash, nil
+	}
+
+	stageStart := time.Now()
+	logger.Info("stage 8a starting",
+		"stage", "submit_blob",
+		"ciphertextBytes", len(ciphertext),
+		"timeout", h.cfg.BlobTxTimeout.String(),
+	)
+	submitCtx, submitCancel := context.WithTimeout(ctx, h.cfg.BlobTxTimeout)
+	blobHashes, err := h.blobSubmitter.SubmitBlobTx(submitCtx, ciphertext)
+	submitCancel()
+	if err != nil {
+		return common.Hash{}, fmt.Errorf("stage 8 (submit blob): %w", err)
+	}
+	if len(blobHashes) != 1 {
+		return common.Hash{}, fmt.Errorf("stage 8 (submit blob): expected exactly 1 blob hash, got %d", len(blobHashes))
+	}
+	versionedHash := common.Hash(blobHashes[0])
+	logger.Info("stage 8a complete",
+		"stage", "submit_blob",
+		"versionedHash", versionedHash.Hex(),
+		"durationMs", time.Since(stageStart).Milliseconds(),
+	)
+	if h.checkpoints != nil {
+		if err := h.checkpoints.SetVersionedHash(ctx, jobID, versionedHash); err != nil {
+			logger.Warn("failed to persist versionedHash on checkpoint",
+				"stage", "checkpoint",
+				"error", err,
+			)
+		}
+	}
+	return versionedHash, nil
 }
 
 func (h *JobHandler) completeJob(
