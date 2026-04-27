@@ -10,6 +10,8 @@ import (
 
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/crypto"
+
+	"github.com/lightchain/worker/internal/metrics"
 )
 
 // Config holds all worker sidecar configuration parsed from environment variables.
@@ -102,6 +104,18 @@ type Config struct {
 	// Gateway mode (optional — when set, worker uses HTTP gateway instead of direct Redis)
 	WorkerGatewayURL string
 
+	// Metrics — Prometheus /metrics HTTP endpoint.
+	//
+	// MetricsListenAddr defaults to 127.0.0.1:9101 (loopback-only, scraped
+	// by the same-host Ops Agent). Set to empty to disable the endpoint.
+	//
+	// MetricsAllowPublic is a deliberate escape hatch: when false (default)
+	// Validate rejects any non-loopback host to prevent accidentally
+	// exposing /metrics on 0.0.0.0. Set true only when fronted by an
+	// authenticated reverse proxy or scraped from outside the host.
+	MetricsListenAddr  string
+	MetricsAllowPublic bool
+
 	// Logging
 	LogLevel  string
 	LogFormat string
@@ -121,6 +135,7 @@ func Load() (*Config, error) {
 		BeaconAPIURL:           envOrDefault("BEACON_API_URL", "http://localhost:3500"),
 		SessionKeyFile:         envOrDefault("SESSION_KEY_FILE", "data/session-keys.enc"),
 		WorkerGatewayURL:       os.Getenv("WORKER_GATEWAY_URL"),
+		MetricsListenAddr:      envOrDefault("WORKER_METRICS_ADDR", "127.0.0.1:9101"),
 		LogLevel:               envOrDefault("LOG_LEVEL", "info"),
 		LogFormat:              envOrDefault("LOG_FORMAT", "json"),
 	}
@@ -225,6 +240,7 @@ func Load() (*Config, error) {
 	cfg.StuckNonceThreshold = parseInt("WORKER_STUCK_NONCE_THRESHOLD", 5, &errs)
 	cfg.StuckNonceMaxBumps = parseInt("WORKER_STUCK_NONCE_MAX_BUMPS", 3, &errs)
 	cfg.StuckNonceAutoReplace = parseBool("WORKER_STUCK_NONCE_AUTOREPLACE", true, &errs)
+	cfg.MetricsAllowPublic = parseBool("WORKER_METRICS_ALLOW_PUBLIC", false, &errs)
 
 	// Job checkpoint (retry-safety cache)
 	cfg.CheckpointTTL = parseDuration("WORKER_CHECKPOINT_TTL", "2h", &errs)
@@ -305,6 +321,9 @@ func (c *Config) Validate() []string {
 	}
 	if c.StuckNonceMaxBumps <= 0 {
 		errs = append(errs, "WORKER_STUCK_NONCE_MAX_BUMPS must be positive")
+	}
+	if err := metrics.ValidateListenAddr(c.MetricsListenAddr, c.MetricsAllowPublic); err != nil {
+		errs = append(errs, fmt.Sprintf("WORKER_METRICS_ADDR: %v", err))
 	}
 
 	return errs

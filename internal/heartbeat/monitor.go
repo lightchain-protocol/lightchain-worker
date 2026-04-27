@@ -16,6 +16,8 @@ import (
 	"github.com/redis/go-redis/v9"
 
 	pkgtypes "github.com/lightchain/pkg/types"
+
+	"github.com/lightchain/worker/internal/metrics"
 )
 
 const (
@@ -55,6 +57,10 @@ type Monitor struct {
 	logger      *slog.Logger
 	jobCounter  *atomic.Int32
 	maxJobs     int
+	// metrics is optional — when nil the monitor still writes to Redis but
+	// does not update OllamaUp / HeartbeatLastEmit. Production constructs
+	// always pass non-nil; some tests pass nil to keep them focused.
+	metrics *metrics.Metrics
 
 	done     chan struct{}
 	wg       sync.WaitGroup
@@ -65,6 +71,8 @@ type Monitor struct {
 // without the 0x prefix (used directly as the Redis key suffix).
 // modelIDs must be 0x-prefixed lowercase hex bytes32 strings for JSON serialization.
 // jobCounter is shared with the pipeline handler; maxJobs comes from config.
+// metricsCollector may be nil (tests); when non-nil, OllamaUp and
+// HeartbeatLastEmit gauges are updated on each emit.
 func NewMonitor(
 	redisClient *redis.Client,
 	cfg MonitorConfig,
@@ -73,6 +81,7 @@ func NewMonitor(
 	jobCounter *atomic.Int32,
 	maxJobs int,
 	logger *slog.Logger,
+	metricsCollector *metrics.Metrics,
 ) *Monitor {
 	return &Monitor{
 		redisClient: redisClient,
@@ -84,6 +93,7 @@ func NewMonitor(
 		logger:      logger,
 		jobCounter:  jobCounter,
 		maxJobs:     maxJobs,
+		metrics:     metricsCollector,
 		done:        make(chan struct{}),
 	}
 }
@@ -171,6 +181,18 @@ func (m *Monitor) emit(ctx context.Context) error {
 
 	if _, err := pipe.Exec(ctx); err != nil {
 		return fmt.Errorf("write heartbeat %s: %w", key, err)
+	}
+
+	// Mirror the heartbeat outcome into Prometheus gauges so dashboards can
+	// display fleet-wide Ollama health and per-worker heartbeat freshness
+	// without scraping the Redis HSET keys directly.
+	if m.metrics != nil {
+		if ollamaStatus == OllamaStatusReady {
+			m.metrics.OllamaUp.Set(1)
+		} else {
+			m.metrics.OllamaUp.Set(0)
+		}
+		m.metrics.HeartbeatLastEmit.SetToCurrentTime()
 	}
 	return nil
 }

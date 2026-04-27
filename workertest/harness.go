@@ -28,6 +28,7 @@ import (
 	pkgtypes "github.com/lightchain/pkg/types"
 	workerchain "github.com/lightchain/worker/internal/chain"
 	"github.com/lightchain/worker/internal/keystore"
+	"github.com/lightchain/worker/internal/metrics"
 	"github.com/lightchain/worker/internal/ollama"
 	"github.com/lightchain/worker/internal/pipeline"
 )
@@ -192,6 +193,12 @@ func New(t testing.TB, opts Options) *Harness {
 			JobRegistryAddr:     opts.JobRegistryAddr,
 		},
 		checkpoints,
+		// Each harness instance gets its own metrics registry — keeps
+		// integration tests isolated from each other and from any global
+		// state. Allowlist drawn from the test's configured ModelIDToName
+		// values so NormalizeModel returns the actual tag, not "unknown".
+		metrics.New(modelTagsFromMap(opts.ModelIDToName)),
+		metrics.DeliveryAsynq,
 	)
 
 	redisConnOpt := asynq.RedisClientOpt{
@@ -283,6 +290,20 @@ func (h *Harness) RunAllRetryTasks() (int, error) {
 }
 
 // WorkerAddress returns the worker's signing address.
+// modelTagsFromMap returns the unique set of Ollama tag values from a
+// modelID-to-tag mapping. Used to seed metrics.NormalizeModel's allowlist.
+func modelTagsFromMap(m map[string]string) []string {
+	seen := make(map[string]struct{}, len(m))
+	for _, tag := range m {
+		seen[tag] = struct{}{}
+	}
+	out := make([]string, 0, len(seen))
+	for tag := range seen {
+		out = append(out, tag)
+	}
+	return out
+}
+
 func (h *Harness) WorkerAddress() common.Address {
 	return h.workerAddress
 }

@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"log/slog"
 	"math/big"
+	"net/http"
 	"os"
 	"os/signal"
 	"strings"
@@ -28,6 +29,7 @@ import (
 	gw "github.com/lightchain/worker/internal/gateway"
 	"github.com/lightchain/worker/internal/heartbeat"
 	"github.com/lightchain/worker/internal/keystore"
+	"github.com/lightchain/worker/internal/metrics"
 	"github.com/lightchain/worker/internal/ollama"
 	"github.com/lightchain/worker/internal/pipeline"
 	"github.com/lightchain/worker/internal/registration"
@@ -49,6 +51,11 @@ type Service struct {
 	sessionKeyStore *keystore.SessionKeyStore
 	jobCounter      *atomic.Int32
 	logger          *slog.Logger
+
+	// metrics owns the Prometheus registry; metricsServer is the HTTP server
+	// exposing /metrics. Server is non-nil iff cfg.MetricsListenAddr != "".
+	metrics       *metrics.Metrics
+	metricsServer *http.Server
 
 	// Gateway mode (non-nil when WORKER_GATEWAY_URL is set)
 	gwClient  *gw.Client
@@ -237,6 +244,28 @@ func New(cfg *config.Config) (*Service, error) {
 	// Shared job counter between pipeline handler and heartbeat monitor
 	jobCounter := &atomic.Int32{}
 
+	// Prometheus metrics. Owns its own registry — no global pollution.
+	// MaxJobs is set immediately because it's a config-derived constant;
+	// Bind wires GaugeFunc/CounterFunc collectors to the live atomics on
+	// jobCounter, coordinator, and stuckTracker so each scrape reflects
+	// current state without any background goroutine.
+	metricsCollector := metrics.New(cfg.SupportedModels)
+	metricsCollector.MaxJobs.Set(float64(cfg.MaxConcurrentJobs))
+	if err := metricsCollector.Bind(
+		jobCounter,
+		func() int { return coordinator.Inflight(chain.ClassBlob) },
+		func() int { return coordinator.Inflight(chain.ClassLegacy) },
+		coordinator.OrphanCount,
+		stuckTracker.Size,
+		stuckTracker.MaxConsecutiveHits,
+	); err != nil {
+		// Bind only fails on duplicate-call; can't happen here unless someone
+		// shares the *Metrics across two service.New invocations, which is
+		// itself a bug. Surface loudly.
+		chainClient.Close()
+		return nil, fmt.Errorf("metrics.Bind: %w", err)
+	}
+
 	// Retry-safety checkpoint store. Backed by the same Redis client so
 	// cache records ride the same connection pool as heartbeat and
 	// response pub/sub. Tombstone TTL is fixed at 10 minutes — long enough
@@ -275,6 +304,8 @@ func New(cfg *config.Config) (*Service, error) {
 			JobRegistryAddr:     cfg.JobRegistryAddress,
 		},
 		checkpoints,
+		metricsCollector,
+		metrics.DeliveryAsynq,
 	)
 
 	// --- Gateway mode: skip Asynq and direct Redis heartbeat ---
@@ -291,8 +322,13 @@ func New(cfg *config.Config) (*Service, error) {
 			return nil, fmt.Errorf("authenticate with worker-gateway: %w", err)
 		}
 
-		// Create handler with a gateway-based response publisher
-		gwPublisher := &gatewayResponsePublisher{client: gwClient, logger: logger}
+		// Create handler with a gateway-based response publisher.
+		// RedisPublishTimeout is intentionally omitted from HandlerConfig: gateway
+		// mode publishes via gwPublisher (HTTP), which has its own timeout via
+		// gwClient.httpClient. checkpoints is shared with the direct-mode handler
+		// (would be, if both ran together) — the store is jobID-keyed and stateless,
+		// so the cache benefits any redelivered job regardless of delivery channel.
+		gwPublisher := &gatewayResponsePublisher{client: gwClient, logger: logger, metrics: metricsCollector}
 		gwHandler := pipeline.NewJobHandler(
 			chainClient,
 			blobFetcher,
@@ -312,6 +348,9 @@ func New(cfg *config.Config) (*Service, error) {
 				JobRegistryAddr: cfg.JobRegistryAddress,
 			},
 			gwPublisher,
+			checkpoints,
+			metricsCollector,
+			metrics.DeliveryGateway,
 		)
 
 		logger.Info("worker service initialized (gateway mode)",
@@ -344,6 +383,8 @@ func New(cfg *config.Config) (*Service, error) {
 			sessionKeyStore: sessionKeyStore,
 			jobCounter:      jobCounter,
 			logger:          logger,
+			metrics:         metricsCollector,
+			metricsServer:   buildMetricsServer(cfg, metricsCollector),
 			gwClient:        gwClient,
 			gwHandler:       gwHandler,
 		}, nil
@@ -371,7 +412,7 @@ func New(cfg *config.Config) (*Service, error) {
 		OllamaURL: cfg.OllamaURL,
 	}
 	addrHex := checksumHexNoPrefix(workerAddr)
-	monitor := heartbeat.NewMonitor(redisClient, monitorCfg, addrHex, modelHexStrings, jobCounter, cfg.MaxConcurrentJobs, logger)
+	monitor := heartbeat.NewMonitor(redisClient, monitorCfg, addrHex, modelHexStrings, jobCounter, cfg.MaxConcurrentJobs, logger, metricsCollector)
 
 	// Gate startup on a real heartbeat write
 	startCtx, startCancel := context.WithTimeout(context.Background(), startupHeartbeatTimeout)
@@ -424,13 +465,47 @@ func New(cfg *config.Config) (*Service, error) {
 		sessionKeyStore: sessionKeyStore,
 		jobCounter:      jobCounter,
 		logger:          logger,
+		metrics:         metricsCollector,
+		metricsServer:   buildMetricsServer(cfg, metricsCollector),
 	}, nil
+}
+
+// buildMetricsServer returns the configured Prometheus HTTP server, or nil
+// if metrics are disabled via empty MetricsListenAddr. Constructed here
+// rather than inline in New() so both the direct and gateway paths share
+// the same configuration logic.
+func buildMetricsServer(cfg *config.Config, m *metrics.Metrics) *http.Server {
+	if cfg.MetricsListenAddr == "" {
+		return nil
+	}
+	return m.Server(cfg.MetricsListenAddr)
+}
+
+// startMetricsServer launches the Prometheus /metrics HTTP listener in a
+// background goroutine. No-op when metricsServer is nil (cfg disabled the
+// endpoint). Errors are logged but never returned — the main lifecycle
+// must continue serving jobs even if observability fails.
+func (s *Service) startMetricsServer() {
+	if s.metricsServer == nil {
+		s.logger.Info("metrics endpoint disabled (WORKER_METRICS_ADDR is empty)")
+		return
+	}
+	s.logger.Info("starting metrics endpoint", "addr", s.metricsServer.Addr)
+	go func() {
+		if err := s.metricsServer.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			s.logger.Error("metrics endpoint failed (job processing continues)",
+				"addr", s.metricsServer.Addr,
+				"error", err,
+			)
+		}
+	}()
 }
 
 // gatewayResponsePublisher publishes responses via the worker-gateway HTTP API.
 type gatewayResponsePublisher struct {
-	client *gw.Client
-	logger *slog.Logger
+	client  *gw.Client
+	logger  *slog.Logger
+	metrics *metrics.Metrics
 }
 
 func (p *gatewayResponsePublisher) PublishResponse(
@@ -442,6 +517,9 @@ func (p *gatewayResponsePublisher) PublishResponse(
 ) {
 	if err := p.client.PublishResponse(ctx, jobID, sessionID, correlationID, signature, ciphertext); err != nil {
 		p.logger.Warn("gateway response publish failed (non-fatal)", "jobID", jobID, "error", err)
+		if p.metrics != nil {
+			p.metrics.RedisPublishFailures.Inc()
+		}
 	}
 }
 
@@ -453,6 +531,12 @@ func (s *Service) Run(ctx context.Context) error {
 
 	sigCtx, stop := signal.NotifyContext(runCtx, syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
+
+	// Metrics endpoint runs in both modes. Non-fatal: a bind failure or
+	// transient ListenAndServe error logs loudly but does not stop job
+	// processing — observability outages must not cascade into job
+	// outages. Shutdown is handled in s.shutdown() via srv.Shutdown(ctx).
+	s.startMetricsServer()
 
 	// Gateway mode: poll loop + gateway heartbeat
 	if s.gwClient != nil {
@@ -548,6 +632,15 @@ func (s *Service) runGatewayMode(ctx context.Context, cancel context.CancelFunc)
 // shutdown coordinates all cleanup steps within the given context deadline.
 func (s *Service) shutdown(ctx context.Context) error {
 	var shutdownErr error
+
+	// Stop the metrics endpoint first — its handlers don't hold locks on
+	// anything else we need to drain, and stopping it early prevents new
+	// scrapes during teardown that might observe inconsistent state.
+	if s.metricsServer != nil {
+		if err := s.metricsServer.Shutdown(ctx); err != nil {
+			s.logger.Warn("metrics server shutdown error (non-fatal)", "error", err)
+		}
+	}
 
 	// Stop Asynq server — waits for in-flight jobs (nil in gateway mode)
 	if s.asynqServer != nil {

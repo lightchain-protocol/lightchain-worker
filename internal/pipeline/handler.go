@@ -23,6 +23,7 @@ import (
 	pkgcrypto "github.com/lightchain/pkg/crypto"
 	pkgtypes "github.com/lightchain/pkg/types"
 
+	"github.com/lightchain/worker/internal/metrics"
 	"github.com/lightchain/worker/internal/ollama"
 )
 
@@ -86,18 +87,26 @@ type ResponsePublisher interface {
 
 // JobHandler processes inference jobs received from Asynq.
 type JobHandler struct {
-	chainClient   JobExecutionClient
-	blobFetcher   BlobFetcher
-	blobSubmitter BlobSubmitter
-	keyStore      SessionKeyGetter
-	ollamaClient  InferenceClient
-	redisClient   *redis.Client
-	signingKey    *ecdsa.PrivateKey
-	ecdhKey       *ecdh.PrivateKey
-	jobCounter    *atomic.Int32
-	logger        *slog.Logger
-	cfg           HandlerConfig
-	modelIDToName map[string]string
+	chainClient       JobExecutionClient
+	blobFetcher       BlobFetcher
+	blobSubmitter     BlobSubmitter
+	keyStore          SessionKeyGetter
+	ollamaClient      InferenceClient
+	redisClient       *redis.Client
+	responsePublisher ResponsePublisher
+	signingKey        *ecdsa.PrivateKey
+	ecdhKey           *ecdh.PrivateKey
+	jobCounter        *atomic.Int32
+	logger            *slog.Logger
+	cfg               HandlerConfig
+	modelIDToName     map[string]string
+	// metrics is the per-process Prometheus surface. Always non-nil — service.New
+	// constructs one and threads it through. Tests construct their own via
+	// metrics.New(testModels) for isolation.
+	metrics *metrics.Metrics
+	// delivery labels every metric emission so the asynq vs gateway paths
+	// are distinguishable in dashboards. Set once at construction.
+	delivery string
 	// checkpoints is optional. When nil, the handler runs without retry
 	// caching — equivalent to pre-PR-2 behavior. Production wires a
 	// Redis-backed store here; tests that exercise the cache path do the
@@ -105,9 +114,13 @@ type JobHandler struct {
 	checkpoints *CheckpointStore
 }
 
-// NewJobHandler creates a handler wired with all dependencies. checkpoints
-// may be nil — when nil, the handler skips the retry-safety cache (stages
-// 2-6 re-run on every asynq retry, same as pre-checkpoint behavior).
+// NewJobHandler creates a handler wired with all dependencies. publisher
+// may be nil — when nil and redisClient is non-nil, a RedisResponsePublisher
+// is auto-built. checkpoints may be nil — when nil, the handler skips the
+// retry-safety cache (stages 2-6 re-run on every retry).
+//
+// metricsCollector must be non-nil; service.New constructs it. delivery
+// must be one of metrics.DeliveryAsynq or metrics.DeliveryGateway.
 func NewJobHandler(
 	chainClient JobExecutionClient,
 	blobFetcher BlobFetcher,
@@ -121,26 +134,21 @@ func NewJobHandler(
 	logger *slog.Logger,
 	cfg HandlerConfig,
 	checkpoints *CheckpointStore,
+	metricsCollector *metrics.Metrics,
+	delivery string,
 ) *JobHandler {
 	modelIDToName := make(map[string]string, len(cfg.ModelIDToName))
 	for k, v := range cfg.ModelIDToName {
 		modelIDToName[normalizeModelLookupKey(k)] = v
 	}
 
-	return &JobHandler{
-		chainClient:   chainClient,
-		blobFetcher:   blobFetcher,
-		blobSubmitter: blobSubmitter,
-		keyStore:      keyStore,
-		ollamaClient:  ollamaClient,
-		redisClient:   redisClient,
-		signingKey:    signingKey,
-		ecdhKey:       ecdhKey,
-		jobCounter:    jobCounter,
-		logger:        logger,
-		cfg:           cfg,
-		modelIDToName: modelIDToName,
-		checkpoints:   checkpoints,
+	if publisher == nil && redisClient != nil {
+		publisher = &RedisResponsePublisher{
+			client:         redisClient,
+			logger:         logger,
+			publishTimeout: cfg.RedisPublishTimeout,
+			metrics:        metricsCollector,
+		}
 	}
 
 	return &JobHandler{
@@ -157,16 +165,40 @@ func NewJobHandler(
 		logger:            logger,
 		cfg:               cfg,
 		modelIDToName:     modelIDToName,
+		metrics:           metricsCollector,
+		delivery:          delivery,
+		checkpoints:       checkpoints,
 	}
+}
+
+// modelLabel returns the bounded {model} label value for a JobPayload's
+// ModelID. Two-step normalization: resolve to ollama tag first (so labels
+// match what the worker actually invokes), then run through the metrics
+// allowlist so unknown inputs collapse to ModelUnknown rather than blow
+// up label cardinality.
+func (h *JobHandler) modelLabel(modelID string) string {
+	name, err := h.resolveModelName(modelID)
+	if err != nil {
+		return metrics.ModelUnknown
+	}
+	return h.metrics.NormalizeModel(name)
 }
 
 // RedisResponsePublisher publishes responses directly to Redis pub/sub.
 type RedisResponsePublisher struct {
-	client *redis.Client
-	logger *slog.Logger
+	client         *redis.Client
+	logger         *slog.Logger
+	publishTimeout time.Duration
+	// metrics may be nil only in tests that exercise the publisher directly
+	// without going through NewJobHandler. Production constructs always
+	// pass a non-nil collector.
+	metrics *metrics.Metrics
 }
 
-// PublishResponse signs and publishes the response to the session's Redis channel.
+// PublishResponse builds the PubSubMessage and PUBLISHes it to the session's
+// Redis channel. Errors are logged but non-fatal — the on-chain blob is the
+// authoritative response. Failure counters are incremented when present so
+// dashboards can track publish health independently of the on-chain path.
 func (p *RedisResponsePublisher) PublishResponse(
 	ctx context.Context,
 	jobID, sessionID uint64,
@@ -189,12 +221,18 @@ func (p *RedisResponsePublisher) PublishResponse(
 	data, err := json.Marshal(resp)
 	if err != nil {
 		p.logger.Warn("failed to marshal response for Redis", "jobID", jobID, "error", err)
+		if p.metrics != nil {
+			p.metrics.RedisPublishFailures.Inc()
+		}
 		return
 	}
 
 	channel := fmt.Sprintf("session:%d:responses", sessionID)
 	if err := p.client.Publish(ctx, channel, data).Err(); err != nil {
 		p.logger.Warn("failed to publish response to Redis", "jobID", jobID, "channel", channel, "error", err)
+		if p.metrics != nil {
+			p.metrics.RedisPublishFailures.Inc()
+		}
 	}
 }
 
@@ -300,26 +338,62 @@ func (h *JobHandler) HandleTask(ctx context.Context, task *asynq.Task) error {
 
 // processJob executes the 8-stage inference pipeline.
 //
+// Metrics: each stage observes worker_pipeline_stage_duration_seconds with
+// {stage, model, cache, delivery, outcome} labels. End-to-end timing lands
+// on worker_job_total_duration_seconds via the deferred observer below.
+// The {cache} label on the job-total histogram is "hit" only if the
+// checkpoint short-circuited stages 2-6 (the dominant inference cost).
+//
 // A child logger tagged with job/session/correlation IDs is threaded through
 // every helper so each stage-boundary log line is automatically correlated
 // in Cloud Logging. Every stage emits at minimum a completion log with a
 // stable `stage` attribute and `durationMs` so slow/stuck stages are easy
 // to locate when debugging production traces.
-func (h *JobHandler) processJob(ctx context.Context, p JobPayload) error {
+func (h *JobHandler) processJob(ctx context.Context, p JobPayload) (err error) {
 	logger := h.logger.With(
 		"jobID", p.JobID,
 		"sessionID", p.SessionID,
 		"correlationID", p.CorrelationID,
 	)
 
+	jobStart := time.Now()
+	model := h.modelLabel(p.ModelID)
+	delivery := h.delivery
+	// cacheState reflects whether the dominant inference path was skipped.
+	// Promoted to "hit" below if ckpt.HasCiphertext returns true.
+	cacheState := metrics.CacheMiss
+
+	defer func() {
+		if r := recover(); r != nil {
+			h.metrics.JobsTotal.WithLabelValues(
+				metrics.OutcomePanic, metrics.ReasonPanic, model, delivery,
+			).Inc()
+			h.metrics.JobTotalDuration.WithLabelValues(
+				cacheState, delivery, metrics.OutcomePanic,
+			).Observe(time.Since(jobStart).Seconds())
+			// Re-panic so asynq/gateway sees the failure and the stack
+			// trace is preserved — silently swallowing would mask the bug.
+			panic(r)
+		}
+		outcome := metrics.OutcomeFor(err)
+		reason := metrics.ClassifyError(err)
+		h.metrics.JobsTotal.WithLabelValues(outcome, reason, model, delivery).Inc()
+		h.metrics.JobTotalDuration.WithLabelValues(
+			cacheState, delivery, outcome,
+		).Observe(time.Since(jobStart).Seconds())
+	}()
+
 	// Stage 1: ACK — acknowledge job on-chain
-	stageStart := time.Now()
-	if err := h.ensureAcknowledged(ctx, logger, p.JobID); err != nil {
-		return fmt.Errorf("stage 1 (ack): %w", err)
+	rec := h.metrics.StartStage(metrics.StageAck, model, delivery)
+	if ackErr := h.ensureAcknowledged(ctx, logger, p.JobID); ackErr != nil {
+		rec.End(metrics.OutcomeError, metrics.CacheNone)
+		err = fmt.Errorf("stage 1 (ack): %w", ackErr)
+		return err
 	}
+	d := rec.End(metrics.OutcomeOK, metrics.CacheNone)
 	logger.Info("stage 1 complete",
 		"stage", "ack",
-		"durationMs", time.Since(stageStart).Milliseconds(),
+		"durationMs", d.Milliseconds(),
 	)
 
 	// Read checkpoint once after stage 1. The result determines whether
@@ -331,6 +405,8 @@ func (h *JobHandler) processJob(ctx context.Context, p JobPayload) error {
 	var ciphertext []byte
 
 	if ckpt.HasCiphertext() {
+		cacheState = metrics.CacheHit
+		h.metrics.CheckpointEvents.WithLabelValues(metrics.CheckpointEventHitInference).Inc()
 		logger.Info("checkpoint hit, skipping stages 2-6",
 			"stage", "checkpoint",
 			"reason", "inference_cached",
@@ -338,32 +414,39 @@ func (h *JobHandler) processJob(ctx context.Context, p JobPayload) error {
 		)
 		ciphertext = ckpt.Ciphertext
 	} else {
+		h.metrics.CheckpointEvents.WithLabelValues(metrics.CheckpointEventMiss).Inc()
+
 		// Stage 2: Fetch the prompt blob from the consensus layer. Post-audit
 		// each job carries a single bytes32 prompt blob hash.
 		if p.PromptBlobHash == (common.Hash{}) {
-			return fmt.Errorf("stage 2 (fetch blob): prompt blob hash is zero")
+			err = fmt.Errorf("stage 2 (fetch blob): prompt blob hash is zero")
+			return err
 		}
-		stageStart = time.Now()
+		rec = h.metrics.StartStage(metrics.StageFetchBlob, model, delivery)
 		logger.Info("stage 2 starting",
 			"stage", "fetch_blob",
 			"promptBlobHash", p.PromptBlobHash.Hex(),
 			"blockNumber", p.BlockNumber,
 		)
-		blobData, err := h.blobFetcher.FetchBlob(ctx, p.PromptBlobHash, p.BlockNumber)
-		if err != nil {
-			return fmt.Errorf("stage 2 (fetch blob %s): %w", p.PromptBlobHash.Hex(), err)
+		blobData, fetchErr := h.blobFetcher.FetchBlob(ctx, p.PromptBlobHash, p.BlockNumber)
+		if fetchErr != nil {
+			rec.End(metrics.OutcomeError, metrics.CacheMiss)
+			err = fmt.Errorf("stage 2 (fetch blob %s): %w", p.PromptBlobHash.Hex(), fetchErr)
+			return err
 		}
+		d = rec.End(metrics.OutcomeOK, metrics.CacheMiss)
 		logger.Info("stage 2 complete",
 			"stage", "fetch_blob",
 			"blobBytes", len(blobData),
-			"durationMs", time.Since(stageStart).Milliseconds(),
+			"durationMs", d.Milliseconds(),
 		)
 
 		// Stages 3-6 produce ciphertext; they're wrapped in a helper so the
 		// old inlined code keeps its exact stage-boundary logging but the
 		// checkpoint branching stays readable.
-		producedCiphertext, err := h.runInferencePipeline(ctx, logger, p, blobData)
-		if err != nil {
+		producedCiphertext, infErr := h.runInferencePipeline(ctx, logger, p, blobData, model, delivery)
+		if infErr != nil {
+			err = infErr
 			return err
 		}
 		ciphertext = producedCiphertext
@@ -381,6 +464,7 @@ func (h *JobHandler) processJob(ctx context.Context, p JobPayload) error {
 					"error", cErr,
 				)
 			case !wasSet:
+				h.metrics.CheckpointEvents.WithLabelValues(metrics.CheckpointEventRaceLost).Inc()
 				logger.Warn("checkpoint race lost, using canonical ciphertext",
 					"stage", "checkpoint",
 					"localBytes", len(ciphertext),
@@ -400,58 +484,66 @@ func (h *JobHandler) processJob(ctx context.Context, p JobPayload) error {
 	// the checkpoint records delivered=true so relay subscribers don't see
 	// a duplicate complete frame.
 	if ckpt.Delivered {
+		h.metrics.CheckpointEvents.WithLabelValues(metrics.CheckpointEventHitDelivered).Inc()
 		logger.Info("checkpoint hit, skipping stage 7",
 			"stage", "checkpoint",
 			"reason", "delivered",
 		)
 	} else {
-		stageStart = time.Now()
+		rec = h.metrics.StartStage(metrics.StageRedisPublish, model, delivery)
 		h.publishToRedis(ctx, logger, p.JobID, p.SessionID, p.CorrelationID, ciphertext)
+		d = rec.End(metrics.OutcomeOK, metrics.CacheMiss)
 		logger.Info("stage 7 complete",
 			"stage", "redis_publish",
-			"durationMs", time.Since(stageStart).Milliseconds(),
+			"durationMs", d.Milliseconds(),
 		)
 		if h.checkpoints != nil {
-			if err := h.checkpoints.MarkDelivered(ctx, p.JobID); err != nil {
+			if mErr := h.checkpoints.MarkDelivered(ctx, p.JobID); mErr != nil {
 				logger.Warn("failed to mark delivered on checkpoint",
 					"stage", "checkpoint",
-					"error", err,
+					"error", mErr,
 				)
 			}
 		}
 	}
 
 	// Stage 8a: Submit blob TX.
-	versionedHash, err := h.ensureBlobSubmitted(ctx, logger, p.JobID, ckpt, ciphertext)
-	if err != nil {
+	versionedHash, blobErr := h.ensureBlobSubmitted(ctx, logger, p.JobID, ckpt, ciphertext, model, delivery)
+	if blobErr != nil {
+		err = blobErr
 		return err
 	}
 
 	// Stage 8b: Complete job on-chain.
-	stageStart = time.Now()
+	rec = h.metrics.StartStage(metrics.StageCompleteJob, model, delivery)
 	responseCiphertextHash := crypto.Keccak256Hash(ciphertext)
 	logger.Info("stage 8b starting",
 		"stage", "complete_job",
 		"versionedHash", versionedHash.Hex(),
 		"ciphertextHash", responseCiphertextHash.Hex(),
 	)
-	if err := h.completeJob(ctx, logger, p.JobID, versionedHash, responseCiphertextHash); err != nil {
-		return fmt.Errorf("stage 8 (complete job): %w", err)
+	if cjErr := h.completeJob(ctx, logger, p.JobID, versionedHash, responseCiphertextHash); cjErr != nil {
+		rec.End(metrics.OutcomeError, metrics.CacheNone)
+		err = fmt.Errorf("stage 8 (complete job): %w", cjErr)
+		return err
 	}
+	d = rec.End(metrics.OutcomeOK, metrics.CacheNone)
 	logger.Info("stage 8b complete",
 		"stage", "complete_job",
-		"durationMs", time.Since(stageStart).Milliseconds(),
+		"durationMs", d.Milliseconds(),
 	)
 
 	// Tombstone the checkpoint after a successful stage 8b. A short TTL
 	// lets any straggler retry observe "completed" before the record
 	// disappears; outright Delete would race concurrent retries.
 	if h.checkpoints != nil {
-		if err := h.checkpoints.Tombstone(ctx, p.JobID); err != nil {
+		if tErr := h.checkpoints.Tombstone(ctx, p.JobID); tErr != nil {
 			logger.Warn("failed to tombstone checkpoint after completion",
 				"stage", "checkpoint",
-				"error", err,
+				"error", tErr,
 			)
+		} else {
+			h.metrics.CheckpointEvents.WithLabelValues(metrics.CheckpointEventTombstoned).Inc()
 		}
 	}
 
@@ -486,16 +578,19 @@ func (h *JobHandler) runInferencePipeline(
 	logger *slog.Logger,
 	p JobPayload,
 	blobData []byte,
+	model, delivery string,
 ) ([]byte, error) {
 	// Stage 3: Get session key (cache miss → chain fetch → store)
-	stageStart := time.Now()
+	rec := h.metrics.StartStage(metrics.StageSessionKey, model, delivery)
 	sessionKey, err := h.getOrDeriveSessionKey(ctx, logger, p.SessionID)
 	if err != nil {
+		rec.End(metrics.OutcomeError, metrics.CacheMiss)
 		return nil, fmt.Errorf("stage 3 (session key): %w", err)
 	}
+	d := rec.End(metrics.OutcomeOK, metrics.CacheMiss)
 	logger.Info("stage 3 complete",
 		"stage", "session_key",
-		"durationMs", time.Since(stageStart).Milliseconds(),
+		"durationMs", d.Milliseconds(),
 	)
 
 	// Stage 4: Decrypt prompt.
@@ -504,7 +599,7 @@ func (h *JobHandler) runInferencePipeline(
 	// the session key may have been rotated via updateSessionKey.
 	// GetSessionEncWorkerKey reads session storage directly, so a refresh
 	// picks up the current key regardless of how it was set.
-	stageStart = time.Now()
+	rec = h.metrics.StartStage(metrics.StageDecrypt, model, delivery)
 	prompt, err := pkgcrypto.Decrypt(sessionKey, blobData)
 	if err != nil {
 		logger.Warn("stage 4: initial decrypt failed, refreshing session key",
@@ -513,18 +608,21 @@ func (h *JobHandler) runInferencePipeline(
 		)
 		refreshed, refreshErr := h.refreshSessionKey(ctx, logger, p.SessionID)
 		if refreshErr != nil {
+			rec.End(metrics.OutcomeError, metrics.CacheMiss)
 			return nil, fmt.Errorf("stage 4 (decrypt prompt): %w (refresh failed: %v)", err, refreshErr)
 		}
 		sessionKey = refreshed
 		prompt, err = pkgcrypto.Decrypt(sessionKey, blobData)
 		if err != nil {
+			rec.End(metrics.OutcomeError, metrics.CacheMiss)
 			return nil, fmt.Errorf("stage 4 (decrypt prompt after key refresh): %w", err)
 		}
 	}
+	d = rec.End(metrics.OutcomeOK, metrics.CacheMiss)
 	logger.Info("stage 4 complete",
 		"stage", "decrypt",
 		"promptBytes", len(prompt),
-		"durationMs", time.Since(stageStart).Milliseconds(),
+		"durationMs", d.Milliseconds(),
 	)
 
 	// Stage 5: AI inference (with conversation history if prior jobs exist)
@@ -547,7 +645,7 @@ func (h *JobHandler) runInferencePipeline(
 		}
 	}
 
-	stageStart = time.Now()
+	rec = h.metrics.StartStage(metrics.StageInference, model, delivery)
 	logger.Info("stage 5 starting",
 		"stage", "inference",
 		"model", modelName,
@@ -558,31 +656,36 @@ func (h *JobHandler) runInferencePipeline(
 		messages := append(history, ollama.ChatMessage{Role: "user", Content: string(prompt)})
 		response, err = h.ollamaClient.Chat(ctx, modelName, messages)
 		if err != nil {
+			rec.End(metrics.OutcomeError, metrics.CacheMiss)
 			return nil, fmt.Errorf("stage 5 (chat inference): %w", err)
 		}
 	} else {
 		response, err = h.ollamaClient.Generate(ctx, modelName, string(prompt))
 		if err != nil {
+			rec.End(metrics.OutcomeError, metrics.CacheMiss)
 			return nil, fmt.Errorf("stage 5 (inference): %w", err)
 		}
 	}
+	d = rec.End(metrics.OutcomeOK, metrics.CacheMiss)
 	logger.Info("stage 5 complete",
 		"stage", "inference",
 		"model", modelName,
 		"responseBytes", len(response),
-		"durationMs", time.Since(stageStart).Milliseconds(),
+		"durationMs", d.Milliseconds(),
 	)
 
 	// Stage 6: Encrypt response
-	stageStart = time.Now()
+	rec = h.metrics.StartStage(metrics.StageEncrypt, model, delivery)
 	ciphertext, err := pkgcrypto.Encrypt(sessionKey, []byte(response))
 	if err != nil {
+		rec.End(metrics.OutcomeError, metrics.CacheMiss)
 		return nil, fmt.Errorf("stage 6 (encrypt response): %w", err)
 	}
+	d = rec.End(metrics.OutcomeOK, metrics.CacheMiss)
 	logger.Info("stage 6 complete",
 		"stage", "encrypt",
 		"ciphertextBytes", len(ciphertext),
-		"durationMs", time.Since(stageStart).Milliseconds(),
+		"durationMs", d.Milliseconds(),
 	)
 
 	return ciphertext, nil
@@ -642,8 +745,15 @@ func (h *JobHandler) ensureBlobSubmitted(
 	jobID uint64,
 	ckpt JobCheckpoint,
 	ciphertext []byte,
+	model, delivery string,
 ) (common.Hash, error) {
 	if ckpt.HasVersionedHash() {
+		// Cache hit: short-circuit. Record an outcome=skipped sample so
+		// dashboards can count "stage 8a skipped on retry" against total
+		// invocations.
+		rec := h.metrics.StartStage(metrics.StageSubmitBlob, model, delivery)
+		rec.End(metrics.OutcomeSkipped, metrics.CacheHit)
+		h.metrics.CheckpointEvents.WithLabelValues(metrics.CheckpointEventHitBlob).Inc()
 		logger.Info("checkpoint hit, skipping stage 8a",
 			"stage", "checkpoint",
 			"reason", "blob_submitted",
@@ -652,7 +762,7 @@ func (h *JobHandler) ensureBlobSubmitted(
 		return ckpt.VersionedHash, nil
 	}
 
-	stageStart := time.Now()
+	rec := h.metrics.StartStage(metrics.StageSubmitBlob, model, delivery)
 	logger.Info("stage 8a starting",
 		"stage", "submit_blob",
 		"ciphertextBytes", len(ciphertext),
@@ -662,16 +772,19 @@ func (h *JobHandler) ensureBlobSubmitted(
 	blobHashes, err := h.blobSubmitter.SubmitBlobTx(submitCtx, ciphertext)
 	submitCancel()
 	if err != nil {
+		rec.End(metrics.OutcomeError, metrics.CacheMiss)
 		return common.Hash{}, fmt.Errorf("stage 8 (submit blob): %w", err)
 	}
 	if len(blobHashes) != 1 {
+		rec.End(metrics.OutcomeError, metrics.CacheMiss)
 		return common.Hash{}, fmt.Errorf("stage 8 (submit blob): expected exactly 1 blob hash, got %d", len(blobHashes))
 	}
 	versionedHash := common.Hash(blobHashes[0])
+	d := rec.End(metrics.OutcomeOK, metrics.CacheMiss)
 	logger.Info("stage 8a complete",
 		"stage", "submit_blob",
 		"versionedHash", versionedHash.Hex(),
-		"durationMs", time.Since(stageStart).Milliseconds(),
+		"durationMs", d.Milliseconds(),
 	)
 	if h.checkpoints != nil {
 		if err := h.checkpoints.SetVersionedHash(ctx, jobID, versionedHash); err != nil {
@@ -713,12 +826,14 @@ func (h *JobHandler) completeJob(
 func (h *JobHandler) getOrDeriveSessionKey(ctx context.Context, logger *slog.Logger, sessionID uint64) ([]byte, error) {
 	key, err := h.keyStore.GetKey(sessionID)
 	if err == nil {
+		h.metrics.SessionKeyEvents.WithLabelValues(metrics.SessionKeyPathCacheHit).Inc()
 		logger.Info("stage 3: session key cache hit",
 			"stage", "session_key",
 			"path", "cache_hit",
 		)
 		return key, nil
 	}
+	h.metrics.SessionKeyEvents.WithLabelValues(metrics.SessionKeyPathChainDerive).Inc()
 	logger.Info("stage 3: session key cache miss, deriving from chain",
 		"stage", "session_key",
 		"path", "chain_derive",
@@ -730,6 +845,7 @@ func (h *JobHandler) getOrDeriveSessionKey(ctx context.Context, logger *slog.Log
 // directly from chain events. Used on decryption failure to pick up a rotated
 // session key.
 func (h *JobHandler) refreshSessionKey(ctx context.Context, logger *slog.Logger, sessionID uint64) ([]byte, error) {
+	h.metrics.SessionKeyEvents.WithLabelValues(metrics.SessionKeyPathRefresh).Inc()
 	logger.Info("stage 4: refreshing session key from chain (possible rotation)",
 		"stage", "session_key",
 		"path", "refresh",
