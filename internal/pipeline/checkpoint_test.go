@@ -229,3 +229,62 @@ func TestCheckpointStore_ConcurrentSetGet(t *testing.T) {
 	wg.Wait()
 	assert.Equal(t, int32(goroutines*jobs), getCount.Load())
 }
+
+// TestCheckpointStore_TombstoneSurvivesLateUpdate guards against a slow
+// concurrent retry resurrecting a tombstoned record. After Tombstone()
+// shortens the TTL to tombstoneTTL (10 min in this fixture), a late call
+// to SetVersionedHash or MarkDelivered MUST NOT extend the TTL back to
+// the full 2h retention window. Otherwise the post-completion GC path
+// is defeated and stale records linger far longer than designed.
+func TestCheckpointStore_TombstoneSurvivesLateUpdate(t *testing.T) {
+	t.Parallel()
+
+	store, mr := newTestCheckpointStore(t)
+	ctx := context.Background()
+	const jobID uint64 = 99
+
+	_, _, err := store.SetCiphertextIfAbsent(ctx, jobID, []byte("ct"))
+	require.NoError(t, err)
+
+	require.NoError(t, store.Tombstone(ctx, jobID))
+
+	// Late updates from a concurrent retry — these must respect the
+	// tombstone marker and skip TTL extension.
+	require.NoError(t, store.SetVersionedHash(ctx, jobID, common.HexToHash("0x01")))
+	require.NoError(t, store.MarkDelivered(ctx, jobID))
+
+	// Fast-forward past the tombstone TTL; the key MUST be gone.
+	// Pre-fix this would fail because the late SetVersionedHash/MarkDelivered
+	// would have re-extended the TTL to the full 2h retention window.
+	mr.FastForward(11 * time.Minute)
+	ckpt, err := store.Get(ctx, jobID)
+	require.NoError(t, err)
+	assert.True(t, ckpt.IsEmpty(),
+		"tombstoned key must expire even after late SetVersionedHash/MarkDelivered")
+}
+
+// TestCheckpointStore_GetRejectsMalformedVersionedHash guards against
+// silent corruption: common.HexToHash zero-pads/truncates malformed input
+// instead of failing, so a corrupted Redis value would yield a non-zero
+// garbage hash that HasVersionedHash() reports as present. Stage 8a would
+// then skip and stage 8b would proceed with an invalid blob hash. Get()
+// must reject the malformed value loudly so the handler falls back to
+// re-running stage 8a from scratch.
+func TestCheckpointStore_GetRejectsMalformedVersionedHash(t *testing.T) {
+	t.Parallel()
+
+	store, mr := newTestCheckpointStore(t)
+	ctx := context.Background()
+	const jobID uint64 = 77
+
+	_, _, err := store.SetCiphertextIfAbsent(ctx, jobID, []byte("ct"))
+	require.NoError(t, err)
+
+	// Inject a malformed value directly via miniredis to simulate
+	// corruption (Redis bitrot, third-party write, etc.).
+	mr.HSet(store.key(jobID), "versionedHash", "0xnot-a-real-hash")
+
+	_, err = store.Get(ctx, jobID)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "invalid versionedHash format")
+}

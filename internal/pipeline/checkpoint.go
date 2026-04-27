@@ -65,12 +65,14 @@ func (c JobCheckpoint) HasVersionedHash() bool {
 // SetCiphertextIfAbsent) are implemented with Lua scripts to avoid a
 // WATCH/MULTI round-trip.
 type CheckpointStore struct {
-	redis           *redis.Client
-	ttl             time.Duration
-	maxCiphertextB  int
-	tombstoneTTL    time.Duration
-	keyPrefix       string
-	setCiphertextLR *redis.Script
+	redis              *redis.Client
+	ttl                time.Duration
+	maxCiphertextB     int
+	tombstoneTTL       time.Duration
+	keyPrefix          string
+	setCiphertextLR    *redis.Script
+	setVersionedHashLR *redis.Script
+	markDeliveredLR    *redis.Script
 }
 
 // NewCheckpointStore constructs a store. ttl is the normal TTL on fresh
@@ -107,6 +109,33 @@ end
 redis.call('HSET', KEYS[1], 'ciphertext', ARGV[1])
 redis.call('EXPIRE', KEYS[1], tonumber(ARGV[2]))
 return {ARGV[1], '1'}
+`),
+		// setVersionedHashLR / markDeliveredLR: HSET the new field, but
+		// only call EXPIRE when the record is NOT tombstoned. Tombstone()
+		// sets the 'tombstoned' marker AND shrinks the TTL after stage 8b
+		// completes; without the guard, a slow concurrent retry calling
+		// SetVersionedHash or MarkDelivered would extend the key back to
+		// the full TTL, defeating the post-completion GC path.
+		setVersionedHashLR: redis.NewScript(`
+-- KEYS[1] = checkpoint hash key
+-- ARGV[1] = versioned-hash hex
+-- ARGV[2] = TTL seconds (only applied if not tombstoned)
+local tombstoned = redis.call('HGET', KEYS[1], 'tombstoned')
+redis.call('HSET', KEYS[1], 'versionedHash', ARGV[1])
+if not tombstoned then
+  redis.call('EXPIRE', KEYS[1], tonumber(ARGV[2]))
+end
+return 'OK'
+`),
+		markDeliveredLR: redis.NewScript(`
+-- KEYS[1] = checkpoint hash key
+-- ARGV[1] = TTL seconds (only applied if not tombstoned)
+local tombstoned = redis.call('HGET', KEYS[1], 'tombstoned')
+redis.call('HSET', KEYS[1], 'delivered', '1')
+if not tombstoned then
+  redis.call('EXPIRE', KEYS[1], tonumber(ARGV[1]))
+end
+return 'OK'
 `),
 	}
 }
@@ -180,14 +209,20 @@ func (s *CheckpointStore) SetCiphertextIfAbsent(
 // stage 8a may re-run on a retry even after ciphertext was cached, and
 // whichever attempt wins writes its hash. The contract rejects duplicate
 // submissions, so on-chain consistency is preserved regardless.
+//
+// The Lua script atomically checks for the 'tombstoned' marker and skips
+// the TTL extension when present — see the script comment for why.
 func (s *CheckpointStore) SetVersionedHash(ctx context.Context, jobID uint64, hash common.Hash) error {
 	if hash == (common.Hash{}) {
 		return fmt.Errorf("versioned hash is zero")
 	}
-	pipe := s.redis.TxPipeline()
-	pipe.HSet(ctx, s.key(jobID), "versionedHash", hash.Hex())
-	pipe.Expire(ctx, s.key(jobID), s.ttl)
-	_, err := pipe.Exec(ctx)
+	_, err := s.setVersionedHashLR.Run(
+		ctx,
+		s.redis,
+		[]string{s.key(jobID)},
+		hash.Hex(),
+		int64(s.ttl.Seconds()),
+	).Result()
 	if err != nil {
 		return fmt.Errorf("set versionedHash: %w", err)
 	}
@@ -195,11 +230,14 @@ func (s *CheckpointStore) SetVersionedHash(ctx context.Context, jobID uint64, ha
 }
 
 // MarkDelivered records that stage 7 has published at least once.
+// Tombstone-aware via Lua script — see SetVersionedHash for rationale.
 func (s *CheckpointStore) MarkDelivered(ctx context.Context, jobID uint64) error {
-	pipe := s.redis.TxPipeline()
-	pipe.HSet(ctx, s.key(jobID), "delivered", "1")
-	pipe.Expire(ctx, s.key(jobID), s.ttl)
-	_, err := pipe.Exec(ctx)
+	_, err := s.markDeliveredLR.Run(
+		ctx,
+		s.redis,
+		[]string{s.key(jobID)},
+		int64(s.ttl.Seconds()),
+	).Result()
 	if err != nil {
 		return fmt.Errorf("mark delivered: %w", err)
 	}
@@ -227,6 +265,14 @@ func (s *CheckpointStore) Get(ctx context.Context, jobID uint64) (JobCheckpoint,
 		out.Ciphertext = ct
 	}
 	if hashHex, ok := vals["versionedHash"]; ok && hashHex != "" {
+		// common.HexToHash silently zero-pads/truncates malformed input,
+		// so a corrupted Redis value would yield a non-zero garbage hash
+		// that HasVersionedHash() reports as present. Stage 8a would skip
+		// and stage 8b would proceed with an invalid blob hash. Reject
+		// malformed input loudly and fall through to a fresh re-submit.
+		if !common.IsHexHash(hashHex) {
+			return JobCheckpoint{}, fmt.Errorf("invalid versionedHash format in checkpoint: %q", hashHex)
+		}
 		out.VersionedHash = common.HexToHash(hashHex)
 	}
 	if delivered, ok := vals["delivered"]; ok && delivered == "1" {
@@ -235,12 +281,20 @@ func (s *CheckpointStore) Get(ctx context.Context, jobID uint64) (JobCheckpoint,
 	return out, nil
 }
 
-// Tombstone shrinks the checkpoint's TTL to tombstoneTTL. Called after
-// on-chain completion is confirmed so an in-flight retry can still observe
-// "already completed" for a short window but the record is GC'd soon after.
-// Delete-outright would race a retry that's mid-processJob.
+// Tombstone shrinks the checkpoint's TTL to tombstoneTTL and sets a
+// 'tombstoned' marker. Called after on-chain completion is confirmed so
+// an in-flight retry can still observe "already completed" for a short
+// window but the record is GC'd soon after. Delete-outright would race a
+// retry that's mid-processJob.
+//
+// The marker is what SetVersionedHash and MarkDelivered's Lua scripts
+// check before extending TTL — without it, a slow concurrent retry would
+// resurrect the key back to the full retention window and defeat the GC.
 func (s *CheckpointStore) Tombstone(ctx context.Context, jobID uint64) error {
-	if err := s.redis.Expire(ctx, s.key(jobID), s.tombstoneTTL).Err(); err != nil {
+	pipe := s.redis.TxPipeline()
+	pipe.HSet(ctx, s.key(jobID), "tombstoned", "1")
+	pipe.Expire(ctx, s.key(jobID), s.tombstoneTTL)
+	if _, err := pipe.Exec(ctx); err != nil {
 		return fmt.Errorf("tombstone checkpoint: %w", err)
 	}
 	return nil
