@@ -242,12 +242,17 @@ func New(cfg *config.Config) (*Service, error) {
 	// response pub/sub. Tombstone TTL is fixed at 10 minutes — long enough
 	// that a late retry observes "completed" via the cached record, short
 	// enough that stale entries don't accumulate.
-	checkpoints := pipeline.NewCheckpointStore(
-		redisClient,
-		cfg.CheckpointTTL,
-		10*time.Minute,
-		cfg.CheckpointMaxBytes,
-	)
+	// In gateway+beacon mode redisClient is nil — skip checkpoints (the
+	// handler treats nil checkpoints as a no-op).
+	var checkpoints *pipeline.CheckpointStore
+	if redisClient != nil {
+		checkpoints = pipeline.NewCheckpointStore(
+			redisClient,
+			cfg.CheckpointTTL,
+			10*time.Minute,
+			cfg.CheckpointMaxBytes,
+		)
+	}
 
 	// Job pipeline handler
 	handler := pipeline.NewJobHandler(
@@ -313,9 +318,26 @@ func New(cfg *config.Config) (*Service, error) {
 			"models", len(modelIDs),
 		)
 
+		// Seed the coordinator from the chain's pending-vs-latest nonce gap
+		// so gateway mode also recovers from a previous crash's stuck txs.
+		seedCtx, seedCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		pendingNonce, perr := chainClient.EthClient().PendingNonceAt(seedCtx, workerAddr)
+		latestNonce, lerr := chainClient.EthClient().NonceAt(seedCtx, workerAddr, nil)
+		seedCancel()
+		if perr == nil && lerr == nil {
+			coordinator.Seed(pendingNonce, latestNonce)
+		} else {
+			logger.Warn("coordinator seed skipped — pending/latest nonce read failed",
+				"pendingErr", perr,
+				"latestErr", lerr,
+				"hint", "first legacy broadcast may race a stuck pool tx; existing ShouldResetNonceOnSendError will recover",
+			)
+		}
+
 		return &Service{
 			cfg:             cfg,
 			chainClient:     chainClient,
+			coordinator:     coordinator,
 			redis:           redisClient,
 			sessionKeyStore: sessionKeyStore,
 			jobCounter:      jobCounter,
