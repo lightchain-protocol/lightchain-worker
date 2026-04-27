@@ -284,12 +284,36 @@ func (s *BlobTxSubmitter) SubmitBlobTx(ctx context.Context, data []byte) ([][32]
 		return nil, fmt.Errorf("broadcast blob tx: %w", err)
 	}
 
+	if err := s.submitAndWait(ctx, txBackend, signTx, waitMined, signedTx, token, nonce, mutexWaitMs); err != nil {
+		return nil, err
+	}
+	return [][32]byte{[32]byte(payload.versionedHash)}, nil
+}
+
+// submitAndWait broadcasts the already-signed blob tx, registers its hash on
+// the coordinator token, waits for it to be mined, and returns nil iff a
+// successful receipt is observed. On send failure it delegates to
+// handleSendError (which manages nonce reset and stuck-nonce tracking). On
+// WaitMined failure it resets the nonce — see the inline comment for the
+// 2026-04-23 testnet incident that motivated this. On mined-but-reverted
+// receipt, returns an error WITHOUT resetting the nonce, because the tx
+// genuinely consumed it.
+func (s *BlobTxSubmitter) submitAndWait(
+	ctx context.Context,
+	txBackend BlobTxBackend,
+	signTx func(tx *types.Transaction, signer types.Signer, key *ecdsa.PrivateKey) (*types.Transaction, error),
+	waitMined func(ctx context.Context, b bind.DeployBackend, tx *types.Transaction) (*types.Receipt, error),
+	signedTx *types.Transaction,
+	token *workerchain.BroadcastToken,
+	nonce uint64,
+	mutexWaitMs int64,
+) error {
 	txHash := signedTx.Hash()
 
 	broadcastStart := time.Now()
 	if err := txBackend.SendTransaction(ctx, signedTx); err != nil {
 		s.handleSendError(ctx, txBackend, signTx, err, nonce, txHash, mutexWaitMs)
-		return nil, fmt.Errorf("send blob tx: %w", err)
+		return fmt.Errorf("send blob tx: %w", err)
 	}
 
 	// Broadcast accepted by the pool — record the hash on the coordinator
@@ -334,10 +358,10 @@ func (s *BlobTxSubmitter) SubmitBlobTx(ctx context.Context, data []byte) ([][32]
 				"error", err,
 			)
 		}
-		return nil, fmt.Errorf("wait for blob tx %s: %w", txHash.Hex(), err)
+		return fmt.Errorf("wait for blob tx %s: %w", txHash.Hex(), err)
 	}
 	if receipt.Status != types.ReceiptStatusSuccessful {
-		return nil, fmt.Errorf("blob tx reverted (status 0, tx %s)", receipt.TxHash.Hex())
+		return fmt.Errorf("blob tx reverted (status 0, tx %s)", receipt.TxHash.Hex())
 	}
 
 	// A mined receipt means the tx at this nonce is no longer in the pool.
@@ -354,7 +378,7 @@ func (s *BlobTxSubmitter) SubmitBlobTx(ctx context.Context, data []byte) ([][32]
 		)
 	}
 
-	return [][32]byte{[32]byte(payload.versionedHash)}, nil
+	return nil
 }
 
 func (s *BlobTxSubmitter) handleSendError(
