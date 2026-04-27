@@ -904,7 +904,7 @@ func TestHandleTask_CheckpointHit_SkipsInference(t *testing.T) {
 	handler := NewJobHandler(
 		chain, fetcher, submitter, newMockKeyStore(), ollama,
 		rc, testSigningKey(t), ecdhKey, counter, logger,
-		HandlerConfig{AckTxTimeout: 5 * time.Second, BlobTxTimeout: 60 * time.Second},
+		HandlerConfig{AckTxTimeout: 5 * time.Second, BlobTxTimeout: 60 * time.Second, RedisPublishTimeout: 5 * time.Second},
 		store,
 	)
 
@@ -975,7 +975,7 @@ func TestHandleTask_CheckpointRaceLoserUsesCanonical(t *testing.T) {
 	handler := NewJobHandler(
 		chain, fetcher, submitter, newMockKeyStore(), ollama,
 		rc, testSigningKey(t), ecdhKey, counter, logger,
-		HandlerConfig{AckTxTimeout: 5 * time.Second, BlobTxTimeout: 60 * time.Second},
+		HandlerConfig{AckTxTimeout: 5 * time.Second, BlobTxTimeout: 60 * time.Second, RedisPublishTimeout: 5 * time.Second},
 		store,
 	)
 
@@ -1009,6 +1009,14 @@ func TestHandleTask_CheckpointRaceLoserUsesCanonical(t *testing.T) {
 	require.Len(t, submittedCiphertexts, 2)
 	assert.Equal(t, submittedCiphertexts[0], submittedCiphertexts[1],
 		"both SubmitBlobTx calls must observe BYTE-IDENTICAL canonical ciphertext — loser must refresh from SETNX")
+
+	// Stronger invariant: the persisted store row must contain those same
+	// bytes. This proves the loser refreshed from Redis (the actual
+	// canonical source) and not from some accidental in-memory short-circuit.
+	persisted, err := store.Get(context.Background(), uint64(payload.JobID))
+	require.NoError(t, err)
+	assert.Equal(t, submittedCiphertexts[0], persisted.Ciphertext,
+		"checkpoint store must hold the same canonical ciphertext both submissions used")
 }
 
 // TestHandleTask_CheckpointTombstonedAfterCompletion asserts that a
@@ -1048,7 +1056,7 @@ func TestHandleTask_CheckpointTombstonedAfterCompletion(t *testing.T) {
 	handler := NewJobHandler(
 		chain, fetcher, submitter, newMockKeyStore(), ollama,
 		rc, testSigningKey(t), ecdhKey, counter, logger,
-		HandlerConfig{AckTxTimeout: 5 * time.Second, BlobTxTimeout: 60 * time.Second},
+		HandlerConfig{AckTxTimeout: 5 * time.Second, BlobTxTimeout: 60 * time.Second, RedisPublishTimeout: 5 * time.Second},
 		store,
 	)
 
@@ -1107,7 +1115,7 @@ func TestHandleTask_CheckpointRetained_WhenStage8bFails(t *testing.T) {
 	handler := NewJobHandler(
 		chain, fetcher, submitter, newMockKeyStore(), ollama,
 		rc, testSigningKey(t), ecdhKey, counter, logger,
-		HandlerConfig{AckTxTimeout: 5 * time.Second, BlobTxTimeout: 60 * time.Second},
+		HandlerConfig{AckTxTimeout: 5 * time.Second, BlobTxTimeout: 60 * time.Second, RedisPublishTimeout: 5 * time.Second},
 		store,
 	)
 
