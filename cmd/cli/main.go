@@ -18,6 +18,7 @@ package main
 import (
 	"context"
 	"crypto/ecdsa"
+	"flag"
 	"fmt"
 	"log/slog"
 	"os"
@@ -44,6 +45,8 @@ func main() {
 
 	cmd := os.Args[1]
 	switch cmd {
+	case "import-key":
+		runImportKey()
 	case "keygen":
 		runKeygen()
 	case "register":
@@ -69,13 +72,59 @@ func printUsage() {
 Usage: lightchain-worker <command>
 
 Commands:
+  import-key  Import a hex private key into an encrypted keystore file
   keygen      Generate/load ECDH encryption key and print public key hex
   register    Register worker on-chain (stake + encryption key + models)
   add-models  Add models to an already-registered worker
   deregister  Deregister worker and withdraw stake
   status      Check on-chain registration status
 
-All configuration is via environment variables. See docs/worker-cli.md for details.`)
+All configuration is via environment variables. See docs/worker-cli.md for details.
+
+import-key flags:
+  --private-key <hex>   Hex-encoded private key (without 0x prefix)
+  --password <string>   Password to encrypt the keystore
+  --output <dir>        Directory to write the keystore file (default: ./eth-keystore)`)
+}
+
+func runImportKey() {
+	fs := flag.NewFlagSet("import-key", flag.ExitOnError)
+	privKeyHex := fs.String("private-key", "", "Hex-encoded private key (without 0x prefix)")
+	password := fs.String("password", "", "Password to encrypt the keystore")
+	outputDir := fs.String("output", "./eth-keystore", "Directory to write the keystore file")
+	if err := fs.Parse(os.Args[2:]); err != nil {
+		os.Exit(1)
+	}
+
+	if *privKeyHex == "" || *password == "" {
+		fmt.Fprintln(os.Stderr, "import-key requires --private-key and --password flags")
+		fs.Usage()
+		os.Exit(1)
+	}
+
+	// Strip 0x prefix if present.
+	hex := strings.TrimPrefix(*privKeyHex, "0x")
+
+	privateKey, err := crypto.HexToECDSA(hex)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "invalid private key: %v\n", err)
+		os.Exit(1)
+	}
+
+	if err := os.MkdirAll(*outputDir, 0700); err != nil {
+		fmt.Fprintf(os.Stderr, "create output directory: %v\n", err)
+		os.Exit(1)
+	}
+
+	ks := ethkeystore.NewKeyStore(*outputDir, ethkeystore.StandardScryptN, ethkeystore.StandardScryptP)
+	account, err := ks.ImportECDSA(privateKey, *password)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "import key: %v\n", err)
+		os.Exit(1)
+	}
+
+	fmt.Printf("Address:  %s\n", account.Address.Hex())
+	fmt.Printf("Keystore: %s\n", account.URL.Path)
 }
 
 func runKeygen() {
