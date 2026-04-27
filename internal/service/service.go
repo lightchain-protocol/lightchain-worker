@@ -284,7 +284,9 @@ func New(cfg *config.Config) (*Service, error) {
 		gwCtx, gwCancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer gwCancel()
 		if err := gwClient.Authenticate(gwCtx); err != nil {
-			_ = redisClient.Close()
+			if redisClient != nil {
+				_ = redisClient.Close()
+			}
 			chainClient.Close()
 			return nil, fmt.Errorf("authenticate with worker-gateway: %w", err)
 		}
