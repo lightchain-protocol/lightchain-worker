@@ -51,24 +51,20 @@ func TestStuckNonceTracker_BumpCounterResetsOnNonceChange(t *testing.T) {
 	tr := NewStuckNonceTracker()
 	tr.IncrementBumpAttemptsFor(152)
 	tr.IncrementBumpAttemptsFor(152)
-	assert.Equal(t, 2, tr.BumpAttemptsUsed())
+	assert.Equal(t, 2, tr.BumpAttemptsUsedFor(152))
 
 	// Bumping at a new nonce resets — replacement at 152 makes no sense
 	// if we're now bumping 153.
 	tr.IncrementBumpAttemptsFor(153)
-	assert.Equal(t, 1, tr.BumpAttemptsUsed())
-}
+	assert.Equal(t, 1, tr.BumpAttemptsUsedFor(153))
 
-func TestStuckNonceTracker_LegacyIncrementBumpAttempts(t *testing.T) {
-	t.Parallel()
-
-	// The legacy nonce-less IncrementBumpAttempts is preserved for the
-	// existing caller (blob_tx.go:521). It increments without resetting.
-	tr := NewStuckNonceTracker()
-	tr.IncrementBumpAttempts()
-	tr.IncrementBumpAttempts()
-	tr.IncrementBumpAttempts()
-	assert.Equal(t, 3, tr.BumpAttemptsUsed())
+	// Critical regression guard: nonce 152's earlier budget MUST NOT leak
+	// into nonce 153's check, and vice versa. Reading 152's count after
+	// the rotation must report 0 — otherwise the next stuck nonce would
+	// inherit the prior nonce's budget and could be wrongly declared
+	// exhausted (or pre-inflated to a high 2^N multiplier).
+	assert.Equal(t, 0, tr.BumpAttemptsUsedFor(152),
+		"per-nonce budgets must not leak across nonce changes")
 }
 
 func TestStuckNonceTracker_Clear(t *testing.T) {
@@ -78,12 +74,12 @@ func TestStuckNonceTracker_Clear(t *testing.T) {
 	tr.Record(152)
 	tr.Record(152)
 	tr.Record(153)
-	tr.IncrementBumpAttempts()
+	tr.IncrementBumpAttemptsFor(152)
 
 	tr.Clear()
 
 	assert.Equal(t, 0, tr.MaxConsecutiveHits())
-	assert.Equal(t, 0, tr.BumpAttemptsUsed())
+	assert.Equal(t, 0, tr.BumpAttemptsUsedFor(152))
 	assert.Equal(t, 0, tr.Size())
 	_, ok := tr.LastNonce()
 	assert.False(t, ok, "LastNonce must report hasObserved=false after Clear")

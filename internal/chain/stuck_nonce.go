@@ -41,8 +41,8 @@ type StuckNonceTracker struct {
 	// now seeing rejections at K+1.
 	bumpAttempts int
 	// lastBumpNonce tracks which nonce the current bumpAttempts counter
-	// belongs to, so IncrementBumpAttempts / BumpAttemptsUsed can detect
-	// when the counter should reset.
+	// belongs to, so IncrementBumpAttemptsFor / BumpAttemptsUsedFor can
+	// detect when the counter should reset.
 	lastBumpNonce    uint64
 	hasLastBumpNonce bool
 
@@ -140,29 +140,27 @@ func (t *StuckNonceTracker) LastNonce() (uint64, bool) {
 	return lastN, observed
 }
 
-// BumpAttemptsUsed reports how many replacement-tx attempts have been made
-// for the CURRENT stuck nonce. Resets implicitly when the caller starts
-// tracking a new nonce (via IncrementBumpAttempts at a different nonce).
-func (t *StuckNonceTracker) BumpAttemptsUsed() int {
+// BumpAttemptsUsedFor reports how many replacement-tx attempts have been
+// made for the given nonce. Returns 0 when the tracker's last-bumped
+// nonce differs from n — i.e. each new stuck nonce starts with a fresh
+// budget, mirroring IncrementBumpAttemptsFor's reset semantics.
+//
+// Use this paired with IncrementBumpAttemptsFor; the global
+// BumpAttemptsUsed reader was removed because it carried state across
+// nonce changes and could exhaust the per-nonce budget incorrectly when
+// successive nonces hit the stuck path.
+func (t *StuckNonceTracker) BumpAttemptsUsedFor(n uint64) int {
 	t.mu.Lock()
 	defer t.mu.Unlock()
+	if !t.hasLastBumpNonce || t.lastBumpNonce != n {
+		return 0
+	}
 	return t.bumpAttempts
 }
 
-// IncrementBumpAttempts is called by the replacement-tx submitter each
-// time it broadcasts a bumped-fee replacement. Call sites today don't
-// thread the nonce through, so this keeps the legacy signature and relies
-// on the caller's own discipline (replacement only fires from one path,
-// the blob-tx stuck-nonce branch).
-func (t *StuckNonceTracker) IncrementBumpAttempts() {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	t.bumpAttempts++
-}
-
-// IncrementBumpAttemptsFor is the nonce-aware variant: if the last bump
-// was for a DIFFERENT nonce, the counter resets before incrementing. Use
-// this in new callers that know which nonce they're bumping.
+// IncrementBumpAttemptsFor records a replacement-tx attempt for the given
+// nonce. If the last bump was for a DIFFERENT nonce, the counter resets
+// before incrementing — each new stuck nonce gets a fresh budget.
 func (t *StuckNonceTracker) IncrementBumpAttemptsFor(n uint64) {
 	t.mu.Lock()
 	defer t.mu.Unlock()

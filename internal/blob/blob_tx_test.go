@@ -361,7 +361,7 @@ func TestBlobTxSubmitter_DetectsStuckNonce_BelowThreshold(t *testing.T) {
 	n, ok := tracker.LastNonce()
 	assert.True(t, ok)
 	assert.Equal(t, uint64(152), n)
-	assert.Equal(t, 0, tracker.BumpAttemptsUsed(),
+	assert.Equal(t, 0, tracker.BumpAttemptsUsedFor(152),
 		"no bump attempts must fire below threshold")
 }
 
@@ -422,7 +422,7 @@ func TestBlobTxSubmitter_TriggersReplacementAtThreshold(t *testing.T) {
 	// BlobFeeCap bumped from 1 gwei baseline to 2 gwei.
 	assert.Equal(t, "2000000000", replacement.BlobGasFeeCap().String())
 
-	assert.Equal(t, 1, tracker.BumpAttemptsUsed(),
+	assert.Equal(t, 1, tracker.BumpAttemptsUsedFor(152),
 		"exactly one bump attempt must be recorded after first threshold trigger")
 }
 
@@ -488,10 +488,10 @@ func TestBlobTxSubmitter_StopsReplacingAfterMaxBumps(t *testing.T) {
 
 	// Breakdown: 4 originals + 2 replacements = 6 total broadcasts.
 	// The 3rd and 4th threshold hits do NOT produce new replacements
-	// because BumpAttemptsUsed has reached MaxBumps.
+	// because BumpAttemptsUsedFor(nonce) has reached MaxBumps.
 	assert.Equal(t, int32(6), sendCalls.Load(),
 		"expected exactly MaxBumps replacements (2), not one per threshold hit")
-	assert.Equal(t, 2, tracker.BumpAttemptsUsed())
+	assert.Equal(t, 2, tracker.BumpAttemptsUsedFor(152))
 }
 
 // TestBlobTxSubmitter_ReplacementHonorsAutoReplaceDisabled asserts the
@@ -526,8 +526,8 @@ func TestBlobTxSubmitter_ReplacementHonorsAutoReplaceDisabled(t *testing.T) {
 	// Only the 3 originals — no replacement broadcasts.
 	assert.Equal(t, int32(3), sendCalls.Load(),
 		"AutoReplace=false must suppress all replacement broadcasts")
-	assert.Equal(t, 0, tracker.BumpAttemptsUsed(),
-		"AutoReplace=false must not call IncrementBumpAttempts either")
+	assert.Equal(t, 0, tracker.BumpAttemptsUsedFor(152),
+		"AutoReplace=false must not call IncrementBumpAttemptsFor either")
 	assert.Equal(t, 3, tracker.MaxConsecutiveHits(),
 		"detection still happens — the tracker counts regardless of auto-replace")
 }

@@ -441,7 +441,7 @@ func (s *BlobTxSubmitter) maybeSubmitReplacementBlobTx(
 	}
 
 	tracker := s.stuckNonceTracker()
-	bumpsUsed := tracker.BumpAttemptsUsed()
+	bumpsUsed := tracker.BumpAttemptsUsedFor(nonce)
 	if bumpsUsed >= s.stuckCfg.MaxBumps {
 		if s.logger != nil {
 			s.logger.Error("stuck-nonce replacement bumps exhausted; manual intervention required",
@@ -560,8 +560,9 @@ func (s *BlobTxSubmitter) submitReplacementBlobTx(
 
 	// Increment BEFORE broadcast: even a failed send should count against
 	// the max-bumps budget so a misconfigured EL doesn't let us bump
-	// forever without progress.
-	s.stuckNonceTracker().IncrementBumpAttempts()
+	// forever without progress. Use the nonce-aware variant so a budget
+	// burnt on nonce N doesn't pre-exhaust nonce N+1's budget.
+	s.stuckNonceTracker().IncrementBumpAttemptsFor(nonce)
 
 	if err := txBackend.SendTransaction(ctx, signedTx); err != nil {
 		return fmt.Errorf("broadcast replacement blob tx: %w", err)

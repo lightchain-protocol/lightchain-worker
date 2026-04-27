@@ -212,7 +212,11 @@ func TestSubmitPreparedTx_RecordsStuckNonceHitWithoutReplacement(t *testing.T) {
 
 	assert.Equal(t, 3, tracker.MaxConsecutiveHits(),
 		"three consecutive reservation rejections must accumulate in the shared tracker")
-	assert.Equal(t, 0, tracker.BumpAttemptsUsed(),
+	// The legacy path doesn't bump for any nonce, so checking BumpAttemptsUsedFor
+	// for the broadcast nonce (0 — mock backend uses opts.Nonce starting at 0)
+	// must report 0. Reading by nonce is required since the global reader was
+	// removed to fix per-nonce budget leakage (PR #20 follow-up).
+	assert.Equal(t, 0, tracker.BumpAttemptsUsedFor(0),
 		"non-blob path must not attempt any replacement bumps")
 }
 
