@@ -262,6 +262,21 @@ func (s *BlobTxSubmitter) SubmitBlobTx(ctx context.Context, data []byte) ([][32]
 		return nil, fmt.Errorf("wait for blob broadcast slot: %w", err)
 	}
 	// Token.Done is idempotent; deferring is safe across every return path.
+	//
+	// Known trade-off (CodeRabbit PR #20 finding, deferred fix):
+	// On WaitMined-failure (tx still pending in pool) and on the replacement
+	// path (intentionally fire-and-forget), this defer releases the
+	// coordinator slot while the blob tx may still be live in geth — letting
+	// a ClassLegacy entrant proceed while the sender is still blob-reserved.
+	// The recovery path is the same as for any send-time collision: the
+	// legacy submission hits "address already reserved", IsAlreadyReservedError
+	// detects it, ResetNonce fires, and the asynq retry recovers. Cost is one
+	// wasted RPC round-trip per cross-class collision after a failure, not a
+	// stuck system. If devnet soak shows clustered "address already reserved"
+	// errors after WaitMined failures, mitigations are: (a) post-failure
+	// eth_getTransactionByHash polling to know when the tx is gone before
+	// releasing, or (b) restructuring the token lifecycle to span the asynq
+	// retry window. Neither is justified without that evidence.
 	defer token.Done()
 	mutexWaitMs := time.Since(mutexWaitStart).Milliseconds()
 
