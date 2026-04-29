@@ -85,7 +85,16 @@ type ResponsePublisher interface {
 	PublishResponse(ctx context.Context, jobID, sessionID uint64, correlationID string, signature string, ciphertext []byte)
 }
 
-// JobHandler processes inference jobs received from Asynq.
+// ReleaseTracker records that a job has just been completed and is now
+// awaiting on-chain release. Defined at the consumer (pipeline) per Go
+// conventions; release.Tracker satisfies it. Optional — the handler runs
+// fine when nil and the periodic reconciler will backfill missed writes.
+type ReleaseTracker interface {
+	MarkEligible(ctx context.Context, jobID uint64, completedAt int64) error
+}
+
+// JobHandler processes inference jobs received from Asynq or directly from
+// the gateway via HandleJobPayload.
 type JobHandler struct {
 	chainClient       JobExecutionClient
 	blobFetcher       BlobFetcher
@@ -112,6 +121,17 @@ type JobHandler struct {
 	// Redis-backed store here; tests that exercise the cache path do the
 	// same via miniredis.
 	checkpoints *CheckpointStore
+	// releaseTracker is optional. When set (via SetReleaseTracker), the
+	// handler records a stage-8b success so the release scheduler can
+	// settle the job after the dispute window. Failure to write is
+	// non-fatal — the periodic reconciler picks up missed writes.
+	releaseTracker ReleaseTracker
+}
+
+// SetReleaseTracker installs the release tracker after construction.
+// Service wiring calls this once before Run; tests may leave it nil.
+func (h *JobHandler) SetReleaseTracker(t ReleaseTracker) {
+	h.releaseTracker = t
 }
 
 // NewJobHandler creates a handler wired with all dependencies. publisher
@@ -532,6 +552,23 @@ func (h *JobHandler) processJob(ctx context.Context, p JobPayload) (err error) {
 		"stage", "complete_job",
 		"durationMs", d.Milliseconds(),
 	)
+
+	// Mark the job as eligible for the release scheduler. Best-effort:
+	// completedAt here is wall-clock time. The reconciler later overwrites
+	// it with the authoritative on-chain Job.completedAt, and the
+	// scheduler always re-reads on-chain state via GetJobState before
+	// releasing — so a slightly off local timestamp can only delay
+	// release, never cause a wrongful one. This call MUST be non-fatal:
+	// a failure cannot fail the job (which would trigger asynq retry of
+	// an already-completed on-chain job). Reconciler backs us up.
+	if h.releaseTracker != nil {
+		if mErr := h.releaseTracker.MarkEligible(ctx, p.JobID, time.Now().Unix()); mErr != nil {
+			logger.Warn("failed to mark job eligible for release; reconciler will backfill",
+				"stage", "release_tracker",
+				"error", mErr,
+			)
+		}
+	}
 
 	// Tombstone the checkpoint after a successful stage 8b. A short TTL
 	// lets any straggler retry observe "completed" before the record
