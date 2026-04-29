@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"math/big"
 	"sync"
+	"time"
 
 	"github.com/ethereum/go-ethereum/accounts/abi/bind"
 	"github.com/ethereum/go-ethereum/common"
@@ -16,11 +17,17 @@ import (
 	"github.com/lightchain/pkg/chain/bindings"
 )
 
+// defaultDisputeWindowCacheTTL is used when SetDisputeWindowCacheTTL has not
+// been called. Governance changes the dispute window rarely; 15m balances
+// staleness against contract round-trips.
+const defaultDisputeWindowCacheTTL = 15 * time.Minute
+
 // Compile-time interface assertions.
 var (
 	_ RegistrationClient = (*ChainClient)(nil)
 	_ ValidationClient   = (*ChainClient)(nil)
 	_ JobExecutionClient = (*ChainClient)(nil)
+	_ SettlementClient   = (*ChainClient)(nil)
 )
 
 // ChainClient implements RegistrationClient, ValidationClient, and JobExecutionClient
@@ -50,6 +57,14 @@ type ChainClient struct {
 	// lazy init for tests that don't inject one.
 	stuckTracker     *StuckNonceTracker
 	stuckTrackerOnce sync.Once
+	// disputeWindowCache memoizes AIConfig.getDisputeWindow() to avoid an
+	// eth_call on every release-cycle eligibility check. TTL is bounded so
+	// governance changes propagate without a worker restart. Guarded by
+	// disputeWindowMu.
+	disputeWindowMu       sync.Mutex
+	disputeWindowValue    time.Duration
+	disputeWindowExpires  time.Time
+	disputeWindowCacheTTL time.Duration // zero means defaultDisputeWindowCacheTTL
 }
 
 type jobTxBackend interface {
@@ -517,4 +532,190 @@ func (c *ChainClient) NonceManager() *NonceManager {
 // WorkerAddr returns the worker's Ethereum address.
 func (c *ChainClient) WorkerAddr() common.Address {
 	return c.workerAddr
+}
+
+// SetDisputeWindowCacheTTL configures how long GetDisputeWindow memoizes the
+// on-chain value. Pass <= 0 to fall back to defaultDisputeWindowCacheTTL.
+// Service wiring sets this from cfg.ReleaseDisputeWindowCacheTTL.
+func (c *ChainClient) SetDisputeWindowCacheTTL(ttl time.Duration) {
+	c.disputeWindowMu.Lock()
+	defer c.disputeWindowMu.Unlock()
+	c.disputeWindowCacheTTL = ttl
+	// Invalidate the cached value so the next call reflects the new TTL
+	// regime (and fetches fresh data).
+	c.disputeWindowExpires = time.Time{}
+}
+
+// ReleaseJob settles a single job's escrowed fee. The contract reverts if the
+// job is not Completed-past-window or Resolved; callers should pre-filter via
+// GetJobState to avoid wasted gas.
+func (c *ChainClient) ReleaseJob(ctx context.Context, jobID uint64) error {
+	if err := c.requireJobRegistry(); err != nil {
+		return err
+	}
+	return c.submitPreparedTx(ctx, "ReleaseJob", nil, func(opts *bind.TransactOpts) (*types.Transaction, error) {
+		return c.jobRegistry.ReleaseJob(opts, new(big.Int).SetUint64(jobID))
+	})
+}
+
+// ReleaseJobs is the batch variant. The contract reverts the entire batch if
+// any single job is not in a releasable state, so callers must pre-filter.
+func (c *ChainClient) ReleaseJobs(ctx context.Context, jobIDs []uint64) error {
+	if err := c.requireJobRegistry(); err != nil {
+		return err
+	}
+	if len(jobIDs) == 0 {
+		return fmt.Errorf("ReleaseJobs: empty jobIDs slice")
+	}
+	idsBig := make([]*big.Int, len(jobIDs))
+	for i, id := range jobIDs {
+		idsBig[i] = new(big.Int).SetUint64(id)
+	}
+	return c.submitPreparedTx(ctx, "ReleaseJobs", nil, func(opts *bind.TransactOpts) (*types.Transaction, error) {
+		return c.jobRegistry.ReleaseJobs(opts, idsBig)
+	})
+}
+
+// GetJobState reads the on-chain Job struct and returns the subset of fields
+// needed by the release scheduler.
+func (c *ChainClient) GetJobState(ctx context.Context, jobID uint64) (JobStateInfo, error) {
+	if err := c.requireJobRegistry(); err != nil {
+		return JobStateInfo{}, err
+	}
+	job, err := c.jobRegistry.GetJob(&bind.CallOpts{Context: ctx}, new(big.Int).SetUint64(jobID))
+	if err != nil {
+		return JobStateInfo{}, fmt.Errorf("GetJob %d: %w", jobID, err)
+	}
+	completedAt := int64(0)
+	if job.CompletedAt != nil {
+		completedAt = job.CompletedAt.Int64()
+	}
+	fee := job.EscrowedFee
+	if fee == nil {
+		fee = new(big.Int)
+	}
+	return JobStateInfo{
+		State:       JobState(job.State),
+		Worker:      job.Worker,
+		CompletedAt: completedAt,
+		EscrowedFee: fee,
+	}, nil
+}
+
+// GetDisputeWindow reads AIConfig.getDisputeWindow() with TTL'd caching. The
+// returned duration is the contract's window in seconds (converted to
+// time.Duration).
+func (c *ChainClient) GetDisputeWindow(ctx context.Context) (time.Duration, error) {
+	c.disputeWindowMu.Lock()
+	if !c.disputeWindowExpires.IsZero() && time.Now().Before(c.disputeWindowExpires) {
+		v := c.disputeWindowValue
+		c.disputeWindowMu.Unlock()
+		return v, nil
+	}
+	c.disputeWindowMu.Unlock()
+
+	raw, err := c.aiConfig.GetDisputeWindow(&bind.CallOpts{Context: ctx})
+	if err != nil {
+		return 0, fmt.Errorf("AIConfig.getDisputeWindow: %w", err)
+	}
+	if raw == nil || raw.Sign() <= 0 {
+		return 0, fmt.Errorf("AIConfig.getDisputeWindow returned non-positive value: %v", raw)
+	}
+	window := time.Duration(raw.Int64()) * time.Second
+
+	c.disputeWindowMu.Lock()
+	defer c.disputeWindowMu.Unlock()
+	ttl := c.disputeWindowCacheTTL
+	if ttl <= 0 {
+		ttl = defaultDisputeWindowCacheTTL
+	}
+	c.disputeWindowValue = window
+	c.disputeWindowExpires = time.Now().Add(ttl)
+	return window, nil
+}
+
+// WorkerBalance returns the withdrawable balance accumulated for `worker`.
+func (c *ChainClient) WorkerBalance(ctx context.Context, worker common.Address) (*big.Int, error) {
+	if err := c.requireJobRegistry(); err != nil {
+		return nil, err
+	}
+	bal, err := c.jobRegistry.WorkerBalance(&bind.CallOpts{Context: ctx}, worker)
+	if err != nil {
+		return nil, fmt.Errorf("WorkerBalance %s: %w", worker.Hex(), err)
+	}
+	if bal == nil {
+		return new(big.Int), nil
+	}
+	return bal, nil
+}
+
+// Withdraw moves the calling address's full workerBalance to itself. The
+// contract sends ETH to msg.sender; there is no destination parameter.
+func (c *ChainClient) Withdraw(ctx context.Context) error {
+	if err := c.requireJobRegistry(); err != nil {
+		return err
+	}
+	return c.submitPreparedTx(ctx, "Withdraw", nil, func(opts *bind.TransactOpts) (*types.Transaction, error) {
+		return c.jobRegistry.Withdraw(opts)
+	})
+}
+
+// Head returns the latest block number and timestamp. Used to make settlement
+// decisions against block.timestamp instead of wall-clock time.
+func (c *ChainClient) Head(ctx context.Context) (HeadInfo, error) {
+	header, err := c.ethClient.HeaderByNumber(ctx, nil)
+	if err != nil {
+		return HeadInfo{}, fmt.Errorf("HeaderByNumber(latest): %w", err)
+	}
+	if header.Number == nil {
+		return HeadInfo{}, fmt.Errorf("HeaderByNumber returned nil block number")
+	}
+	return HeadInfo{
+		Number:    header.Number.Uint64(),
+		Timestamp: int64(header.Time),
+	}, nil
+}
+
+// FilterJobCompleted iterates JobCompleted events emitted by `worker` in
+// [fromBlock, toBlock] (both inclusive). The worker filter uses the indexed
+// event topic so filtering happens on the node side.
+func (c *ChainClient) FilterJobCompleted(
+	ctx context.Context,
+	worker common.Address,
+	fromBlock, toBlock uint64,
+) ([]JobCompletedEvent, error) {
+	if err := c.requireJobRegistry(); err != nil {
+		return nil, err
+	}
+	if toBlock < fromBlock {
+		return nil, fmt.Errorf("FilterJobCompleted: toBlock %d < fromBlock %d", toBlock, fromBlock)
+	}
+	endBlock := toBlock
+	opts := &bind.FilterOpts{
+		Context: ctx,
+		Start:   fromBlock,
+		End:     &endBlock,
+	}
+	iter, err := c.jobRegistry.FilterJobCompleted(opts, nil, []common.Address{worker})
+	if err != nil {
+		return nil, fmt.Errorf("filter JobCompleted [%d..%d] for %s: %w", fromBlock, toBlock, worker.Hex(), err)
+	}
+	defer iter.Close()
+
+	var events []JobCompletedEvent
+	for iter.Next() {
+		ev := iter.Event
+		if ev == nil || ev.JobId == nil {
+			continue
+		}
+		events = append(events, JobCompletedEvent{
+			JobID:       ev.JobId.Uint64(),
+			Worker:      ev.Worker,
+			BlockNumber: ev.Raw.BlockNumber,
+		})
+	}
+	if err := iter.Error(); err != nil {
+		return nil, fmt.Errorf("iterate JobCompleted [%d..%d]: %w", fromBlock, toBlock, err)
+	}
+	return events, nil
 }
