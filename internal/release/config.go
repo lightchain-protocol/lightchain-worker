@@ -2,6 +2,8 @@ package release
 
 import (
 	"fmt"
+	"os"
+	"strconv"
 	"time"
 )
 
@@ -111,6 +113,103 @@ func DefaultConfig() Config {
 		DisputeWindowOverride: 0,
 		DisputeWindowCacheTTL: 15 * time.Minute,
 	}
+}
+
+// ConfigFromEnv builds a Config by overlaying RELEASE_* environment
+// variables on DefaultConfig(). Used by the worker-cli release subcommand
+// so it does not have to duplicate the sidecar's parsing logic. Errors
+// (invalid duration, etc.) are returned so the caller can fail loudly
+// rather than silently fall back to defaults.
+//
+// The sidecar's config.Config has its own equivalent loader; both must
+// stay in sync. A future refactor can extract a shared helper, but the
+// duplication is small enough that copying is preferable to creating a
+// config → release import edge.
+func ConfigFromEnv() (Config, error) {
+	cfg := DefaultConfig()
+	var errs []string
+
+	overrideString := func(key string, target *string) {
+		if v := os.Getenv(key); v != "" {
+			*target = v
+		}
+	}
+	overrideBool := func(key string, target *bool) {
+		if v := os.Getenv(key); v != "" {
+			b, err := strconv.ParseBool(v)
+			if err != nil {
+				errs = append(errs, fmt.Sprintf("%s: invalid bool %q", key, v))
+				return
+			}
+			*target = b
+		}
+	}
+	overrideDuration := func(key string, target *time.Duration) {
+		if v := os.Getenv(key); v != "" {
+			d, err := time.ParseDuration(v)
+			if err != nil {
+				errs = append(errs, fmt.Sprintf("%s: invalid duration %q: %v", key, v, err))
+				return
+			}
+			*target = d
+		}
+	}
+	overrideInt := func(key string, target *int) {
+		if v := os.Getenv(key); v != "" {
+			n, err := strconv.Atoi(v)
+			if err != nil {
+				errs = append(errs, fmt.Sprintf("%s: invalid int %q", key, v))
+				return
+			}
+			*target = n
+		}
+	}
+	overrideUint64 := func(key string, target *uint64) {
+		if v := os.Getenv(key); v != "" {
+			n, err := strconv.ParseUint(v, 10, 64)
+			if err != nil {
+				errs = append(errs, fmt.Sprintf("%s: invalid uint64 %q", key, v))
+				return
+			}
+			*target = n
+		}
+	}
+
+	overrideBool("RELEASE_ENABLED", &cfg.Enabled)
+	overrideString("RELEASE_STATE_PATH", &cfg.StatePath)
+	overrideDuration("RELEASE_INTERVAL", &cfg.Interval)
+	overrideDuration("RELEASE_PROBE_INTERVAL", &cfg.ProbeInterval)
+	overrideInt("RELEASE_BATCH_THRESHOLD", &cfg.BatchThreshold)
+	overrideInt("RELEASE_MAX_BATCH_SIZE", &cfg.MaxBatchSize)
+	overrideDuration("RELEASE_TX_TIMEOUT", &cfg.TxTimeout)
+	overrideUint64("RELEASE_RECONCILE_START_BLOCK", &cfg.StartBlock)
+	overrideUint64("RELEASE_RECONCILE_CHUNK_SIZE", &cfg.ChunkSize)
+	overrideUint64("RELEASE_RECONCILE_CONFIRMATIONS", &cfg.Confirmations)
+	overrideDuration("RELEASE_RECONCILE_INTERVAL", &cfg.ReconcileInterval)
+	overrideDuration("RELEASE_BACKOFF_BASE", &cfg.BackoffBase)
+	overrideDuration("RELEASE_BACKOFF_MAX", &cfg.BackoffMax)
+	overrideDuration("RELEASE_PAUSED_CYCLE_BACKOFF", &cfg.PausedCycleBackoff)
+	overrideDuration("RELEASE_STALE_DISPUTE_WARN_AFTER", &cfg.StaleDisputeWarnAfter)
+	overrideDuration("RELEASE_DISPUTE_WINDOW_OVERRIDE", &cfg.DisputeWindowOverride)
+	overrideDuration("RELEASE_DISPUTE_WINDOW_CACHE_TTL", &cfg.DisputeWindowCacheTTL)
+
+	if len(errs) > 0 {
+		return Config{}, fmt.Errorf("release config from env:\n  - %s", joinStrings(errs, "\n  - "))
+	}
+	return cfg, nil
+}
+
+// joinStrings is a tiny stdlib-free reimplementation of strings.Join, kept
+// local so this package does not pull in strings just for one helper.
+func joinStrings(items []string, sep string) string {
+	if len(items) == 0 {
+		return ""
+	}
+	out := items[0]
+	for _, s := range items[1:] {
+		out += sep + s
+	}
+	return out
 }
 
 // Validate returns a slice of error strings describing config violations.
