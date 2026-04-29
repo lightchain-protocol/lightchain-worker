@@ -4,6 +4,7 @@ import (
 	"os"
 	"testing"
 
+	"github.com/ethereum/go-ethereum/common"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -14,6 +15,7 @@ var allRegEnvKeys = []string{
 	"ENCRYPTION_KEYSTORE_PATH",
 	"RPC_URL", "CHAIN_ID",
 	"WORKER_REGISTRY_ADDRESS", "AI_CONFIG_ADDRESS",
+	"JOB_REGISTRY_ADDRESS",
 	"SUPPORTED_MODELS", "WORKER_STAKE",
 	"GAS_PRICE_MULTIPLIER_BPS", "MAX_GAS_PRICE",
 	"LOG_LEVEL", "LOG_FORMAT",
@@ -100,6 +102,64 @@ func TestLoadRegistration_NegativeStake(t *testing.T) {
 	_, err := LoadRegistration()
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "WORKER_STAKE: must be non-negative")
+}
+
+func TestLoadRegistration_JobRegistryAddress_OptionalAtLoad(t *testing.T) {
+	validRegEnv(t)
+	// JOB_REGISTRY_ADDRESS not set — load should succeed; field stays zero.
+
+	cfg, err := LoadRegistration()
+	require.NoError(t, err)
+	assert.Equal(t, common.Address{}, cfg.JobRegistryAddress)
+}
+
+func TestLoadRegistration_JobRegistryAddress_Provided(t *testing.T) {
+	validRegEnv(t)
+	t.Setenv("JOB_REGISTRY_ADDRESS", "0xcccccccccccccccccccccccccccccccccccccccc")
+
+	cfg, err := LoadRegistration()
+	require.NoError(t, err)
+	assert.Equal(t,
+		common.HexToAddress("0xcccccccccccccccccccccccccccccccccccccccc"),
+		cfg.JobRegistryAddress,
+	)
+}
+
+func TestLoadRegistration_JobRegistryAddress_InvalidHex(t *testing.T) {
+	validRegEnv(t)
+	t.Setenv("JOB_REGISTRY_ADDRESS", "not-an-address")
+
+	_, err := LoadRegistration()
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "JOB_REGISTRY_ADDRESS")
+}
+
+func TestValidateForSettlement_MissingJobRegistry(t *testing.T) {
+	validRegEnv(t)
+	t.Setenv("WORKER_KEYSTORE_PATH", "/tmp/keystore.json")
+	t.Setenv("WORKER_KEYSTORE_PASSWORD", "secret")
+	cfg, err := LoadRegistration()
+	require.NoError(t, err)
+
+	// Validate() does not require JobRegistryAddress.
+	assert.Empty(t, cfg.Validate(), "non-settlement validation must not require JobRegistryAddress")
+
+	// ValidateForSettlement() does require it.
+	settlementErrs := cfg.ValidateForSettlement()
+	require.NotEmpty(t, settlementErrs)
+	assert.Contains(t, settlementErrs[0], "JOB_REGISTRY_ADDRESS")
+}
+
+func TestValidateForSettlement_Provided(t *testing.T) {
+	validRegEnv(t)
+	t.Setenv("WORKER_KEYSTORE_PATH", "/tmp/keystore.json")
+	t.Setenv("WORKER_KEYSTORE_PASSWORD", "secret")
+	t.Setenv("JOB_REGISTRY_ADDRESS", "0xcccccccccccccccccccccccccccccccccccccccc")
+
+	cfg, err := LoadRegistration()
+	require.NoError(t, err)
+	assert.Empty(t, cfg.Validate())
+	assert.Empty(t, cfg.ValidateForSettlement())
 }
 
 func TestLoadRegistration_Validate_MissingKeystore(t *testing.T) {

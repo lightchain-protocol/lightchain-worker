@@ -299,14 +299,19 @@ func parseModels(cfg *config.RegistrationConfig, logger *slog.Logger) ([][32]byt
 	return modelIDs, cfg.SupportedModels
 }
 
-// dialChain creates a ChainClient for the CLI.
+// dialChain creates a ChainClient for the CLI. cfg.JobRegistryAddress may be
+// the zero address for non-settlement subcommands; chain.NewChainClient
+// conditionally binds JobRegistry only when the address is non-zero.
+// Settlement subcommands (balance, withdraw, release) must call
+// cfg.ValidateForSettlement() before calling dialChain so misconfiguration
+// fails loudly rather than producing nil-binding panics later.
 func dialChain(cfg *config.RegistrationConfig, signingKey *ecdsa.PrivateKey, logger *slog.Logger) *chain.ChainClient {
 	client, err := chain.NewChainClient(
 		cfg.RPCURL,
 		cfg.ChainID,
 		cfg.WorkerRegistryAddress,
 		cfg.AIConfigAddress,
-		common.Address{}, // jobRegistryAddr — not needed for CLI operations
+		cfg.JobRegistryAddress,
 		signingKey,
 		cfg.GasPriceMultiplierBps,
 		// CLI is single-threaded — no concurrent broadcasts possible, so

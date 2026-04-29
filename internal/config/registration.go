@@ -25,6 +25,10 @@ type RegistrationConfig struct {
 	ChainID               int64
 	WorkerRegistryAddress common.Address
 	AIConfigAddress       common.Address
+	// JobRegistryAddress is required only for settlement subcommands
+	// (balance, withdraw, release). Other subcommands leave it as the zero
+	// address; chain.NewChainClient skips the JobRegistry binding when zero.
+	JobRegistryAddress common.Address
 
 	// Models — comma-separated list
 	SupportedModels []string
@@ -88,6 +92,16 @@ func LoadRegistration() (*RegistrationConfig, error) {
 		errs = append(errs, fmt.Sprintf("AI_CONFIG_ADDRESS: invalid hex address %q", aiConfigStr))
 	} else {
 		cfg.AIConfigAddress = common.HexToAddress(aiConfigStr)
+	}
+
+	// JobRegistryAddress — optional at load time; required only for settlement
+	// subcommands (balance, withdraw, release) via ValidateForSettlement.
+	if jobRegStr := os.Getenv("JOB_REGISTRY_ADDRESS"); jobRegStr != "" {
+		if !common.IsHexAddress(jobRegStr) {
+			errs = append(errs, fmt.Sprintf("JOB_REGISTRY_ADDRESS: invalid hex address %q", jobRegStr))
+		} else {
+			cfg.JobRegistryAddress = common.HexToAddress(jobRegStr)
+		}
 	}
 
 	// SupportedModels — required for register/add-models; may be empty for other commands
@@ -162,5 +176,16 @@ func (c *RegistrationConfig) Validate() []string {
 		errs = append(errs, fmt.Sprintf("LOG_FORMAT: must be \"json\" or \"text\", got %q", c.LogFormat))
 	}
 
+	return errs
+}
+
+// ValidateForSettlement adds checks required only by settlement subcommands
+// (balance, withdraw, release). Callers should run Validate() first and merge
+// the returned slices, since these checks are additive.
+func (c *RegistrationConfig) ValidateForSettlement() []string {
+	var errs []string
+	if c.JobRegistryAddress == (common.Address{}) {
+		errs = append(errs, "JOB_REGISTRY_ADDRESS must be a non-zero address for balance/withdraw/release")
+	}
 	return errs
 }
