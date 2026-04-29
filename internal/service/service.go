@@ -33,6 +33,7 @@ import (
 	"github.com/lightchain/worker/internal/ollama"
 	"github.com/lightchain/worker/internal/pipeline"
 	"github.com/lightchain/worker/internal/registration"
+	"github.com/lightchain/worker/internal/release"
 )
 
 // startupHeartbeatTimeout is the maximum time allowed for the initial heartbeat
@@ -60,6 +61,40 @@ type Service struct {
 	// Gateway mode (non-nil when WORKER_GATEWAY_URL is set)
 	gwClient  *gw.Client
 	gwHandler *pipeline.JobHandler
+
+	// Release subsystem. Store is always non-nil (the Tracker writes to it
+	// from the pipeline regardless of cfg.ReleaseEnabled). Scheduler and
+	// Reconciler are nil when ReleaseEnabled=false; in that case the
+	// operator is expected to settle via worker-cli release.
+	releaseStore      release.Store
+	releaseTracker    *release.Tracker
+	releaseScheduler  *release.Scheduler
+	releaseReconciler *release.Reconciler
+}
+
+// buildReleaseConfig translates the flat env-var fields on config.Config
+// into the release package's typed Config. Lives in the service package so
+// the release package never has to import config (which would cycle).
+func buildReleaseConfig(cfg *config.Config) release.Config {
+	return release.Config{
+		Enabled:               cfg.ReleaseEnabled,
+		StatePath:             cfg.ReleaseStatePath,
+		Interval:              cfg.ReleaseInterval,
+		ProbeInterval:         cfg.ReleaseProbeInterval,
+		BatchThreshold:        cfg.ReleaseBatchThreshold,
+		MaxBatchSize:          cfg.ReleaseMaxBatchSize,
+		TxTimeout:             cfg.ReleaseTxTimeout,
+		StartBlock:            cfg.ReleaseStartBlock,
+		ChunkSize:             cfg.ReleaseChunkSize,
+		Confirmations:         cfg.ReleaseConfirmations,
+		ReconcileInterval:     cfg.ReleaseReconcileInterval,
+		BackoffBase:           cfg.ReleaseBackoffBase,
+		BackoffMax:            cfg.ReleaseBackoffMax,
+		PausedCycleBackoff:    cfg.ReleasePausedCycleBackoff,
+		StaleDisputeWarnAfter: cfg.ReleaseStaleDisputeWarnAfter,
+		DisputeWindowOverride: cfg.ReleaseDisputeWindowOverride,
+		DisputeWindowCacheTTL: cfg.ReleaseDisputeWindowCacheTTL,
+	}
 }
 
 // New initializes all components: loads keys, dials chain + Redis, registers on-chain,
@@ -283,6 +318,44 @@ func New(cfg *config.Config) (*Service, error) {
 		)
 	}
 
+	// Release subsystem. The Store opens with chain/contract/worker
+	// identity — mismatches fail loudly so a worker can never settle the
+	// wrong chain's jobs. The Tracker is wired into the pipeline handler
+	// below regardless of cfg.ReleaseEnabled; if the scheduler is off, the
+	// Tracker still records eligibility so worker-cli release can settle
+	// later.
+	releaseStore, err := release.NewFileStore(cfg.ReleaseStatePath, release.StoreIdentity{
+		ChainID:       uint64(cfg.ChainID),
+		JobRegistry:   cfg.JobRegistryAddress,
+		WorkerAddress: workerAddr,
+	}, logger)
+	if err != nil {
+		if redisClient != nil {
+			_ = redisClient.Close()
+		}
+		chainClient.Close()
+		return nil, fmt.Errorf("open release store: %w", err)
+	}
+	releaseTracker := release.NewTracker(releaseStore, logger)
+	chainClient.SetDisputeWindowCacheTTL(cfg.ReleaseDisputeWindowCacheTTL)
+
+	releaseCfg := buildReleaseConfig(cfg)
+	var releaseScheduler *release.Scheduler
+	var releaseReconciler *release.Reconciler
+	if cfg.ReleaseEnabled {
+		releaseReconciler = release.NewReconciler(releaseStore, chainClient, workerAddr, releaseCfg, logger)
+		// Run a startup reconciliation pass best-effort. Errors are logged
+		// but never fatal — the periodic reconciler retries on its own
+		// timer.
+		startupRecCtx, startupRecCancel := context.WithTimeout(context.Background(), 30*time.Second)
+		if recErr := releaseReconciler.Run(startupRecCtx); recErr != nil {
+			logger.Warn("startup reconciliation failed; periodic reconciler will retry",
+				"error", recErr)
+		}
+		startupRecCancel()
+		releaseScheduler = release.NewScheduler(releaseStore, chainClient, workerAddr, releaseCfg, logger)
+	}
+
 	// Job pipeline handler
 	handler := pipeline.NewJobHandler(
 		chainClient,
@@ -307,6 +380,7 @@ func New(cfg *config.Config) (*Service, error) {
 		metricsCollector,
 		metrics.DeliveryAsynq,
 	)
+	handler.SetReleaseTracker(releaseTracker)
 
 	// --- Gateway mode: skip Asynq and direct Redis heartbeat ---
 	if cfg.WorkerGatewayURL != "" {
@@ -352,6 +426,7 @@ func New(cfg *config.Config) (*Service, error) {
 			metricsCollector,
 			metrics.DeliveryGateway,
 		)
+		gwHandler.SetReleaseTracker(releaseTracker)
 
 		logger.Info("worker service initialized (gateway mode)",
 			"address", workerAddr.Hex(),
@@ -376,17 +451,21 @@ func New(cfg *config.Config) (*Service, error) {
 		}
 
 		return &Service{
-			cfg:             cfg,
-			chainClient:     chainClient,
-			coordinator:     coordinator,
-			redis:           redisClient,
-			sessionKeyStore: sessionKeyStore,
-			jobCounter:      jobCounter,
-			logger:          logger,
-			metrics:         metricsCollector,
-			metricsServer:   buildMetricsServer(cfg, metricsCollector),
-			gwClient:        gwClient,
-			gwHandler:       gwHandler,
+			cfg:               cfg,
+			chainClient:       chainClient,
+			coordinator:       coordinator,
+			redis:             redisClient,
+			sessionKeyStore:   sessionKeyStore,
+			jobCounter:        jobCounter,
+			logger:            logger,
+			metrics:           metricsCollector,
+			metricsServer:     buildMetricsServer(cfg, metricsCollector),
+			gwClient:          gwClient,
+			gwHandler:         gwHandler,
+			releaseStore:      releaseStore,
+			releaseTracker:    releaseTracker,
+			releaseScheduler:  releaseScheduler,
+			releaseReconciler: releaseReconciler,
 		}, nil
 	}
 
@@ -455,18 +534,22 @@ func New(cfg *config.Config) (*Service, error) {
 	}
 
 	return &Service{
-		cfg:             cfg,
-		chainClient:     chainClient,
-		coordinator:     coordinator,
-		redis:           redisClient,
-		monitor:         monitor,
-		asynqServer:     asynqSrv,
-		asynqMux:        mux,
-		sessionKeyStore: sessionKeyStore,
-		jobCounter:      jobCounter,
-		logger:          logger,
-		metrics:         metricsCollector,
-		metricsServer:   buildMetricsServer(cfg, metricsCollector),
+		cfg:               cfg,
+		chainClient:       chainClient,
+		coordinator:       coordinator,
+		redis:             redisClient,
+		monitor:           monitor,
+		asynqServer:       asynqSrv,
+		asynqMux:          mux,
+		sessionKeyStore:   sessionKeyStore,
+		jobCounter:        jobCounter,
+		logger:            logger,
+		metrics:           metricsCollector,
+		metricsServer:     buildMetricsServer(cfg, metricsCollector),
+		releaseStore:      releaseStore,
+		releaseTracker:    releaseTracker,
+		releaseScheduler:  releaseScheduler,
+		releaseReconciler: releaseReconciler,
 	}, nil
 }
 
@@ -545,6 +628,7 @@ func (s *Service) Run(ctx context.Context) error {
 
 	// Direct Redis mode
 	s.monitor.Start(runCtx)
+	s.startReleaseSubsystem(runCtx)
 
 	asynqErrCh := make(chan error, 1)
 	go func() {
@@ -590,6 +674,9 @@ func (s *Service) Run(ctx context.Context) error {
 func (s *Service) runGatewayMode(ctx context.Context, cancel context.CancelFunc) error {
 	s.logger.Info("worker sidecar running (gateway mode) — waiting for shutdown signal")
 
+	// Release subsystem runs identically in both modes.
+	s.startReleaseSubsystem(ctx)
+
 	// Heartbeat loop (HTTP POST, unchanged)
 	go func() {
 		ticker := time.NewTicker(s.cfg.HeartbeatInterval)
@@ -629,6 +716,26 @@ func (s *Service) runGatewayMode(ctx context.Context, cancel context.CancelFunc)
 	return s.shutdown(shutdownCtx)
 }
 
+// startReleaseSubsystem launches the Scheduler and the periodic Reconciler.
+// No-op when ReleaseEnabled=false. Safe to call exactly once per Service.
+func (s *Service) startReleaseSubsystem(ctx context.Context) {
+	if s.releaseScheduler == nil && s.releaseReconciler == nil {
+		s.logger.Info("release subsystem disabled (RELEASE_ENABLED=false); operator must run worker-cli release")
+		return
+	}
+	if s.releaseReconciler != nil {
+		s.releaseReconciler.StartPeriodic(ctx)
+	}
+	if s.releaseScheduler != nil {
+		s.releaseScheduler.Start(ctx)
+	}
+	s.logger.Info("release subsystem started",
+		"interval", s.cfg.ReleaseInterval,
+		"probe_interval", s.cfg.ReleaseProbeInterval,
+		"reconcile_interval", s.cfg.ReleaseReconcileInterval,
+	)
+}
+
 // shutdown coordinates all cleanup steps within the given context deadline.
 func (s *Service) shutdown(ctx context.Context) error {
 	var shutdownErr error
@@ -664,6 +771,38 @@ func (s *Service) shutdown(ctx context.Context) error {
 		case <-monitorDone:
 		case <-ctx.Done():
 			s.logger.Warn("heartbeat monitor stop timed out")
+		}
+	}
+
+	// Stop release subsystem before closing the chain client, since the
+	// scheduler/reconciler goroutines may still be holding a chain call.
+	if s.releaseScheduler != nil {
+		schedDone := make(chan struct{})
+		go func() {
+			s.releaseScheduler.Stop()
+			close(schedDone)
+		}()
+		select {
+		case <-schedDone:
+		case <-ctx.Done():
+			s.logger.Warn("release scheduler stop timed out")
+		}
+	}
+	if s.releaseReconciler != nil {
+		recDone := make(chan struct{})
+		go func() {
+			s.releaseReconciler.StopPeriodic()
+			close(recDone)
+		}()
+		select {
+		case <-recDone:
+		case <-ctx.Done():
+			s.logger.Warn("release reconciler stop timed out")
+		}
+	}
+	if s.releaseStore != nil {
+		if err := s.releaseStore.Close(); err != nil {
+			s.logger.Warn("release store close error", "error", err)
 		}
 	}
 

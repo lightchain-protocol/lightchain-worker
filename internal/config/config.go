@@ -116,6 +116,28 @@ type Config struct {
 	MetricsListenAddr  string
 	MetricsAllowPublic bool
 
+	// Release scheduler — settles completed jobs on-chain after the
+	// dispute window. ReleaseEnabled gates the entire subsystem; when
+	// false the pipeline still runs (no MarkEligible writes occur)
+	// and the operator settles via worker-cli release.
+	ReleaseEnabled               bool
+	ReleaseStatePath             string
+	ReleaseInterval              time.Duration
+	ReleaseProbeInterval         time.Duration
+	ReleaseBatchThreshold        int
+	ReleaseMaxBatchSize          int
+	ReleaseTxTimeout             time.Duration
+	ReleaseStartBlock            uint64
+	ReleaseChunkSize             uint64
+	ReleaseConfirmations         uint64
+	ReleaseReconcileInterval     time.Duration
+	ReleaseBackoffBase           time.Duration
+	ReleaseBackoffMax            time.Duration
+	ReleasePausedCycleBackoff    time.Duration
+	ReleaseStaleDisputeWarnAfter time.Duration
+	ReleaseDisputeWindowOverride time.Duration
+	ReleaseDisputeWindowCacheTTL time.Duration
+
 	// Logging
 	LogLevel  string
 	LogFormat string
@@ -246,6 +268,26 @@ func Load() (*Config, error) {
 	cfg.CheckpointTTL = parseDuration("WORKER_CHECKPOINT_TTL", "2h", &errs)
 	cfg.CheckpointMaxBytes = parseInt("WORKER_CHECKPOINT_MAX_BYTES", 262144, &errs)
 
+	// Release scheduler. Defaults match release.DefaultConfig() — when
+	// they drift, both must be updated.
+	cfg.ReleaseEnabled = parseBool("RELEASE_ENABLED", true, &errs)
+	cfg.ReleaseStatePath = envOrDefault("RELEASE_STATE_PATH", "./release_state.json")
+	cfg.ReleaseInterval = parseDuration("RELEASE_INTERVAL", "8h", &errs)
+	cfg.ReleaseProbeInterval = parseDuration("RELEASE_PROBE_INTERVAL", "5m", &errs)
+	cfg.ReleaseBatchThreshold = parseInt("RELEASE_BATCH_THRESHOLD", 20, &errs)
+	cfg.ReleaseMaxBatchSize = parseInt("RELEASE_MAX_BATCH_SIZE", 50, &errs)
+	cfg.ReleaseTxTimeout = parseDuration("RELEASE_TX_TIMEOUT", "120s", &errs)
+	cfg.ReleaseStartBlock = parseUint64("RELEASE_RECONCILE_START_BLOCK", 0, &errs)
+	cfg.ReleaseChunkSize = parseUint64("RELEASE_RECONCILE_CHUNK_SIZE", 5000, &errs)
+	cfg.ReleaseConfirmations = parseUint64("RELEASE_RECONCILE_CONFIRMATIONS", 5, &errs)
+	cfg.ReleaseReconcileInterval = parseDuration("RELEASE_RECONCILE_INTERVAL", "1h", &errs)
+	cfg.ReleaseBackoffBase = parseDuration("RELEASE_BACKOFF_BASE", "15m", &errs)
+	cfg.ReleaseBackoffMax = parseDuration("RELEASE_BACKOFF_MAX", "24h", &errs)
+	cfg.ReleasePausedCycleBackoff = parseDuration("RELEASE_PAUSED_CYCLE_BACKOFF", "1h", &errs)
+	cfg.ReleaseStaleDisputeWarnAfter = parseDuration("RELEASE_STALE_DISPUTE_WARN_AFTER", "168h", &errs)
+	cfg.ReleaseDisputeWindowOverride = parseDuration("RELEASE_DISPUTE_WINDOW_OVERRIDE", "0s", &errs)
+	cfg.ReleaseDisputeWindowCacheTTL = parseDuration("RELEASE_DISPUTE_WINDOW_CACHE_TTL", "15m", &errs)
+
 	if len(errs) > 0 {
 		return nil, fmt.Errorf("config load errors:\n  - %s", strings.Join(errs, "\n  - "))
 	}
@@ -324,6 +366,52 @@ func (c *Config) Validate() []string {
 	}
 	if err := metrics.ValidateListenAddr(c.MetricsListenAddr, c.MetricsAllowPublic); err != nil {
 		errs = append(errs, fmt.Sprintf("WORKER_METRICS_ADDR: %v", err))
+	}
+
+	// Release scheduler validation. The Tracker needs StatePath even when
+	// the rest of the subsystem is disabled, so it is checked regardless.
+	if c.ReleaseStatePath == "" {
+		errs = append(errs, "RELEASE_STATE_PATH must not be empty")
+	}
+	if c.ReleaseEnabled {
+		if c.ReleaseInterval <= 0 {
+			errs = append(errs, "RELEASE_INTERVAL must be positive")
+		}
+		if c.ReleaseProbeInterval <= 0 {
+			errs = append(errs, "RELEASE_PROBE_INTERVAL must be positive")
+		}
+		if c.ReleaseProbeInterval > c.ReleaseInterval {
+			errs = append(errs, fmt.Sprintf("RELEASE_PROBE_INTERVAL (%s) must be ≤ RELEASE_INTERVAL (%s)",
+				c.ReleaseProbeInterval, c.ReleaseInterval))
+		}
+		if c.ReleaseBatchThreshold < 1 {
+			errs = append(errs, "RELEASE_BATCH_THRESHOLD must be ≥ 1")
+		}
+		if c.ReleaseMaxBatchSize < 1 {
+			errs = append(errs, "RELEASE_MAX_BATCH_SIZE must be ≥ 1")
+		}
+		if c.ReleaseTxTimeout <= 0 {
+			errs = append(errs, "RELEASE_TX_TIMEOUT must be positive")
+		}
+		if c.ReleaseChunkSize == 0 {
+			errs = append(errs, "RELEASE_RECONCILE_CHUNK_SIZE must be ≥ 1")
+		}
+		if c.ReleaseReconcileInterval <= 0 {
+			errs = append(errs, "RELEASE_RECONCILE_INTERVAL must be positive")
+		}
+		if c.ReleaseBackoffBase <= 0 {
+			errs = append(errs, "RELEASE_BACKOFF_BASE must be positive")
+		}
+		if c.ReleaseBackoffMax < c.ReleaseBackoffBase {
+			errs = append(errs, fmt.Sprintf("RELEASE_BACKOFF_MAX (%s) must be ≥ RELEASE_BACKOFF_BASE (%s)",
+				c.ReleaseBackoffMax, c.ReleaseBackoffBase))
+		}
+		if c.ReleasePausedCycleBackoff <= 0 {
+			errs = append(errs, "RELEASE_PAUSED_CYCLE_BACKOFF must be positive")
+		}
+		if c.ReleaseDisputeWindowCacheTTL < 0 {
+			errs = append(errs, "RELEASE_DISPUTE_WINDOW_CACHE_TTL must be ≥ 0")
+		}
 	}
 
 	return errs
@@ -418,6 +506,29 @@ func parseBool(key string, defaultVal bool, errs *[]string) bool {
 		*errs = append(*errs, fmt.Sprintf("%s: invalid boolean %q", key, raw))
 		return defaultVal
 	}
+}
+
+// parseUint64 reads an env var as a non-negative integer that fits in uint64.
+// Returns defaultVal on empty/missing.
+func parseUint64(key string, defaultVal uint64, errs *[]string) uint64 {
+	raw := os.Getenv(key)
+	if raw == "" {
+		return defaultVal
+	}
+	v := new(big.Int)
+	if _, ok := v.SetString(raw, 10); !ok {
+		*errs = append(*errs, fmt.Sprintf("%s: invalid integer %q", key, raw))
+		return defaultVal
+	}
+	if v.Sign() < 0 {
+		*errs = append(*errs, fmt.Sprintf("%s: must be non-negative", key))
+		return defaultVal
+	}
+	if !v.IsUint64() {
+		*errs = append(*errs, fmt.Sprintf("%s: value %q overflows uint64", key, raw))
+		return defaultVal
+	}
+	return v.Uint64()
 }
 
 func parseInt(key string, defaultVal int, errs *[]string) int {
