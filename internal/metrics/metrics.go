@@ -126,6 +126,15 @@ type Metrics struct {
 	OllamaUp          prometheus.Gauge
 	HeartbeatLastEmit prometheus.Gauge
 
+	// Release subsystem.
+	ReleasePending             prometheus.Gauge   // current count of pending jobs awaiting settlement
+	ReleaseReleasedTotal       prometheus.Counter // jobs successfully released (cumulative)
+	ReleaseFailedTotal         prometheus.Counter // per-job release failures (post-fallback)
+	ReleaseDroppedTotal        *prometheus.CounterVec // labels: reason (terminal_state | foreign_worker | resolved_zero_escrow)
+	ReleasePauseEventsTotal    prometheus.Counter // batch reverts classified as pause-class
+	ReleaseLastSuccessTimestamp prometheus.Gauge  // unix seconds of last successful release tx
+	ReleaseReconcileLastBlock  prometheus.Gauge   // last block number reconciled
+
 	// modelAllowlist gates the {model} label. Captured at construction so
 	// each *Metrics is isolated from any other (parallel tests, multiple
 	// service instances in a process). Lowercased on insertion.
@@ -201,6 +210,41 @@ func New(modelAllowlist []string) *Metrics {
 		HeartbeatLastEmit: f.NewGauge(prometheus.GaugeOpts{
 			Name: "worker_heartbeat_last_emit_timestamp_seconds",
 			Help: "Unix timestamp of the last successful heartbeat write to Redis.",
+		}),
+
+		ReleasePending: f.NewGauge(prometheus.GaugeOpts{
+			Name: "worker_release_pending",
+			Help: "Current number of jobs awaiting on-chain release in the local store.",
+		}),
+
+		ReleaseReleasedTotal: f.NewCounter(prometheus.CounterOpts{
+			Name: "worker_release_released_total",
+			Help: "Cumulative count of jobs successfully released on-chain.",
+		}),
+
+		ReleaseFailedTotal: f.NewCounter(prometheus.CounterOpts{
+			Name: "worker_release_failed_total",
+			Help: "Per-job release failures after batch fallback. Pause-class cycle reverts are tracked separately by worker_release_pause_events_total.",
+		}),
+
+		ReleaseDroppedTotal: f.NewCounterVec(prometheus.CounterOpts{
+			Name: "worker_release_dropped_total",
+			Help: "Pending entries dropped without release. reason in {terminal_state, foreign_worker, resolved_zero_escrow}.",
+		}, []string{"reason"}),
+
+		ReleasePauseEventsTotal: f.NewCounter(prometheus.CounterOpts{
+			Name: "worker_release_pause_events_total",
+			Help: "Batch release reverts classified as pause-class (Pausable: paused / EnforcedPause).",
+		}),
+
+		ReleaseLastSuccessTimestamp: f.NewGauge(prometheus.GaugeOpts{
+			Name: "worker_release_last_success_timestamp_seconds",
+			Help: "Chain timestamp of the last successful release transaction.",
+		}),
+
+		ReleaseReconcileLastBlock: f.NewGauge(prometheus.GaugeOpts{
+			Name: "worker_release_reconcile_last_block",
+			Help: "Highest block number scanned by the release reconciler.",
 		}),
 	}
 }

@@ -72,6 +72,25 @@ type Service struct {
 	releaseReconciler *release.Reconciler
 }
 
+// releaseMetricsAdapter bridges release.Metrics (a tiny consumer-side
+// interface) to the worker's Prometheus collectors. Service constructs
+// one instance and passes it to both the Scheduler and the Reconciler.
+type releaseMetricsAdapter struct{ m *metrics.Metrics }
+
+func (a releaseMetricsAdapter) SetPending(n int)  { a.m.ReleasePending.Set(float64(n)) }
+func (a releaseMetricsAdapter) IncReleased(n int) { a.m.ReleaseReleasedTotal.Add(float64(n)) }
+func (a releaseMetricsAdapter) IncFailed(n int)   { a.m.ReleaseFailedTotal.Add(float64(n)) }
+func (a releaseMetricsAdapter) IncDropped(reason string) {
+	a.m.ReleaseDroppedTotal.WithLabelValues(reason).Inc()
+}
+func (a releaseMetricsAdapter) IncPauseEvent() { a.m.ReleasePauseEventsTotal.Inc() }
+func (a releaseMetricsAdapter) SetLastSuccessTimestamp(ts int64) {
+	a.m.ReleaseLastSuccessTimestamp.Set(float64(ts))
+}
+func (a releaseMetricsAdapter) SetReconcileLastBlock(block uint64) {
+	a.m.ReleaseReconcileLastBlock.Set(float64(block))
+}
+
 // buildReleaseConfig translates the flat env-var fields on config.Config
 // into the release package's typed Config. Lives in the service package so
 // the release package never has to import config (which would cycle).
@@ -340,10 +359,12 @@ func New(cfg *config.Config) (*Service, error) {
 	chainClient.SetDisputeWindowCacheTTL(cfg.ReleaseDisputeWindowCacheTTL)
 
 	releaseCfg := buildReleaseConfig(cfg)
+	releaseMetrics := releaseMetricsAdapter{m: metricsCollector}
 	var releaseScheduler *release.Scheduler
 	var releaseReconciler *release.Reconciler
 	if cfg.ReleaseEnabled {
 		releaseReconciler = release.NewReconciler(releaseStore, chainClient, workerAddr, releaseCfg, logger)
+		releaseReconciler.SetMetrics(releaseMetrics)
 		// Run a startup reconciliation pass best-effort. Errors are logged
 		// but never fatal — the periodic reconciler retries on its own
 		// timer.
@@ -354,6 +375,7 @@ func New(cfg *config.Config) (*Service, error) {
 		}
 		startupRecCancel()
 		releaseScheduler = release.NewScheduler(releaseStore, chainClient, workerAddr, releaseCfg, logger)
+		releaseScheduler.SetMetrics(releaseMetrics)
 	}
 
 	// Job pipeline handler

@@ -33,6 +33,7 @@ type Scheduler struct {
 	workerAddr common.Address
 	cfg        Config
 	logger     *slog.Logger
+	metrics    Metrics
 
 	done     chan struct{}
 	wg       sync.WaitGroup
@@ -50,8 +51,15 @@ func NewScheduler(store Store, settlement schedulerChain, workerAddr common.Addr
 		workerAddr: workerAddr,
 		cfg:        cfg,
 		logger:     logger,
+		metrics:    noopMetrics{},
 		done:       make(chan struct{}),
 	}
+}
+
+// SetMetrics installs the observability sink. Optional; defaults to a
+// silent no-op. Must be called before Start.
+func (s *Scheduler) SetMetrics(m Metrics) {
+	s.metrics = callMetrics(m)
 }
 
 // Start launches the background goroutine. Returns immediately.
@@ -109,6 +117,7 @@ func (s *Scheduler) tick(ctx context.Context) {
 		s.logger.Warn("scheduler: read pending failed", "err", err)
 		return
 	}
+	s.metrics.SetPending(len(pending))
 
 	lastReleaseTs, err := s.store.GetLastReleaseTs(cycleCtx)
 	if err != nil {
@@ -173,6 +182,8 @@ func (s *Scheduler) runReleaseCycle(ctx context.Context, head chain.HeadInfo, wi
 			s.logger.Warn("scheduler: post-release Remove failed",
 				"count", len(releaseBatch), "err", rErr)
 		}
+		s.metrics.IncReleased(len(releaseBatch))
+		s.metrics.SetLastSuccessTimestamp(head.Timestamp)
 		s.logger.Info("scheduler: batch release succeeded",
 			"released", len(releaseBatch), "head_block", head.Number)
 		s.recordAttempt(ctx, head.Timestamp)
@@ -181,6 +192,7 @@ func (s *Scheduler) runReleaseCycle(ctx context.Context, head chain.HeadInfo, wi
 
 	// Batch revert. Classify the error.
 	if isPauseError(err) {
+		s.metrics.IncPauseEvent()
 		s.logger.Warn("scheduler: contract paused; backing off without per-job blame",
 			"err", err, "back_off", s.cfg.PausedCycleBackoff)
 		s.recordAttemptWithBackoff(ctx, head.Timestamp, s.cfg.PausedCycleBackoff)
@@ -267,6 +279,7 @@ func (s *Scheduler) partition(ctx context.Context, candidates []PendingJob, wind
 			s.logger.Warn("scheduler: pending job has foreign worker; dropping",
 				"job_id", p.JobID, "stored_worker", info.Worker.Hex())
 			dropIDs = append(dropIDs, p.JobID)
+			s.metrics.IncDropped(DropReasonForeignWorker)
 			continue
 		}
 		switch info.State {
@@ -283,13 +296,16 @@ func (s *Scheduler) partition(ctx context.Context, candidates []PendingJob, wind
 				s.logger.Info("scheduler: dropping Resolved job with zero escrow (guilty path)",
 					"job_id", p.JobID)
 				dropIDs = append(dropIDs, p.JobID)
+				s.metrics.IncDropped(DropReasonResolvedZeroFee)
 			}
 		case chain.JobStateReleased:
 			dropIDs = append(dropIDs, p.JobID)
+			s.metrics.IncDropped(DropReasonTerminalState)
 		case chain.JobStateTimedOut:
 			s.logger.Info("scheduler: dropping TimedOut job (slashed; no payout)",
 				"job_id", p.JobID)
 			dropIDs = append(dropIDs, p.JobID)
+			s.metrics.IncDropped(DropReasonTerminalState)
 		case chain.JobStateDisputed:
 			if s.cfg.StaleDisputeWarnAfter > 0 {
 				ageSec := chainNow - p.CompletedAt
@@ -349,6 +365,7 @@ func (s *Scheduler) perJobFallback(ctx context.Context, batch []uint64, window t
 			if isPauseError(rErr) {
 				// Pause hit mid-fallback. Stop the per-job loop entirely;
 				// resuming would just keep failing.
+				s.metrics.IncPauseEvent()
 				s.logger.Warn("scheduler: pause detected mid-fallback; stopping",
 					"job_id", id, "err", rErr)
 				return
@@ -356,12 +373,15 @@ func (s *Scheduler) perJobFallback(ctx context.Context, batch []uint64, window t
 			s.logger.Warn("scheduler: per-job release failed",
 				"job_id", id, "err", rErr)
 			s.recordPerJobFailure(ctx, id, head.Timestamp)
+			s.metrics.IncFailed(1)
 			failed++
 			continue
 		}
 		if rErr := s.store.Remove(ctx, []uint64{id}); rErr != nil {
 			s.logger.Warn("scheduler: per-job remove failed", "job_id", id, "err", rErr)
 		}
+		s.metrics.IncReleased(1)
+		s.metrics.SetLastSuccessTimestamp(head.Timestamp)
 		released++
 	}
 	s.logger.Info("scheduler: per-job fallback complete",

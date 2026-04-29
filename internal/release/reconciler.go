@@ -37,6 +37,7 @@ type Reconciler struct {
 	workerAddr common.Address
 	cfg        Config
 	logger     *slog.Logger
+	metrics    Metrics
 
 	// Periodic-mode lifecycle.
 	done     chan struct{}
@@ -56,8 +57,15 @@ func NewReconciler(store Store, settlement reconcilerChain, workerAddr common.Ad
 		workerAddr: workerAddr,
 		cfg:        cfg,
 		logger:     logger,
+		metrics:    noopMetrics{},
 		done:       make(chan struct{}),
 	}
+}
+
+// SetMetrics installs the observability sink. Optional; defaults to a
+// silent no-op. Must be called before Run/StartPeriodic.
+func (r *Reconciler) SetMetrics(m Metrics) {
+	r.metrics = callMetrics(m)
 }
 
 // Run executes one reconciliation pass. Safe to call concurrently with
@@ -148,6 +156,7 @@ func (r *Reconciler) Run(ctx context.Context) error {
 		if sErr := r.store.SetReconcileBlock(ctx, hi); sErr != nil {
 			return fmt.Errorf("SetReconcileBlock %d: %w", hi, sErr)
 		}
+		r.metrics.SetReconcileLastBlock(hi)
 		scannedChunks++
 
 		if hi == safeHead {
