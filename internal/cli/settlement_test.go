@@ -205,6 +205,135 @@ func TestRelease_RunsReconcilerThenCycle(t *testing.T) {
 	assert.Contains(t, got, "pending after cycle: 0")
 }
 
+// W6: contract pause must surface as a non-zero exit (returned error)
+// AND a clear "paused" message on stdout. Previously the CLI printed
+// "release cycle complete" and returned nil even when the cycle was
+// silently backed off because the contract was paused.
+func TestRelease_PauseSurfacesAsErrorWithBackoffMessage(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	store, err := release.NewFileStore(filepath.Join(dir, "rs.json"), release.StoreIdentity{
+		ChainID:       1337,
+		JobRegistry:   common.HexToAddress("0xaaaa000000000000000000000000000000000001"),
+		WorkerAddress: testAddr,
+	}, testLogger())
+	require.NoError(t, err)
+	defer func() { _ = store.Close() }()
+
+	// Seed a pending job so the cycle has something to attempt.
+	require.NoError(t, store.AddEligible(context.Background(), 99, 1_000_000-2*86400))
+
+	settlement := &mockSettlement{
+		filterFn: func(_ context.Context, _ common.Address, _, _ uint64) ([]chain.JobCompletedEvent, error) {
+			return nil, nil
+		},
+		headFn: func(_ context.Context) (chain.HeadInfo, error) {
+			return chain.HeadInfo{Number: 100, Timestamp: 1_000_000}, nil
+		},
+		getJobStateFn: func(_ context.Context, jobID uint64) (chain.JobStateInfo, error) {
+			return chain.JobStateInfo{
+				State:       chain.JobStateCompleted,
+				Worker:      testAddr,
+				CompletedAt: 1_000_000 - 2*86400,
+				EscrowedFee: big.NewInt(100),
+			}, nil
+		},
+		releaseJobsFn: func(_ context.Context, _ []uint64) error {
+			return errors.New("execution reverted: Pausable: paused")
+		},
+	}
+
+	cfg := release.DefaultConfig()
+	cfg.Confirmations = 0
+	cfg.StartBlock = 1
+	cfg.DisputeWindowOverride = time.Hour
+	cfg.PausedCycleBackoff = 30 * time.Minute
+
+	var out bytes.Buffer
+	h := &Handler{
+		Settlement:    settlement,
+		WorkerAddr:    testAddr,
+		ReleaseStore:  store,
+		ReleaseConfig: cfg,
+		Out:           &out,
+		Logger:        testLogger(),
+	}
+
+	err = h.Release(context.Background(), false)
+	require.Error(t, err, "pause must produce a non-zero exit so scripted callers detect the silent failure")
+	assert.Contains(t, err.Error(), "paused")
+
+	got := out.String()
+	assert.Contains(t, got, "release cycle paused")
+	assert.NotContains(t, got, "release cycle complete",
+		"the misleading 'release cycle complete' message must NOT appear on pause")
+}
+
+// W6: per-job failures must produce non-zero exit so a scripted
+// caller (cron, smoke test) can detect partial failure.
+func TestRelease_PerJobFailuresSurfaceAsError(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	store, err := release.NewFileStore(filepath.Join(dir, "rs.json"), release.StoreIdentity{
+		ChainID:       1337,
+		JobRegistry:   common.HexToAddress("0xaaaa000000000000000000000000000000000001"),
+		WorkerAddress: testAddr,
+	}, testLogger())
+	require.NoError(t, err)
+	defer func() { _ = store.Close() }()
+
+	for _, id := range []uint64{1, 2} {
+		require.NoError(t, store.AddEligible(context.Background(), id, 1_000_000-2*86400))
+	}
+
+	settlement := &mockSettlement{
+		filterFn: func(_ context.Context, _ common.Address, _, _ uint64) ([]chain.JobCompletedEvent, error) {
+			return nil, nil
+		},
+		headFn: func(_ context.Context) (chain.HeadInfo, error) {
+			return chain.HeadInfo{Number: 100, Timestamp: 1_000_000}, nil
+		},
+		getJobStateFn: func(_ context.Context, _ uint64) (chain.JobStateInfo, error) {
+			return chain.JobStateInfo{
+				State:       chain.JobStateCompleted,
+				Worker:      testAddr,
+				CompletedAt: 1_000_000 - 2*86400,
+				EscrowedFee: big.NewInt(100),
+			}, nil
+		},
+		releaseJobsFn: func(_ context.Context, _ []uint64) error {
+			return errors.New("execution reverted: stale") // non-pause; triggers fallback
+		},
+		releaseJobFn: func(_ context.Context, _ uint64) error {
+			return errors.New("execution reverted: misc") // every per-job fails
+		},
+	}
+
+	cfg := release.DefaultConfig()
+	cfg.Confirmations = 0
+	cfg.StartBlock = 1
+	cfg.DisputeWindowOverride = time.Hour
+
+	var out bytes.Buffer
+	h := &Handler{
+		Settlement:    settlement,
+		WorkerAddr:    testAddr,
+		ReleaseStore:  store,
+		ReleaseConfig: cfg,
+		Out:           &out,
+		Logger:        testLogger(),
+	}
+
+	err = h.Release(context.Background(), false)
+	require.Error(t, err, "per-job failures must produce a non-zero exit")
+	assert.Contains(t, err.Error(), "failed")
+
+	got := out.String()
+	assert.Contains(t, got, "release cycle completed with failures")
+}
+
 func TestRelease_ReconcileOnlySkipsCycle(t *testing.T) {
 	t.Parallel()
 

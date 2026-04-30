@@ -216,11 +216,16 @@ func (r *ReleaseTester) Reconcile(ctx context.Context) error {
 	return rec.Run(ctx)
 }
 
-// RunCycle runs one release cycle synchronously. Bypasses trigger evaluation
-// (Scheduler.RunOnce semantics) so back-to-back calls always proceed.
+// RunCycle runs one release cycle synchronously. Bypasses trigger
+// evaluation (Scheduler.RunOnce semantics) so back-to-back calls always
+// proceed. The CycleResult is intentionally discarded — e2e callers
+// assert on observable on-chain state (workerBalance, JobReleased
+// events, pending count) rather than the cycle summary. Tests that
+// need to inspect outcomes directly should call Scheduler.RunOnce.
 func (r *ReleaseTester) RunCycle(ctx context.Context) error {
 	sched := release.NewScheduler(r.store, r.chainClient, r.workerAddr, r.cfg, nil)
-	return sched.RunOnce(ctx)
+	_, err := sched.RunOnce(ctx)
+	return err
 }
 
 // Pending returns a snapshot of the local pending set, sorted by JobID.

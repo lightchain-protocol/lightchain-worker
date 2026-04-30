@@ -147,7 +147,12 @@ func TestScheduler_BatchSuccessPath(t *testing.T) {
 
 	cfg := defaultSchedConfig()
 	s := NewScheduler(store, stub, worker, cfg, nil)
-	require.NoError(t, s.RunOnce(ctx))
+	result, err := s.RunOnce(ctx)
+	require.NoError(t, err)
+	assert.False(t, result.BatchReverted, "happy path: batch must land first try")
+	assert.False(t, result.Paused)
+	assert.Equal(t, 0, result.Failed)
+	assert.Greater(t, result.Released, 0, "happy path must report released jobs")
 
 	assert.Equal(t, int32(1), stub.releaseJobsCalls.Load(), "one batch tx")
 	assert.Equal(t, int32(0), stub.releaseJobCalls.Load(), "no per-job fallback")
@@ -219,7 +224,8 @@ func TestScheduler_PartitionEachState(t *testing.T) {
 
 	cfg := defaultSchedConfig()
 	s := NewScheduler(store, stub, worker, cfg, nil)
-	require.NoError(t, s.RunOnce(ctx))
+	_, err := s.RunOnce(ctx)
+	require.NoError(t, err)
 
 	// Only Completed-past-window (1) and Resolved-with-escrow (4) get released.
 	assert.ElementsMatch(t, []uint64{1, 4}, releasedBatch)
@@ -267,7 +273,12 @@ func TestScheduler_BatchFallbackPerJob(t *testing.T) {
 
 	cfg := defaultSchedConfig()
 	s := NewScheduler(store, stub, worker, cfg, nil)
-	require.NoError(t, s.RunOnce(ctx))
+	result, err := s.RunOnce(ctx)
+	require.NoError(t, err)
+	assert.True(t, result.BatchReverted, "result must report batch revert")
+	assert.False(t, result.Paused, "non-pause revert must NOT mark Paused")
+	assert.Equal(t, 2, result.Released, "id=1 and id=3 succeeded in fallback")
+	assert.Equal(t, 1, result.Failed, "id=2 failed in fallback")
 
 	assert.Equal(t, int32(1), stub.releaseJobsCalls.Load())
 	assert.Equal(t, int32(3), stub.releaseJobCalls.Load(), "per-job retried for all 3")
@@ -309,7 +320,12 @@ func TestScheduler_PauseClassificationSkipsPerJobBlame(t *testing.T) {
 
 	cfg := defaultSchedConfig()
 	s := NewScheduler(store, stub, worker, cfg, nil)
-	require.NoError(t, s.RunOnce(ctx))
+	result, err := s.RunOnce(ctx)
+	require.NoError(t, err)
+	assert.True(t, result.Paused, "batch pause must surface as Paused")
+	assert.True(t, result.BatchReverted, "batch revert is also a revert")
+	assert.Equal(t, chainNow+int64(cfg.PausedCycleBackoff/time.Second), result.NextAllowedAt,
+		"result.NextAllowedAt must reflect the gate written by applyPauseBackoff")
 
 	assert.Equal(t, int32(0), stub.releaseJobCalls.Load(), "per-job loop must NOT run on pause")
 
@@ -489,7 +505,10 @@ func TestScheduler_RunOnceRespectsGate(t *testing.T) {
 
 	cfg := defaultSchedConfig()
 	s := NewScheduler(store, stub, worker, cfg, nil)
-	require.NoError(t, s.RunOnce(ctx), "RunOnce returns nil (no error) when gate blocks")
+	result, err := s.RunOnce(ctx)
+	require.NoError(t, err, "RunOnce returns nil (no error) when gate blocks")
+	assert.True(t, result.BackoffActive, "result must report BackoffActive when gate blocks")
+	assert.Equal(t, chainNow+300, result.NextAllowedAt, "result must surface the gate timestamp")
 
 	assert.Equal(t, int32(0), stub.releaseJobsCalls.Load())
 }
@@ -538,6 +557,68 @@ func TestScheduler_ResolvedJobInsideWindowReleasesImmediately(t *testing.T) {
 	pending, err := store.Pending(ctx)
 	require.NoError(t, err)
 	assert.Empty(t, pending, "released job must be removed from pending")
+}
+
+// W5+W6: a contract pause hit mid per-job fallback must surface as
+// Paused in the cycle result AND advance NextAllowedAttempt exactly
+// once. Previously the per-job loop returned silently and the caller
+// called recordAttempt (no backoff), so the next probe retried
+// immediately and IncPauseEvent was missed.
+func TestScheduler_PauseMidFallbackAppliesCycleBackoff(t *testing.T) {
+	t.Parallel()
+	store := newSchedStore(t)
+	worker := defaultIdentityForTest().WorkerAddress
+	ctx := context.Background()
+
+	chainNow := int64(1_000_000)
+	for _, id := range []uint64{1, 2, 3} {
+		require.NoError(t, store.AddEligible(ctx, id, chainNow-2*86400))
+	}
+
+	stub := &schedStub{
+		headFn: func() (chain.HeadInfo, error) {
+			return chain.HeadInfo{Number: 100, Timestamp: chainNow}, nil
+		},
+		getJobStateFn: func(jobID uint64) (chain.JobStateInfo, error) {
+			return mkInfo(chain.JobStateCompleted, worker, chainNow-2*86400, 100), nil
+		},
+		// Batch reverts non-pause → fallback runs.
+		releaseJobsFn: func([]uint64) error { return errors.New("execution reverted: stale") },
+		// First per-job succeeds; second hits pause; third must NOT
+		// be attempted because the loop bails on pause.
+		releaseJobFn: func(jobID uint64) error {
+			if jobID == 2 {
+				return errors.New("execution reverted: Pausable: paused")
+			}
+			return nil
+		},
+	}
+
+	cfg := defaultSchedConfig()
+	s := NewScheduler(store, stub, worker, cfg, nil)
+	result, err := s.RunOnce(ctx)
+	require.NoError(t, err)
+
+	assert.True(t, result.BatchReverted, "batch revert kicked off the fallback")
+	assert.True(t, result.Paused, "mid-fallback pause must surface as Paused")
+	assert.Equal(t, 1, result.Released, "id=1 was released before the pause")
+	assert.Equal(t, 0, result.Failed, "pause is NOT a per-job failure")
+	assert.Equal(t, int32(2), stub.releaseJobCalls.Load(),
+		"per-job loop must stop at the pause; id=3 must NOT be attempted")
+
+	// NextAllowedAttempt must be advanced exactly once (not bumped by
+	// both perJobFallback and the cycle wrapper).
+	gate, err := store.GetNextAllowedAttempt(ctx)
+	require.NoError(t, err)
+	expected := chainNow + int64(cfg.PausedCycleBackoff/time.Second)
+	assert.Equal(t, expected, gate, "cycle gate written exactly once on mid-fallback pause")
+	assert.Equal(t, expected, result.NextAllowedAt)
+
+	// LastReleaseTs must NOT be advanced into the future by a
+	// pause backoff (the gate is the next-attempt signal).
+	lts, err := store.GetLastReleaseTs(ctx)
+	require.NoError(t, err)
+	assert.Equal(t, int64(0), lts, "LastReleaseTs is reserved for time-trigger")
 }
 
 // TestScheduler_StartStopLifecycle: clean shutdown of background loop.

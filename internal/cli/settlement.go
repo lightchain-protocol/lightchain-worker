@@ -94,15 +94,49 @@ func (h *Handler) Release(ctx context.Context, reconcileOnly bool) error {
 	}
 
 	scheduler := release.NewScheduler(h.ReleaseStore, h.Settlement, h.WorkerAddr, h.ReleaseConfig, h.Logger)
-	if err := scheduler.RunOnce(ctx); err != nil {
+	result, err := scheduler.RunOnce(ctx)
+	if err != nil {
 		return fmt.Errorf("release cycle: %w", err)
 	}
-	fmt.Fprintln(h.Out, "release cycle complete")
+
+	// Surface accurate status. Previously the CLI printed
+	// "release cycle complete" unconditionally even when the
+	// scheduler swallowed batch reverts, paused-contract backoffs,
+	// and per-job failures (CodeRabbit PR #23). The CycleResult
+	// from RunOnce makes the real outcome visible to operators and
+	// drives a non-zero exit when settlement did not fully succeed.
+	switch {
+	case result.BackoffActive:
+		fmt.Fprintf(h.Out, "release cycle blocked: backoff active until chain time %d\n", result.NextAllowedAt)
+	case result.Paused:
+		fmt.Fprintf(h.Out, "release cycle paused: contract paused; backoff active until chain time %d\n", result.NextAllowedAt)
+	case result.Candidates == 0:
+		fmt.Fprintln(h.Out, "release cycle complete: no jobs ready for release")
+	case result.BatchReverted && result.Failed == 0:
+		fmt.Fprintf(h.Out, "release cycle complete: batch reverted, %d job(s) recovered via per-job fallback (%d dropped)\n",
+			result.Released, result.Dropped)
+	case result.Failed > 0:
+		fmt.Fprintf(h.Out, "release cycle completed with failures: %d released, %d failed, %d dropped\n",
+			result.Released, result.Failed, result.Dropped)
+	default:
+		fmt.Fprintf(h.Out, "release cycle complete: %d released (%d dropped)\n", result.Released, result.Dropped)
+	}
 
 	pending, err := h.ReleaseStore.Pending(ctx)
 	if err != nil {
 		return fmt.Errorf("read pending after cycle: %w", err)
 	}
 	fmt.Fprintf(h.Out, "pending after cycle: %d job(s)\n", len(pending))
+
+	// Non-zero exit on Paused or Failed > 0 so an operator scripting
+	// `lightchain-worker release` (e.g. cron, smoke test) can detect
+	// silent settlement failures instead of treating every invocation
+	// as success.
+	switch {
+	case result.Paused:
+		return fmt.Errorf("release cycle paused: contract paused; next attempt allowed at chain time %d", result.NextAllowedAt)
+	case result.Failed > 0:
+		return fmt.Errorf("release cycle: %d per-job release(s) failed", result.Failed)
+	}
 	return nil
 }
