@@ -231,6 +231,30 @@ func checkReceipt(receipt *types.Receipt, txName string) error {
 	return nil
 }
 
+// classifyReceiptRevert wraps a checkReceipt error with ErrContractPaused
+// when the original transaction reverted because the callee contract is
+// paused. Replays the tx via eth_call against the receipt's block to
+// extract revert data; classification is best-effort and degrades to
+// the generic revert error on any decode failure (so a transient RPC
+// problem never escalates a generic revert into "paused").
+//
+// The wrapped error preserves the status-0 context the operator sees
+// in logs while letting the scheduler use errors.Is(err,
+// chain.ErrContractPaused) to apply cycle-level backoff.
+func (c *ChainClient) classifyReceiptRevert(
+	ctx context.Context,
+	txName string,
+	tx *types.Transaction,
+	receipt *types.Receipt,
+	revertErr error,
+) error {
+	if !decodePauseRevert(ctx, c.ethClient, c.workerAddr, tx, receipt.BlockNumber) {
+		return revertErr
+	}
+	return fmt.Errorf("%s transaction reverted (status 0, tx %s): %w",
+		txName, receipt.TxHash.Hex(), ErrContractPaused)
+}
+
 // adjustGasPrice applies the configured gas price multiplier: basePrice * gasPriceMulBps / 10000.
 func (c *ChainClient) adjustGasPrice(basePrice *big.Int) *big.Int {
 	adjusted := new(big.Int).Mul(basePrice, big.NewInt(int64(c.gasPriceMulBps)))
@@ -337,7 +361,7 @@ func (c *ChainClient) submitPreparedTx(
 		return fmt.Errorf("wait for %s tx %s: %w", txName, tx.Hash().Hex(), err)
 	}
 	if err := checkReceipt(receipt, txName); err != nil {
-		return err
+		return c.classifyReceiptRevert(ctx, txName, tx, receipt, err)
 	}
 
 	// A mined receipt means this tx is no longer in the pool. Clear the
