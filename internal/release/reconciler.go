@@ -124,11 +124,15 @@ func (r *Reconciler) Run(ctx context.Context) error {
 			return fmt.Errorf("FilterJobCompleted [%d..%d]: %w", lo, hi, fErr)
 		}
 
+		var firstStateErr error
 		for _, ev := range events {
 			info, gErr := r.chain.GetJobState(ctx, ev.JobID)
 			if gErr != nil {
-				r.logger.Warn("reconciler: GetJobState failed; will retry on next pass",
-					"job_id", ev.JobID, "err", gErr)
+				r.logger.Warn("reconciler: GetJobState failed; will retry chunk on next pass",
+					"job_id", ev.JobID, "lo", lo, "hi", hi, "err", gErr)
+				if firstStateErr == nil {
+					firstStateErr = gErr
+				}
 				continue
 			}
 			if info.Worker != r.workerAddr {
@@ -151,6 +155,14 @@ func (r *Reconciler) Run(ctx context.Context) error {
 				return fmt.Errorf("AddEligible job %d: %w", ev.JobID, aErr)
 			}
 			added++
+		}
+
+		// If any per-event GetJobState failed, leave the cursor at the
+		// previous block so the chunk is retried. Advancing past a
+		// failed lookup would skip that event range permanently and the
+		// missed job would never enter Pending.
+		if firstStateErr != nil {
+			return fmt.Errorf("reconcile chunk [%d..%d]: GetJobState failed for one or more events: %w", lo, hi, firstStateErr)
 		}
 
 		if sErr := r.store.SetReconcileBlock(ctx, hi); sErr != nil {

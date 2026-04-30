@@ -297,3 +297,64 @@ func TestReconciler_StartPeriodicAndStopAreClean(t *testing.T) {
 	// because timer scheduling is non-deterministic in CI.
 	assert.GreaterOrEqual(t, fired.Load(), int32(1))
 }
+
+// W3: a transient GetJobState failure inside a chunk must NOT advance
+// the cursor. Otherwise the next pass starts at hi+1 and the failed
+// event range is never revisited, so the missed job never enters
+// Pending. The fix should also ensure the chunk is retried on the
+// next pass and the previously-failing event lands in Pending.
+func TestReconciler_GetJobStateFailureKeepsCursor(t *testing.T) {
+	t.Parallel()
+	store := newReconcilerStore(t)
+	worker := defaultIdentityForTest().WorkerAddress
+
+	events := []chain.JobCompletedEvent{
+		{JobID: 1, Worker: worker, BlockNumber: 10},
+		{JobID: 2, Worker: worker, BlockNumber: 11},
+	}
+
+	var stateCalls atomic.Int32
+	ch := &stubChain{
+		headFn: func() (chain.HeadInfo, error) { return chain.HeadInfo{Number: 100, Timestamp: 1}, nil },
+		filterFn: func(common.Address, uint64, uint64) ([]chain.JobCompletedEvent, error) {
+			return events, nil
+		},
+		stateFn: func(jobID uint64) (chain.JobStateInfo, error) {
+			n := stateCalls.Add(1)
+			// Job 2 fails on the first pass (n==2), succeeds on the
+			// second pass (n==4). Job 1 always succeeds.
+			if jobID == 2 && n == 2 {
+				return chain.JobStateInfo{}, errors.New("transient rpc error")
+			}
+			return chain.JobStateInfo{
+				State:       chain.JobStateCompleted,
+				Worker:      worker,
+				CompletedAt: 1000 + int64(jobID),
+				EscrowedFee: big.NewInt(100),
+			}, nil
+		},
+	}
+
+	cfg := DefaultConfig()
+	cfg.Confirmations = 0
+	cfg.StartBlock = 1
+	cfg.ChunkSize = 5000
+
+	r := NewReconciler(store, ch, worker, cfg, nil)
+
+	// First pass must surface the error and leave the cursor unchanged.
+	err := r.Run(context.Background())
+	require.Error(t, err, "chunk with failed GetJobState must propagate error")
+
+	cursor, err := store.GetReconcileBlock(context.Background())
+	require.NoError(t, err)
+	assert.Equal(t, uint64(0), cursor, "cursor must NOT advance past a failed chunk")
+
+	// Second pass must succeed and admit both jobs.
+	require.NoError(t, r.Run(context.Background()), "retry pass must succeed")
+
+	pending, err := store.Pending(context.Background())
+	require.NoError(t, err)
+	require.Len(t, pending, 2, "previously-failing event must be admitted on retry")
+	assert.Equal(t, []uint64{1, 2}, []uint64{pending[0].JobID, pending[1].JobID})
+}
