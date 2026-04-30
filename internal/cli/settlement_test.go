@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"math/big"
 	"path/filepath"
 	"strings"
@@ -240,7 +241,10 @@ func TestRelease_PauseSurfacesAsErrorWithBackoffMessage(t *testing.T) {
 			}, nil
 		},
 		releaseJobsFn: func(_ context.Context, _ []uint64) error {
-			return errors.New("execution reverted: Pausable: paused")
+			// Mirror chain client behavior on a paused contract: the
+			// reverted-receipt error is wrapped with chain.ErrContractPaused
+			// after the EnforcedPause() selector decode.
+			return fmt.Errorf("ReleaseJobs transaction reverted (status 0, tx 0xabc): %w", chain.ErrContractPaused)
 		},
 	}
 

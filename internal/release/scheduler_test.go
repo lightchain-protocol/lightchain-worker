@@ -3,6 +3,7 @@ package release
 import (
 	"context"
 	"errors"
+	"fmt"
 	"math/big"
 	"path/filepath"
 	"sync"
@@ -105,9 +106,21 @@ func TestIsPauseError(t *testing.T) {
 	t.Parallel()
 	assert.False(t, isPauseError(nil))
 	assert.False(t, isPauseError(errors.New("nonce too low")))
+
+	// v5 (production): chain client wraps reverted-receipt errors with
+	// chain.ErrContractPaused after decoding the EnforcedPause() selector.
+	wrapped := fmt.Errorf("ReleaseJobs transaction reverted (status 0, tx 0xabc): %w", chain.ErrContractPaused)
+	assert.True(t, isPauseError(wrapped), "wrapped chain.ErrContractPaused must classify as pause")
+
+	// v4 fallback: substring match on the Error(string) text. Kept for
+	// legacy contracts and for test stubs that bypass the chain client.
 	assert.True(t, isPauseError(errors.New("execution reverted: Pausable: paused")))
-	assert.True(t, isPauseError(errors.New("EnforcedPause()")))
-	assert.True(t, isPauseError(errors.New("ENFORCEDPAUSE custom error")), "case-insensitive")
+
+	// Plain "EnforcedPause" text is NOT classified anymore — go-ethereum
+	// never produces it, so matching it would only mask test misuse and
+	// give a false sense of safety.
+	assert.False(t, isPauseError(errors.New("EnforcedPause()")),
+		"raw EnforcedPause text is not what production produces; require the wrapped sentinel")
 }
 
 func TestCountReadyForStateCheck_AppliesBackoffOnly(t *testing.T) {
@@ -314,7 +327,10 @@ func TestScheduler_PauseClassificationSkipsPerJobBlame(t *testing.T) {
 			return mkInfo(chain.JobStateCompleted, worker, chainNow-2*86400, 100), nil
 		},
 		releaseJobsFn: func([]uint64) error {
-			return errors.New("execution reverted: Pausable: paused")
+			// Mirror what the chain client returns in production: a
+			// status-0 revert wrapped with chain.ErrContractPaused
+			// after EnforcedPause() selector decode.
+			return fmt.Errorf("ReleaseJobs transaction reverted (status 0, tx 0xabc): %w", chain.ErrContractPaused)
 		},
 	}
 
@@ -588,7 +604,8 @@ func TestScheduler_PauseMidFallbackAppliesCycleBackoff(t *testing.T) {
 		// be attempted because the loop bails on pause.
 		releaseJobFn: func(jobID uint64) error {
 			if jobID == 2 {
-				return errors.New("execution reverted: Pausable: paused")
+				// Mirror chain client behavior: wrapped sentinel.
+				return fmt.Errorf("ReleaseJob transaction reverted (status 0, tx 0xabc): %w", chain.ErrContractPaused)
 			}
 			return nil
 		},

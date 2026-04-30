@@ -2,6 +2,7 @@ package release
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"strings"
@@ -580,16 +581,24 @@ func computeBackoff(base, maxBackoff time.Duration, attempt int) time.Duration {
 	return d
 }
 
-// isPauseError pattern-matches the contract's revert reason for "paused".
-// OpenZeppelin Pausable emits "Pausable: paused"; the v5 version uses the
-// custom error EnforcedPause(). go-ethereum surfaces both as text in the
-// returned error. The match is case-insensitive and substring-based to
-// tolerate wrapper layers.
+// isPauseError reports whether err signals a pause revert from a
+// Pausable contract. v5 contracts (which we deploy) emit the custom
+// error EnforcedPause(); go-ethereum returns only the 4-byte selector
+// in rpc.DataError, so the chain client decodes it post-receipt and
+// wraps ErrContractPaused — detected here via errors.Is.
+//
+// The "Pausable: paused" substring fallback exists for two cases:
+// v4 contracts (which surface the reason as Error(string) text), and
+// test stubs that pass plain error strings rather than going through
+// the chain client. The previous broad "enforcedpause" substring was
+// removed because it never matched a real production revert (geth does
+// not expose custom error names as text).
 func isPauseError(err error) bool {
 	if err == nil {
 		return false
 	}
-	msg := strings.ToLower(err.Error())
-	return strings.Contains(msg, "pausable: paused") ||
-		strings.Contains(msg, "enforcedpause")
+	if errors.Is(err, chain.ErrContractPaused) {
+		return true
+	}
+	return strings.Contains(strings.ToLower(err.Error()), "pausable: paused")
 }
