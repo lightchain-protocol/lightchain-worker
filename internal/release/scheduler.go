@@ -106,6 +106,22 @@ func (s *Scheduler) tick(ctx context.Context) {
 		return
 	}
 
+	// Cycle-backoff gate. Honored before the threshold and time-trigger
+	// checks so that a paused contract (or any other condition that
+	// scheduled a future attempt) cannot be silently bypassed by either
+	// path. Reading this from the store keeps the gate persistent across
+	// process restarts.
+	nextAllowed, err := s.store.GetNextAllowedAttempt(cycleCtx)
+	if err != nil {
+		s.logger.Warn("scheduler: read next allowed attempt failed", "err", err)
+		return
+	}
+	if head.Timestamp < nextAllowed {
+		s.logger.Debug("scheduler: cycle backoff active; skipping probe",
+			"head_timestamp", head.Timestamp, "next_allowed", nextAllowed)
+		return
+	}
+
 	window, err := s.disputeWindow(cycleCtx)
 	if err != nil {
 		s.logger.Warn("scheduler: read dispute window failed", "err", err)
@@ -207,6 +223,10 @@ func (s *Scheduler) runReleaseCycle(ctx context.Context, head chain.HeadInfo, wi
 
 // RunOnce executes a single release cycle synchronously. Used by the CLI
 // `release` subcommand. Reads chain head + pending snapshot itself.
+// Honors the same NextAllowedAttempt gate as the periodic tick so a
+// paused-cycle backoff cannot be bypassed by an operator-initiated
+// invocation. The CLI's accurate-status reporting (CycleResult) lands
+// in a follow-up commit; for now this returns nil when blocked.
 func (s *Scheduler) RunOnce(ctx context.Context) error {
 	cycleCtx, cancel := context.WithTimeout(ctx, s.cfg.TxTimeout)
 	defer cancel()
@@ -214,6 +234,15 @@ func (s *Scheduler) RunOnce(ctx context.Context) error {
 	head, err := s.chain.Head(cycleCtx)
 	if err != nil {
 		return fmt.Errorf("read chain head: %w", err)
+	}
+	nextAllowed, err := s.store.GetNextAllowedAttempt(cycleCtx)
+	if err != nil {
+		return fmt.Errorf("read next allowed attempt: %w", err)
+	}
+	if head.Timestamp < nextAllowed {
+		s.logger.Info("scheduler: RunOnce skipped; cycle backoff active",
+			"head_timestamp", head.Timestamp, "next_allowed", nextAllowed)
+		return nil
 	}
 	window, err := s.disputeWindow(cycleCtx)
 	if err != nil {
@@ -418,13 +447,17 @@ func (s *Scheduler) recordAttempt(ctx context.Context, chainNow int64) {
 	}
 }
 
-// recordAttemptWithBackoff sets LastReleaseTs into the future so the time
-// trigger does not fire for `back` after `chainNow`. Used for cycle-level
-// backoffs (e.g. paused contract).
+// recordAttemptWithBackoff writes NextAllowedAttempt = chainNow + back so
+// neither the threshold path nor the time-trigger fires another cycle
+// for `back` of chain time. Used for cycle-level backoffs (e.g. paused
+// contract). Distinct from recordAttempt, which writes LastReleaseTs
+// for the periodic time-trigger; conflating the two (the previous
+// behavior) let the threshold path bypass backoff entirely and stretched
+// the time path's next fire by an extra Interval.
 func (s *Scheduler) recordAttemptWithBackoff(ctx context.Context, chainNow int64, back time.Duration) {
 	until := chainNow + int64(back/time.Second)
-	if err := s.store.SetLastReleaseTs(ctx, until); err != nil {
-		s.logger.Warn("scheduler: SetLastReleaseTs (with backoff) failed",
+	if err := s.store.SetNextAllowedAttempt(ctx, until); err != nil {
+		s.logger.Warn("scheduler: SetNextAllowedAttempt (with backoff) failed",
 			"backoff", back, "err", err)
 	}
 }

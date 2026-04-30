@@ -321,10 +321,18 @@ func TestScheduler_PauseClassificationSkipsPerJobBlame(t *testing.T) {
 		assert.Equal(t, int64(0), p.BackoffUntil, "per-job backoff must NOT be set on pause")
 	}
 
-	ts, err := store.GetLastReleaseTs(ctx)
+	gate, err := store.GetNextAllowedAttempt(ctx)
 	require.NoError(t, err)
 	expected := chainNow + int64(cfg.PausedCycleBackoff/time.Second)
-	assert.Equal(t, expected, ts, "cycle-level backoff applied to LastReleaseTs")
+	assert.Equal(t, expected, gate, "cycle-level backoff written to NextAllowedAttempt")
+
+	// LastReleaseTs is reserved for the time-trigger and must NOT be
+	// advanced into the future by a pause backoff (W4b: the two were
+	// previously conflated, which let the threshold path bypass the
+	// gate and stretched the time-path next fire by Interval).
+	lts, err := store.GetLastReleaseTs(ctx)
+	require.NoError(t, err)
+	assert.Equal(t, int64(0), lts, "pause backoff must NOT clobber LastReleaseTs")
 }
 
 // TestScheduler_NoFireWhenBelowThresholdAndTime: neither trigger
@@ -390,6 +398,100 @@ func TestScheduler_TimeTriggerFiresWithSubThresholdCount(t *testing.T) {
 	s.tick(ctx)
 
 	assert.Equal(t, int32(1), stub.releaseJobsCalls.Load(), "time trigger fired despite sub-threshold count")
+}
+
+// W4b: NextAllowedAttempt gates the threshold path. Even with N>=
+// BatchThreshold eligible jobs, no chain calls should fire while the
+// gate is in the future. Previously this path bypassed the backoff
+// because recordAttemptWithBackoff overloaded LastReleaseTs.
+func TestScheduler_NextAllowedAttemptGatesThresholdPath(t *testing.T) {
+	t.Parallel()
+	store := newSchedStore(t)
+	worker := defaultIdentityForTest().WorkerAddress
+	ctx := context.Background()
+
+	chainNow := int64(1_000_000)
+	for _, id := range []uint64{1, 2, 3} { // > BatchThreshold (2)
+		require.NoError(t, store.AddEligible(ctx, id, chainNow-2*86400))
+	}
+	require.NoError(t, store.SetNextAllowedAttempt(ctx, chainNow+300)) // 5m in future
+
+	stub := &schedStub{
+		headFn: func() (chain.HeadInfo, error) {
+			return chain.HeadInfo{Number: 100, Timestamp: chainNow}, nil
+		},
+		getJobStateFn: func(uint64) (chain.JobStateInfo, error) {
+			t.Fatal("GetJobState must not be called while cycle gate is active")
+			return chain.JobStateInfo{}, nil
+		},
+	}
+
+	cfg := defaultSchedConfig()
+	s := NewScheduler(store, stub, worker, cfg, nil)
+	s.tick(ctx)
+
+	assert.Equal(t, int32(0), stub.releaseJobsCalls.Load())
+	assert.Equal(t, int32(0), stub.releaseJobCalls.Load())
+}
+
+// W4b: NextAllowedAttempt gates the time path too. Even with the
+// time-trigger overdue (LastReleaseTs ancient), no fire while the
+// gate is in the future.
+func TestScheduler_NextAllowedAttemptGatesTimeTrigger(t *testing.T) {
+	t.Parallel()
+	store := newSchedStore(t)
+	worker := defaultIdentityForTest().WorkerAddress
+	ctx := context.Background()
+
+	chainNow := int64(1_000_000)
+	require.NoError(t, store.AddEligible(ctx, 7, chainNow-2*86400))
+	require.NoError(t, store.SetLastReleaseTs(ctx, chainNow-9*3600))     // far past, time-trigger overdue
+	require.NoError(t, store.SetNextAllowedAttempt(ctx, chainNow+300))   // gate active
+
+	stub := &schedStub{
+		headFn: func() (chain.HeadInfo, error) {
+			return chain.HeadInfo{Number: 100, Timestamp: chainNow}, nil
+		},
+		getJobStateFn: func(uint64) (chain.JobStateInfo, error) {
+			t.Fatal("GetJobState must not be called while cycle gate is active")
+			return chain.JobStateInfo{}, nil
+		},
+	}
+
+	cfg := defaultSchedConfig()
+	s := NewScheduler(store, stub, worker, cfg, nil)
+	s.tick(ctx)
+
+	assert.Equal(t, int32(0), stub.releaseJobsCalls.Load())
+}
+
+// W4b: RunOnce honors the same gate as the periodic tick so a CLI
+// invocation cannot bypass a paused-cycle backoff.
+func TestScheduler_RunOnceRespectsGate(t *testing.T) {
+	t.Parallel()
+	store := newSchedStore(t)
+	worker := defaultIdentityForTest().WorkerAddress
+	ctx := context.Background()
+
+	chainNow := int64(1_000_000)
+	require.NoError(t, store.AddEligible(ctx, 1, chainNow-2*86400))
+	require.NoError(t, store.SetNextAllowedAttempt(ctx, chainNow+300))
+
+	stub := &schedStub{
+		headFn: func() (chain.HeadInfo, error) {
+			return chain.HeadInfo{Number: 100, Timestamp: chainNow}, nil
+		},
+		getJobStateFn: func(uint64) (chain.JobStateInfo, error) {
+			t.Fatal("RunOnce must not call GetJobState while gate is active")
+			return chain.JobStateInfo{}, nil
+		},
+	}
+
+	cfg := defaultSchedConfig()
+	s := NewScheduler(store, stub, worker, cfg, nil)
+	require.NoError(t, s.RunOnce(ctx), "RunOnce returns nil (no error) when gate blocks")
+
+	assert.Equal(t, int32(0), stub.releaseJobsCalls.Load())
 }
 
 // TestScheduler_StartStopLifecycle: clean shutdown of background loop.
