@@ -141,15 +141,15 @@ func (s *Scheduler) tick(ctx context.Context) {
 		return
 	}
 
-	eligibleNow := countEligible(pending, window, head.Timestamp)
+	readyNow := countReadyForStateCheck(pending, head.Timestamp)
 	dueByTime := head.Timestamp-lastReleaseTs >= int64(s.cfg.Interval/time.Second)
 
-	if eligibleNow < s.cfg.BatchThreshold && !dueByTime {
+	if readyNow < s.cfg.BatchThreshold && !dueByTime {
 		return
 	}
 
 	s.logger.Debug("scheduler: firing release cycle",
-		"eligible_now", eligibleNow,
+		"ready_now", readyNow,
 		"pending_total", len(pending),
 		"due_by_time", dueByTime,
 		"head_block", head.Number,
@@ -266,17 +266,20 @@ func (s *Scheduler) disputeWindow(ctx context.Context) (time.Duration, error) {
 	return s.chain.GetDisputeWindow(ctx)
 }
 
-// collectCandidates filters pending jobs by chain-time eligibility and
-// per-job backoff, sorts (already sorted by Store.Pending) and caps at
-// MaxBatchSize.
-func (s *Scheduler) collectCandidates(pending []PendingJob, window time.Duration, chainNow int64) []PendingJob {
+// collectCandidates picks pending jobs that are ready for on-chain
+// state inspection by partition. Filters by per-job backoff only and
+// caps at MaxBatchSize. Deliberately does NOT enforce the dispute
+// window here: a job that resolves on-chain before its window elapses
+// becomes eligible for release immediately (partition allows
+// JobStateResolved with positive escrow regardless of CompletedAt),
+// and we have no local signal for that transition. Letting all
+// non-backoff jobs through means partition does the authoritative
+// gating using on-chain state at the cost of up to MaxBatchSize extra
+// GetJobState RPCs per probe — bounded and acceptable.
+func (s *Scheduler) collectCandidates(pending []PendingJob, _ time.Duration, chainNow int64) []PendingJob {
 	out := pending[:0:0]
-	windowSec := int64(window / time.Second)
 	for _, p := range pending {
 		if p.BackoffUntil > chainNow {
-			continue
-		}
-		if p.CompletedAt+windowSec > chainNow {
 			continue
 		}
 		out = append(out, p)
@@ -462,16 +465,18 @@ func (s *Scheduler) recordAttemptWithBackoff(ctx context.Context, chainNow int64
 	}
 }
 
-// countEligible returns the number of pending jobs whose dispute window
-// has elapsed by chain time and whose backoff has expired.
-func countEligible(pending []PendingJob, window time.Duration, chainNow int64) int {
-	windowSec := int64(window / time.Second)
+// countReadyForStateCheck returns the number of pending jobs that are
+// out of per-job backoff and therefore ready for on-chain state
+// inspection by partition. It deliberately skips the dispute-window
+// check (see collectCandidates for the rationale): a job that
+// resolves before its window elapses is immediately releasable, and
+// we have no local signal for the resolved transition. The threshold
+// path may now fire while many jobs are still inside the window;
+// partition is the authoritative gate using on-chain state.
+func countReadyForStateCheck(pending []PendingJob, chainNow int64) int {
 	n := 0
 	for _, p := range pending {
 		if p.BackoffUntil > chainNow {
-			continue
-		}
-		if p.CompletedAt+windowSec > chainNow {
 			continue
 		}
 		n++

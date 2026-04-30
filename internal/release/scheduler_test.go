@@ -110,17 +110,17 @@ func TestIsPauseError(t *testing.T) {
 	assert.True(t, isPauseError(errors.New("ENFORCEDPAUSE custom error")), "case-insensitive")
 }
 
-func TestCountEligible_AppliesBackoffAndWindow(t *testing.T) {
+func TestCountReadyForStateCheck_AppliesBackoffOnly(t *testing.T) {
 	t.Parallel()
 	chainNow := int64(100000)
-	window := time.Hour // 3600s
 	pending := []PendingJob{
-		{JobID: 1, CompletedAt: chainNow - 7200},                              // window elapsed → eligible
-		{JobID: 2, CompletedAt: chainNow - 1000},                              // window not elapsed → not eligible
-		{JobID: 3, CompletedAt: chainNow - 7200, BackoffUntil: chainNow + 10}, // backed off → not eligible
-		{JobID: 4, CompletedAt: chainNow - 7200, BackoffUntil: chainNow - 10}, // backoff expired → eligible
+		{JobID: 1, CompletedAt: chainNow - 7200},                              // window elapsed → ready
+		{JobID: 2, CompletedAt: chainNow - 1000},                              // W4c: window not elapsed but still ready (partition decides)
+		{JobID: 3, CompletedAt: chainNow - 7200, BackoffUntil: chainNow + 10}, // backed off → not ready
+		{JobID: 4, CompletedAt: chainNow - 7200, BackoffUntil: chainNow - 10}, // backoff expired → ready
 	}
-	assert.Equal(t, 2, countEligible(pending, window, chainNow))
+	assert.Equal(t, 3, countReadyForStateCheck(pending, chainNow),
+		"prefilter no longer enforces dispute window; only per-job backoff blocks")
 }
 
 // TestScheduler_BatchSuccessPath exercises the happy path: time trigger
@@ -492,6 +492,52 @@ func TestScheduler_RunOnceRespectsGate(t *testing.T) {
 	require.NoError(t, s.RunOnce(ctx), "RunOnce returns nil (no error) when gate blocks")
 
 	assert.Equal(t, int32(0), stub.releaseJobsCalls.Load())
+}
+
+// W4c: a pending job whose CompletedAt is still inside the dispute
+// window must be released immediately if its on-chain state is
+// Resolved with positive escrow. Before this fix, the prefilter
+// (countEligible/collectCandidates) blocked any job with
+// CompletedAt+window > chainNow regardless of state, so a job that
+// resolved early would only release after the original window
+// elapsed — defeating the early-resolve behavior in partition.
+func TestScheduler_ResolvedJobInsideWindowReleasesImmediately(t *testing.T) {
+	t.Parallel()
+	store := newSchedStore(t)
+	worker := defaultIdentityForTest().WorkerAddress
+	ctx := context.Background()
+
+	chainNow := int64(1_000_000)
+	// Pending entry has a recent CompletedAt — well inside the
+	// configured 24h dispute window. Pre-W4c the prefilter would
+	// drop this on every probe.
+	require.NoError(t, store.AddEligible(ctx, 42, chainNow-60))
+
+	stub := &schedStub{
+		headFn: func() (chain.HeadInfo, error) {
+			return chain.HeadInfo{Number: 100, Timestamp: chainNow}, nil
+		},
+		getJobStateFn: func(jobID uint64) (chain.JobStateInfo, error) {
+			// Disputer resolved the job in our favor — partition will
+			// admit it regardless of CompletedAt.
+			return mkInfo(chain.JobStateResolved, worker, chainNow-60, 100), nil
+		},
+		releaseJobsFn: func(ids []uint64) error {
+			require.Equal(t, []uint64{42}, ids, "Resolved job must reach the batch despite being inside window")
+			return nil
+		},
+	}
+
+	cfg := defaultSchedConfig()
+	cfg.BatchThreshold = 1 // single resolved job is enough to fire threshold
+	s := NewScheduler(store, stub, worker, cfg, nil)
+	s.tick(ctx)
+
+	assert.Equal(t, int32(1), stub.releaseJobsCalls.Load())
+
+	pending, err := store.Pending(ctx)
+	require.NoError(t, err)
+	assert.Empty(t, pending, "released job must be removed from pending")
 }
 
 // TestScheduler_StartStopLifecycle: clean shutdown of background loop.
