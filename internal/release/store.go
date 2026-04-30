@@ -30,7 +30,11 @@ import (
 // SchemaVersion is the on-disk schema version for the release state file.
 // Bump when changing field semantics in PendingJob or Snapshot — Load will
 // then reject older files and the operator must run a migration or wipe.
-const SchemaVersion = 1
+//
+// v2 (current): adds Snapshot.NextAllowedAttempt so cycle-level backoff
+// (e.g. paused contract) is decoupled from LastReleaseTs.
+// v1: initial schema.
+const SchemaVersion = 2
 
 // PendingJob is one entry in the local "completed but not yet released" set.
 // CompletedAt is best-effort: the pipeline writer fills it from time.Now()
@@ -49,6 +53,13 @@ type PendingJob struct {
 // Snapshot is the full on-disk document. Identity fields are checked at load
 // time against the runtime config so a worker can never accidentally
 // settle jobs from a different chain or different worker key.
+//
+// LastReleaseTs records when a cycle last fired (used by the time-based
+// trigger). NextAllowedAttempt is a separate forward gate that the
+// scheduler must respect before any cycle attempt — it exists so that a
+// cycle-level backoff (e.g. paused contract) cannot be silently
+// bypassed by the threshold path or stretched by the time-trigger
+// interval. Both fields are unix seconds in chain time.
 type Snapshot struct {
 	SchemaVersion       int          `json:"schema_version"`
 	ChainID             uint64       `json:"chain_id"`
@@ -57,6 +68,7 @@ type Snapshot struct {
 	Pending             []PendingJob `json:"pending"`
 	LastReconciledBlock uint64       `json:"last_reconciled_block"`
 	LastReleaseTs       int64        `json:"last_release_ts"`
+	NextAllowedAttempt  int64        `json:"next_allowed_attempt"` // chain seconds; cycle gate, distinct from LastReleaseTs
 }
 
 // StoreIdentity scopes a Store to one (chain, contract, worker) triple.
@@ -123,6 +135,16 @@ type Store interface {
 
 	// SetLastReleaseTs records a cycle attempt (regardless of outcome).
 	SetLastReleaseTs(ctx context.Context, ts int64) error
+
+	// GetNextAllowedAttempt returns the chain timestamp before which no
+	// release cycle may run. Distinct from LastReleaseTs: cycle-level
+	// backoff (e.g. paused contract) writes here so the scheduler's
+	// threshold path AND time-trigger path both honor it.
+	GetNextAllowedAttempt(ctx context.Context) (int64, error)
+
+	// SetNextAllowedAttempt records the next chain timestamp at which a
+	// cycle may attempt to run. Writing 0 effectively clears the gate.
+	SetNextAllowedAttempt(ctx context.Context, ts int64) error
 
 	// Close releases any retained OS resources. After Close, all other
 	// methods return an error.
@@ -553,6 +575,39 @@ func (s *FileStore) SetLastReleaseTs(_ context.Context, ts int64) error {
 			return err
 		}
 		snap.LastReleaseTs = ts
+		return s.writeSnapshotLocked(snap)
+	})
+}
+
+// GetNextAllowedAttempt returns the cycle-backoff gate timestamp.
+// Missing/empty state propagates as an error rather than returning 0,
+// which would otherwise cause the scheduler to fire immediately
+// despite an active backoff.
+func (s *FileStore) GetNextAllowedAttempt(_ context.Context) (int64, error) {
+	var out int64
+	err := s.withSharedLock(func() error {
+		snap, err := s.readSnapshotLocked()
+		if err != nil {
+			return err
+		}
+		if vErr := s.verifyIdentityLocked(snap); vErr != nil {
+			return vErr
+		}
+		out = snap.NextAllowedAttempt
+		return nil
+	})
+	return out, err
+}
+
+// SetNextAllowedAttempt records the chain timestamp before which no
+// release cycle may run.
+func (s *FileStore) SetNextAllowedAttempt(_ context.Context, ts int64) error {
+	return s.withExclusiveLock(func() error {
+		snap, err := s.loadVerifiedLocked()
+		if err != nil {
+			return err
+		}
+		snap.NextAllowedAttempt = ts
 		return s.writeSnapshotLocked(snap)
 	})
 }

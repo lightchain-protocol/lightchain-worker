@@ -316,6 +316,56 @@ func TestPostInit_MissingFile_AllReadsAndMutatorsFail(t *testing.T) {
 	require.Error(t, store.SetLastReleaseTs(ctx, 1234))
 }
 
+// W4a: NextAllowedAttempt is a separate cycle-backoff gate; round-trip
+// it to ensure the new field persists across reads.
+func TestNextAllowedAttempt_RoundTrip(t *testing.T) {
+	t.Parallel()
+	store, _ := newStore(t)
+	ctx := context.Background()
+
+	got, err := store.GetNextAllowedAttempt(ctx)
+	require.NoError(t, err)
+	assert.Equal(t, int64(0), got, "fresh store starts with zero gate")
+
+	require.NoError(t, store.SetNextAllowedAttempt(ctx, 1700000000))
+
+	got, err = store.GetNextAllowedAttempt(ctx)
+	require.NoError(t, err)
+	assert.Equal(t, int64(1700000000), got)
+
+	// Setting LastReleaseTs must not clobber NextAllowedAttempt — they
+	// are deliberately distinct fields.
+	require.NoError(t, store.SetLastReleaseTs(ctx, 9999))
+	got, err = store.GetNextAllowedAttempt(ctx)
+	require.NoError(t, err)
+	assert.Equal(t, int64(1700000000), got)
+}
+
+// W4a: schema v1 files (pre-NextAllowedAttempt) must be rejected so
+// operators are forced to migrate or wipe rather than silently lose
+// the new gate semantics on first run after upgrade.
+func TestNewFileStore_RejectsLegacySchemaV1(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	path := filepath.Join(dir, "release_state.json")
+
+	identity := defaultIdentityForTest()
+	v1 := Snapshot{
+		SchemaVersion: 1,
+		ChainID:       identity.ChainID,
+		JobRegistry:   identity.JobRegistry.Hex(),
+		WorkerAddress: identity.WorkerAddress.Hex(),
+		Pending:       []PendingJob{},
+	}
+	data, err := json.Marshal(v1)
+	require.NoError(t, err)
+	require.NoError(t, os.WriteFile(path, data, 0o600))
+
+	_, err = NewFileStore(path, identity, nil)
+	require.Error(t, err)
+	assert.ErrorIs(t, err, ErrSchemaVersionMismatch)
+}
+
 func TestPostInit_EmptyFile_DistinctFromMissing(t *testing.T) {
 	t.Parallel()
 	store, path := newStore(t)
