@@ -192,8 +192,9 @@ type SettlementClient interface {
 	Head(ctx context.Context) (HeadInfo, error)
 
 	// FilterJobCompleted returns JobCompleted events emitted by this worker
-	// in the half-open block range [fromBlock, toBlock]. Both ends inclusive
-	// per ethclient.FilterLogs semantics. Filtering by worker uses the
-	// indexed topic so the call is cheap even on large block ranges.
+	// in the closed block range [fromBlock, toBlock] (both endpoints
+	// inclusive, per ethclient.FilterLogs semantics). Filtering by worker
+	// uses the indexed topic so the call is cheap even on large block
+	// ranges.
 	FilterJobCompleted(ctx context.Context, worker common.Address, fromBlock, toBlock uint64) ([]JobCompletedEvent, error)
 }
