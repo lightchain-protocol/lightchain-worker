@@ -883,7 +883,9 @@ func (h *JobHandler) getOrDeriveSessionKey(ctx context.Context, logger *slog.Log
 		return key, nil
 	}
 
-	v, err, shared := h.keyFetchGroup.Do(strconv.FormatUint(sessionID, 10), func() (any, error) {
+	leader := false
+	v, err, _ := h.keyFetchGroup.Do(strconv.FormatUint(sessionID, 10), func() (any, error) {
+		leader = true
 		// Re-check the cache inside the flight: a sibling caller may have
 		// just finished between our outer miss and entering Do.
 		if k, err := h.keyStore.GetKey(sessionID); err == nil {
@@ -904,7 +906,7 @@ func (h *JobHandler) getOrDeriveSessionKey(ctx context.Context, logger *slog.Log
 	if err != nil {
 		return nil, err
 	}
-	if shared {
+	if !leader {
 		// Follower: did not run the closure. Count as a cache hit so the
 		// per-caller metric event is preserved.
 		h.metrics.SessionKeyEvents.WithLabelValues(metrics.SessionKeyPathCacheHit).Inc()

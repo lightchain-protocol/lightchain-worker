@@ -572,7 +572,14 @@ func TestGetOrDeriveSessionKey_CoalescesConcurrentMisses(t *testing.T) {
 	var fetchCount atomic.Int32
 	chain := &mockChainClient{
 		getEncWorkerKeyFn: func(_ context.Context, sid uint64) ([]byte, error) {
-			require.Equal(t, sessionID, sid)
+			// Cannot use require.Equal here: this callback runs on
+			// goroutines spawned by the test, and require.* calls
+			// FailNow which is unsafe outside the main test goroutine.
+			// Surface mismatches as a returned error and assert in the
+			// main flow via errs[i].
+			if sid != sessionID {
+				return nil, fmt.Errorf("unexpected sessionID: got %d want %d", sid, sessionID)
+			}
 			fetchCount.Add(1)
 			// Sleep widens the race window so a missing singleflight
 			// reliably produces >1 fetches.
