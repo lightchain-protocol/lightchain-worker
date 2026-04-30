@@ -284,3 +284,49 @@ func TestStore_InProcessConcurrentGoroutines(t *testing.T) {
 }
 
 var _ = errors.Is
+
+// --- W2: post-init missing/empty state must fail loud across every read
+// path (Pending, GetReconcileBlock, GetLastReleaseTs) and mutator. The
+// legitimate first-run path lives in NewFileStore; everything after that
+// treats missing/empty as corruption so settlement state is never
+// silently wiped.
+
+func TestPostInit_MissingFile_AllReadsAndMutatorsFail(t *testing.T) {
+	t.Parallel()
+	store, path := newStore(t)
+	ctx := context.Background()
+	require.NoError(t, os.Remove(path))
+
+	_, err := store.Pending(ctx)
+	require.Error(t, err)
+	assert.ErrorIs(t, err, os.ErrNotExist)
+
+	_, err = store.GetReconcileBlock(ctx)
+	require.Error(t, err)
+	assert.ErrorIs(t, err, os.ErrNotExist)
+
+	_, err = store.GetLastReleaseTs(ctx)
+	require.Error(t, err)
+	assert.ErrorIs(t, err, os.ErrNotExist)
+
+	require.Error(t, store.AddEligible(ctx, 1, 100))
+	require.Error(t, store.Remove(ctx, []uint64{1}))
+	require.Error(t, store.RecordFailure(ctx, 1, 200))
+	require.Error(t, store.SetReconcileBlock(ctx, 5))
+	require.Error(t, store.SetLastReleaseTs(ctx, 1234))
+}
+
+func TestPostInit_EmptyFile_DistinctFromMissing(t *testing.T) {
+	t.Parallel()
+	store, path := newStore(t)
+	ctx := context.Background()
+	require.NoError(t, os.WriteFile(path, nil, 0o600))
+
+	_, err := store.Pending(ctx)
+	require.Error(t, err)
+	assert.ErrorIs(t, err, ErrEmptySnapshot, "empty file must surface ErrEmptySnapshot, not os.ErrNotExist")
+	assert.NotErrorIs(t, err, os.ErrNotExist, "empty file must NOT alias missing-file")
+
+	require.Error(t, store.AddEligible(ctx, 1, 100))
+	require.Error(t, store.SetReconcileBlock(ctx, 5))
+}

@@ -77,6 +77,14 @@ var ErrIdentityMismatch = errors.New("release store identity mismatch")
 // a future or removed schema version. Operators must migrate or wipe.
 var ErrSchemaVersionMismatch = errors.New("release store schema version mismatch")
 
+// ErrEmptySnapshot is returned by readSnapshotLocked when the data file
+// exists but is zero bytes — distinct from os.ErrNotExist so post-init
+// callers can fail loud instead of treating truncation as a clean
+// bootstrap. The legitimate first-run path is created by NewFileStore
+// under exclusive lock; any later read seeing an empty file means the
+// state was lost (truncated, partially written, or manually edited).
+var ErrEmptySnapshot = errors.New("release store snapshot is empty")
+
 // Store is the persistence interface the scheduler, reconciler, and tracker
 // share. Defined at the consumer per the project's accept-interfaces
 // convention. All methods are safe for concurrent use, including across
@@ -254,15 +262,18 @@ func (s *FileStore) withLock(lockType int, fn func() error) error {
 }
 
 // readSnapshotLocked reads and parses the data file. Caller must hold the
-// flock. Returns wrapped os.ErrNotExist when the file is absent (first run).
+// flock. Returns os.ErrNotExist (from os.ReadFile) when the file is
+// absent — only NewFileStore should treat that as the first-run signal;
+// every other caller must propagate it. Returns ErrEmptySnapshot for a
+// zero-byte file so that post-init truncation is not silently treated as
+// a fresh start.
 func (s *FileStore) readSnapshotLocked() (Snapshot, error) {
 	data, err := os.ReadFile(s.dataPath)
 	if err != nil {
 		return Snapshot{}, err
 	}
 	if len(data) == 0 {
-		// Treat empty file as "not yet initialized" rather than corrupt.
-		return Snapshot{}, os.ErrNotExist
+		return Snapshot{}, fmt.Errorf("%w: %s", ErrEmptySnapshot, s.dataPath)
 	}
 	var snap Snapshot
 	if err := json.Unmarshal(data, &snap); err != nil {
@@ -364,18 +375,14 @@ func addrEqualHex(stored string, want common.Address) bool {
 }
 
 // loadVerifiedLocked is the read-modify-write helper used by mutators.
-// Caller must hold an exclusive flock.
+// Caller must hold an exclusive flock. Post-init the data file must
+// always exist and be non-empty — silently re-initializing on
+// missing/empty would drop pending jobs, the reconcile cursor, and
+// LastReleaseTs after a truncation or accidental delete. Fail loud so
+// the operator can investigate; only NewFileStore creates the file.
 func (s *FileStore) loadVerifiedLocked() (Snapshot, error) {
 	snap, err := s.readSnapshotLocked()
 	if err != nil {
-		if errors.Is(err, os.ErrNotExist) {
-			// File was deleted out from under us. Re-initialize so the
-			// caller can mutate against an empty snapshot rather than
-			// erroring — matches the "first run" path.
-			s.logger.Warn("release state file missing on read; re-initializing",
-				"path", s.dataPath)
-			return s.emptySnapshot(), nil
-		}
 		return Snapshot{}, err
 	}
 	if err := s.verifyIdentityLocked(snap); err != nil {
@@ -405,15 +412,15 @@ func (s *FileStore) AddEligible(_ context.Context, jobID uint64, completedAt int
 	})
 }
 
-// Pending returns a sorted snapshot of the pending set.
+// Pending returns a sorted snapshot of the pending set. Post-init the
+// data file must exist and be non-empty; missing/empty errors propagate
+// rather than masquerading as "no pending jobs", which would otherwise
+// silently disable the scheduler.
 func (s *FileStore) Pending(_ context.Context) ([]PendingJob, error) {
 	var out []PendingJob
 	err := s.withSharedLock(func() error {
 		snap, err := s.readSnapshotLocked()
 		if err != nil {
-			if errors.Is(err, os.ErrNotExist) {
-				return nil
-			}
 			return err
 		}
 		if vErr := s.verifyIdentityLocked(snap); vErr != nil {
@@ -482,15 +489,14 @@ func (s *FileStore) RecordFailure(_ context.Context, jobID uint64, backoffUntil 
 	})
 }
 
-// GetReconcileBlock returns the cursor.
+// GetReconcileBlock returns the cursor. Missing/empty state propagates
+// as an error rather than returning 0, which would otherwise cause the
+// reconciler to silently rescan from genesis.
 func (s *FileStore) GetReconcileBlock(_ context.Context) (uint64, error) {
 	var out uint64
 	err := s.withSharedLock(func() error {
 		snap, err := s.readSnapshotLocked()
 		if err != nil {
-			if errors.Is(err, os.ErrNotExist) {
-				return nil
-			}
 			return err
 		}
 		if vErr := s.verifyIdentityLocked(snap); vErr != nil {
@@ -520,15 +526,14 @@ func (s *FileStore) SetReconcileBlock(_ context.Context, block uint64) error {
 	})
 }
 
-// GetLastReleaseTs returns the cycle-attempt timestamp.
+// GetLastReleaseTs returns the cycle-attempt timestamp. Missing/empty
+// state propagates as an error rather than returning 0, which would
+// otherwise cause the time-trigger to fire immediately.
 func (s *FileStore) GetLastReleaseTs(_ context.Context) (int64, error) {
 	var out int64
 	err := s.withSharedLock(func() error {
 		snap, err := s.readSnapshotLocked()
 		if err != nil {
-			if errors.Is(err, os.ErrNotExist) {
-				return nil
-			}
 			return err
 		}
 		if vErr := s.verifyIdentityLocked(snap); vErr != nil {
