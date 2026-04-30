@@ -294,6 +294,10 @@ func (r *ReleaseTester) Head(ctx context.Context) (uint64, int64, error) {
 func (r *ReleaseTester) ResetStore(t testing.TB) {
 	t.Helper()
 
+	if r.store == nil {
+		t.Fatal("workertest: release store is not open (tester may already be closed)")
+	}
+
 	if err := r.store.Close(); err != nil {
 		t.Fatalf("workertest: close release store before reset: %v", err)
 	}
