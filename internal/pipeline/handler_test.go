@@ -551,6 +551,69 @@ func TestHandleTask_SessionKeyRotated_Refreshes(t *testing.T) {
 	assert.Equal(t, newSessionKey, stored)
 }
 
+// TestGetOrDeriveSessionKey_CoalescesConcurrentMisses verifies that N
+// goroutines all calling getOrDeriveSessionKey for the same session before the
+// cache is populated trigger exactly one chain RPC. Without singleflight,
+// each caller would race past the GetKey miss and fire its own
+// GetSessionEncWorkerKey. Regression test for issue #15.
+func TestGetOrDeriveSessionKey_CoalescesConcurrentMisses(t *testing.T) {
+	t.Parallel()
+	mr := miniredis.RunT(t)
+	rc := redis.NewClient(&redis.Options{Addr: mr.Addr()})
+	t.Cleanup(func() { rc.Close() })
+
+	const sessionID = uint64(42)
+	const callers = 16
+
+	sessionKey := testSessionKey(t)
+	ecdhKey := testECDHKey(t)
+	encWorkerKey := encryptSessionKeyForWorker(t, sessionKey, ecdhKey)
+
+	var fetchCount atomic.Int32
+	chain := &mockChainClient{
+		getEncWorkerKeyFn: func(_ context.Context, sid uint64) ([]byte, error) {
+			require.Equal(t, sessionID, sid)
+			fetchCount.Add(1)
+			// Sleep widens the race window so a missing singleflight
+			// reliably produces >1 fetches.
+			time.Sleep(50 * time.Millisecond)
+			return encWorkerKey, nil
+		},
+	}
+	ks := newMockKeyStore()
+
+	counter := &atomic.Int32{}
+	logger := slog.New(slog.NewTextHandler(io.Discard, &slog.HandlerOptions{Level: slog.LevelError}))
+	handler := NewJobHandler(
+		chain, &mockBlobFetcher{}, &mockBlobSubmitter{}, ks, &mockOllama{}, rc,
+		testSigningKey(t), ecdhKey, counter, logger,
+		HandlerConfig{AckTxTimeout: 5 * time.Second, BlobTxTimeout: 60 * time.Second, RedisPublishTimeout: 5 * time.Second},
+		nil, nil, testMetrics(t), metrics.DeliveryAsynq,
+	)
+
+	var wg sync.WaitGroup
+	results := make([][]byte, callers)
+	errs := make([]error, callers)
+	start := make(chan struct{})
+	for i := 0; i < callers; i++ {
+		wg.Add(1)
+		go func(idx int) {
+			defer wg.Done()
+			<-start
+			results[idx], errs[idx] = handler.getOrDeriveSessionKey(context.Background(), logger, sessionID)
+		}(i)
+	}
+	close(start) // release all goroutines together
+	wg.Wait()
+
+	for i, err := range errs {
+		require.NoError(t, err, "caller %d", i)
+		require.Equal(t, sessionKey, results[i], "caller %d", i)
+	}
+	assert.Equal(t, int32(1), fetchCount.Load(),
+		"GetSessionEncWorkerKey must be called exactly once for coalesced concurrent misses")
+}
+
 func TestHandleTask_CompleteJobFailure(t *testing.T) {
 	t.Parallel()
 	mr := miniredis.RunT(t)

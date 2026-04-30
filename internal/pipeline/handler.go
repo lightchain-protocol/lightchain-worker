@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"log/slog"
 	"math/big"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -19,6 +20,7 @@ import (
 	"github.com/ethereum/go-ethereum/crypto"
 	"github.com/hibiken/asynq"
 	"github.com/redis/go-redis/v9"
+	"golang.org/x/sync/singleflight"
 
 	pkgcrypto "github.com/lightchain/pkg/crypto"
 	pkgtypes "github.com/lightchain/pkg/types"
@@ -126,6 +128,11 @@ type JobHandler struct {
 	// settle the job after the dispute window. Failure to write is
 	// non-fatal — the periodic reconciler picks up missed writes.
 	releaseTracker ReleaseTracker
+	// keyFetchGroup coalesces concurrent cache-miss derivations for the same
+	// session so that N parallel jobs trigger exactly one chain RPC. Only
+	// getOrDeriveSessionKey uses it; refreshSessionKey deliberately bypasses
+	// this group because its purpose is to defeat any cache after a rotation.
+	keyFetchGroup singleflight.Group
 }
 
 // SetReleaseTracker installs the release tracker after construction.
@@ -860,9 +867,14 @@ func (h *JobHandler) completeJob(
 }
 
 // getOrDeriveSessionKey tries the cache first, then derives from chain on miss.
+//
+// Concurrent cache-miss callers for the same sessionID are coalesced via
+// keyFetchGroup so that N parallel jobs trigger exactly one chain RPC instead
+// of N. Followers wait for the leader's result; from their perspective the key
+// was already in flight, so they are recorded as cache hits to keep the
+// per-caller event count intact for dashboards.
 func (h *JobHandler) getOrDeriveSessionKey(ctx context.Context, logger *slog.Logger, sessionID uint64) ([]byte, error) {
-	key, err := h.keyStore.GetKey(sessionID)
-	if err == nil {
+	if key, err := h.keyStore.GetKey(sessionID); err == nil {
 		h.metrics.SessionKeyEvents.WithLabelValues(metrics.SessionKeyPathCacheHit).Inc()
 		logger.Info("stage 3: session key cache hit",
 			"stage", "session_key",
@@ -870,12 +882,34 @@ func (h *JobHandler) getOrDeriveSessionKey(ctx context.Context, logger *slog.Log
 		)
 		return key, nil
 	}
-	h.metrics.SessionKeyEvents.WithLabelValues(metrics.SessionKeyPathChainDerive).Inc()
-	logger.Info("stage 3: session key cache miss, deriving from chain",
-		"stage", "session_key",
-		"path", "chain_derive",
-	)
-	return h.deriveAndStoreSessionKey(ctx, logger, sessionID)
+
+	v, err, shared := h.keyFetchGroup.Do(strconv.FormatUint(sessionID, 10), func() (any, error) {
+		// Re-check the cache inside the flight: a sibling caller may have
+		// just finished between our outer miss and entering Do.
+		if k, err := h.keyStore.GetKey(sessionID); err == nil {
+			h.metrics.SessionKeyEvents.WithLabelValues(metrics.SessionKeyPathCacheHit).Inc()
+			logger.Info("stage 3: session key cache hit (inside flight)",
+				"stage", "session_key",
+				"path", "cache_hit",
+			)
+			return k, nil
+		}
+		h.metrics.SessionKeyEvents.WithLabelValues(metrics.SessionKeyPathChainDerive).Inc()
+		logger.Info("stage 3: session key cache miss, deriving from chain",
+			"stage", "session_key",
+			"path", "chain_derive",
+		)
+		return h.deriveAndStoreSessionKey(ctx, logger, sessionID)
+	})
+	if err != nil {
+		return nil, err
+	}
+	if shared {
+		// Follower: did not run the closure. Count as a cache hit so the
+		// per-caller metric event is preserved.
+		h.metrics.SessionKeyEvents.WithLabelValues(metrics.SessionKeyPathCacheHit).Inc()
+	}
+	return v.([]byte), nil
 }
 
 // refreshSessionKey skips the local cache and derives the latest session key
