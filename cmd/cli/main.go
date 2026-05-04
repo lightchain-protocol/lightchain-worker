@@ -107,8 +107,11 @@ Commands:
 balance/withdraw/release additionally require JOB_REGISTRY_ADDRESS.
 release additionally reads RELEASE_STATE_PATH (and other RELEASE_* vars).
 drain/undrain require REDIS_URL (direct mode) or WORKER_GATEWAY_URL
-(gateway mode); LIGHTCHAIN_DRAIN_TTL optionally overrides the default
-TTL (disputeWindow + 2h).
+(gateway mode). In direct mode, LIGHTCHAIN_DRAIN_TTL optionally
+overrides the chain-derived default TTL (disputeWindow + 2h). In
+gateway mode, the TTL is governed by the worker-gateway's own
+DRAIN_TTL setting; LIGHTCHAIN_DRAIN_TTL has no effect and the CLI
+emits a warning if it is set.
 
 drain semantics:
   drain marks the worker ineligible for new sessions but does NOT stop
@@ -351,12 +354,17 @@ func newDrainHandler(
 	if cfg.RedisURL == "" {
 		logger.Error("drain/undrain require either WORKER_GATEWAY_URL or REDIS_URL")
 		quitProcess(1)
+		// quitProcess is bound to os.Exit in production but injectable for
+		// tests; explicit returns prevent fall-through to redis.ParseURL("")
+		// when a test stubs quitProcess to a no-op.
+		return nil
 	}
 
 	opts, err := redis.ParseURL(cfg.RedisURL)
 	if err != nil {
 		logger.Error("parse REDIS_URL failed", "error", err)
 		quitProcess(1)
+		return nil
 	}
 	h.RedisClient = redis.NewClient(opts)
 
