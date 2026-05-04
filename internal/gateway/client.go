@@ -155,6 +155,48 @@ func (c *Client) SendHeartbeat(ctx context.Context, payload HeartbeatPayload) er
 	return nil
 }
 
+// SendDrain posts a drain request to the gateway. The gateway sets the
+// worker's drain marker in Redis, signalling the dispatcher to stop
+// selecting this worker for new sessions. Idempotent.
+func (c *Client) SendDrain(ctx context.Context) error {
+	if err := c.ensureAuth(ctx); err != nil {
+		return fmt.Errorf("auth: %w", err)
+	}
+
+	resp, err := c.doPost(ctx, "/api/worker/drain", nil, c.getToken())
+	if err != nil {
+		return fmt.Errorf("post drain: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusNoContent {
+		respBody, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("drain failed (status %d): %s", resp.StatusCode, string(respBody))
+	}
+	return nil
+}
+
+// SendUndrain posts an undrain request to the gateway. The gateway removes
+// the worker's drain marker in Redis, restoring eligibility for new
+// sessions on the next dispatcher selection cycle. Idempotent.
+func (c *Client) SendUndrain(ctx context.Context) error {
+	if err := c.ensureAuth(ctx); err != nil {
+		return fmt.Errorf("auth: %w", err)
+	}
+
+	resp, err := c.doPost(ctx, "/api/worker/undrain", nil, c.getToken())
+	if err != nil {
+		return fmt.Errorf("post undrain: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusNoContent {
+		respBody, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("undrain failed (status %d): %s", resp.StatusCode, string(respBody))
+	}
+	return nil
+}
+
 // PollJob long-polls the gateway for a job. Returns nil payload if no job is available.
 func (c *Client) PollJob(ctx context.Context, timeout time.Duration) (*pipeline.JobPayload, error) {
 	if err := c.ensureAuth(ctx); err != nil {
