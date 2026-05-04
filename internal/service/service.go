@@ -23,6 +23,8 @@ import (
 	"github.com/hibiken/asynq"
 	"github.com/redis/go-redis/v9"
 
+	pkgtypes "github.com/lightchain/pkg/types"
+
 	"github.com/lightchain/worker/internal/blob"
 	"github.com/lightchain/worker/internal/chain"
 	"github.com/lightchain/worker/internal/config"
@@ -40,9 +42,27 @@ import (
 // write during service startup. It validates Redis connectivity before accepting traffic.
 const startupHeartbeatTimeout = 5 * time.Second
 
+// shutdownDrainTimeout is the maximum time allowed for the SIGTERM-driven
+// drain marker write. Set short — the goal is best-effort signalling, not
+// blocking the shutdown sequence on a network round trip.
+const shutdownDrainTimeout = 10 * time.Second
+
+// drainTTLFallback is used when the on-chain dispute window cannot be read
+// at drain time (RPC down, context cancelled, etc.). 24h matches the live
+// testnet dispute window, with a small implicit slack via the shutdown
+// timeout. See docs/worker-drain-plan.md.
+const drainTTLFallback = 24 * time.Hour
+
+// drainSlack is added to the on-chain dispute window when computing the
+// drain TTL. Gives the operator time to run claimTimeout/releaseJobs/
+// deregister/withdraw after the dispute window passes without the drain
+// marker silently expiring mid-cleanup.
+const drainSlack = 2 * time.Hour
+
 // Service owns all worker sidecar components and coordinates startup and shutdown.
 type Service struct {
 	cfg             *config.Config
+	workerAddr      common.Address
 	chainClient     *chain.ChainClient
 	coordinator     *chain.SubpoolCoordinator
 	redis           *redis.Client
@@ -475,6 +495,7 @@ func New(cfg *config.Config) (*Service, error) {
 
 		return &Service{
 			cfg:               cfg,
+			workerAddr:        workerAddr,
 			chainClient:       chainClient,
 			coordinator:       coordinator,
 			redis:             redisClient,
@@ -558,6 +579,7 @@ func New(cfg *config.Config) (*Service, error) {
 
 	return &Service{
 		cfg:               cfg,
+		workerAddr:        workerAddr,
 		chainClient:       chainClient,
 		coordinator:       coordinator,
 		redis:             redisClient,
@@ -678,6 +700,11 @@ func (s *Service) Run(ctx context.Context) error {
 
 	s.logger.Info("shutdown signal received, stopping gracefully")
 
+	// Set the drain marker BEFORE asynq.Shutdown waits for in-flight jobs.
+	// New sessions stop being routed to this worker while existing jobs
+	// drain naturally. Use a fresh context — sigCtx is cancelled.
+	s.markDrainOnShutdown(false)
+
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), s.cfg.ShutdownTimeout)
 	defer cancel()
 
@@ -734,9 +761,80 @@ func (s *Service) runGatewayMode(ctx context.Context, cancel context.CancelFunc)
 	<-ctx.Done()
 	s.logger.Info("shutdown signal received, stopping gracefully")
 
+	// Set the drain marker via the gateway BEFORE shutdown closes the
+	// gateway client. New sessions stop being routed; in-flight stream
+	// jobs continue draining via the WebSocket reader until ctx
+	// propagation closes it.
+	s.markDrainOnShutdown(true)
+
 	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), s.cfg.ShutdownTimeout)
 	defer shutdownCancel()
 	return s.shutdown(shutdownCtx)
+}
+
+// markDrainOnShutdown writes the drain marker as the worker exits. Failure
+// is non-fatal — a missing drain marker just means the worker will be
+// filtered out by stale-detection (TTL expiry on the heartbeat key)
+// instead of by drain. The shutdown sequence proceeds regardless.
+//
+// gatewayMode selects between writing via the gateway HTTP API (external
+// workers) and writing directly to Redis (internal workers).
+func (s *Service) markDrainOnShutdown(gatewayMode bool) {
+	ctx, cancel := context.WithTimeout(context.Background(), shutdownDrainTimeout)
+	defer cancel()
+
+	if gatewayMode {
+		if s.gwClient == nil {
+			return
+		}
+		if err := s.gwClient.SendDrain(ctx); err != nil {
+			s.logger.Warn("drain_write_failed",
+				"mode", "gateway",
+				"worker", s.workerAddr.Hex(),
+				"error", err,
+			)
+			return
+		}
+		s.logger.Info("drain marker set via gateway", "worker", s.workerAddr.Hex())
+		return
+	}
+
+	if s.redis == nil {
+		return
+	}
+	ttl := s.computeDrainTTL(ctx)
+	if err := pkgtypes.SetDraining(ctx, s.redis, s.workerAddr.Hex(), ttl); err != nil {
+		s.logger.Warn("drain_write_failed",
+			"mode", "direct",
+			"worker", s.workerAddr.Hex(),
+			"ttl", ttl,
+			"error", err,
+		)
+		return
+	}
+	s.logger.Info("drain marker set via redis",
+		"worker", s.workerAddr.Hex(),
+		"ttl", ttl,
+	)
+}
+
+// computeDrainTTL derives the drain marker TTL from the on-chain dispute
+// window plus operator slack. Falls back to drainTTLFallback if the chain
+// read fails — drain still works, but the TTL may drift from governance
+// changes until the next read succeeds.
+func (s *Service) computeDrainTTL(ctx context.Context) time.Duration {
+	if s.chainClient == nil {
+		return drainTTLFallback
+	}
+	disputeWindow, err := s.chainClient.GetDisputeWindow(ctx)
+	if err != nil {
+		s.logger.Warn("get dispute window for drain TTL failed; using fallback",
+			"fallback", drainTTLFallback,
+			"error", err,
+		)
+		return drainTTLFallback
+	}
+	return disputeWindow + drainSlack
 }
 
 // startReleaseSubsystem launches the Scheduler and the periodic Reconciler.
