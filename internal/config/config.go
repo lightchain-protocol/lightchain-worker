@@ -252,9 +252,14 @@ func Load() (*Config, error) {
 	cfg.ShutdownTimeout = parseDuration("SHUTDOWN_TIMEOUT", "30s", &errs)
 	// Drain TTL override — empty means "consult AIConfig.getDisputeWindow()".
 	// parseDuration treats "0s" as a valid zero, which is what we want
-	// when the env var is unset. Any non-zero value bypasses the chain
-	// lookup and is used as-is.
+	// when the env var is unset. Any positive value bypasses the chain
+	// lookup; negative values are rejected so a typo like "-1h" fails
+	// fast instead of silently disabling the override (the > 0 short-
+	// circuit in computeDrainTTL would treat it as "unset" otherwise).
 	cfg.DrainTTLOverride = parseDuration("LIGHTCHAIN_DRAIN_TTL", "0s", &errs)
+	if cfg.DrainTTLOverride < 0 {
+		errs = append(errs, fmt.Sprintf("LIGHTCHAIN_DRAIN_TTL: must be >= 0, got %s", cfg.DrainTTLOverride))
+	}
 	cfg.OllamaTimeout = parseDuration("OLLAMA_TIMEOUT", "120s", &errs)
 	cfg.AckTxTimeout = parseDuration("ACK_TX_TIMEOUT", "15s", &errs)
 	// BlobTxTimeout bounds stage 8 (submit_blob): slot wait + SendTransaction

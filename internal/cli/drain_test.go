@@ -168,6 +168,42 @@ func TestDrain_gatewayMode_callsSendDrain(t *testing.T) {
 	assert.Equal(t, 1, gw.drainCalls)
 }
 
+func TestDrain_gatewayMode_warnsWhenDrainTTLOverrideSet(t *testing.T) {
+	t.Parallel()
+	gw := &stubGateway{}
+	out := &bytes.Buffer{}
+
+	h := &DrainHandler{
+		Gateway:          gw,
+		WorkerAddr:       testDrainWorker,
+		DrainTTLOverride: 10 * time.Minute,
+		Out:              out,
+		Logger:           discardLogger(),
+	}
+	require.NoError(t, h.Drain(context.Background()))
+
+	assert.Equal(t, 1, gw.drainCalls,
+		"warning must not block the drain itself")
+	assert.Contains(t, out.String(), "LIGHTCHAIN_DRAIN_TTL has no effect in gateway mode")
+}
+
+func TestDrain_gatewayMode_silentWhenNoOverride(t *testing.T) {
+	t.Parallel()
+	gw := &stubGateway{}
+	out := &bytes.Buffer{}
+
+	h := &DrainHandler{
+		Gateway:    gw,
+		WorkerAddr: testDrainWorker,
+		Out:        out,
+		Logger:     discardLogger(),
+	}
+	require.NoError(t, h.Drain(context.Background()))
+
+	assert.NotContains(t, out.String(), "no effect in gateway mode",
+		"warning must only fire when an override is actually set")
+}
+
 func TestDrain_failsWhenNoBackendConfigured(t *testing.T) {
 	t.Parallel()
 	h := &DrainHandler{WorkerAddr: testDrainWorker, Logger: discardLogger()}

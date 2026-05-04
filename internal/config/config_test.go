@@ -23,6 +23,7 @@ var allEnvKeys = []string{
 	"MAX_CONCURRENT_JOBS", "ACK_TX_TIMEOUT", "BLOB_TX_TIMEOUT", "BLOB_FETCH_TIMEOUT",
 	"BLOB_FETCH_RETRIES", "RECEIPT_POLL_INTERVAL", "REDIS_PUBLISH_TIMEOUT",
 	"SHUTDOWN_TIMEOUT",
+	"LIGHTCHAIN_DRAIN_TTL",
 	"LOG_LEVEL", "LOG_FORMAT",
 }
 
@@ -89,6 +90,40 @@ func TestLoad_StuckNonceOverrides(t *testing.T) {
 	assert.Equal(t, 8, cfg.StuckNonceThreshold)
 	assert.Equal(t, 1, cfg.StuckNonceMaxBumps)
 	assert.False(t, cfg.StuckNonceAutoReplace)
+}
+
+func TestLoad_DrainTTLOverride_zeroIsUnset(t *testing.T) {
+	validEnv(t)
+	t.Setenv("WORKER_KEYSTORE_PATH", "/tmp/keystore.json")
+	t.Setenv("WORKER_KEYSTORE_PASSWORD", "secret")
+
+	cfg, err := Load()
+	require.NoError(t, err)
+	assert.Equal(t, time.Duration(0), cfg.DrainTTLOverride,
+		"unset LIGHTCHAIN_DRAIN_TTL should leave override at zero")
+}
+
+func TestLoad_DrainTTLOverride_acceptsPositiveDuration(t *testing.T) {
+	validEnv(t)
+	t.Setenv("WORKER_KEYSTORE_PATH", "/tmp/keystore.json")
+	t.Setenv("WORKER_KEYSTORE_PASSWORD", "secret")
+	t.Setenv("LIGHTCHAIN_DRAIN_TTL", "30m")
+
+	cfg, err := Load()
+	require.NoError(t, err)
+	assert.Equal(t, 30*time.Minute, cfg.DrainTTLOverride)
+}
+
+func TestLoad_DrainTTLOverride_rejectsNegativeDuration(t *testing.T) {
+	validEnv(t)
+	t.Setenv("WORKER_KEYSTORE_PATH", "/tmp/keystore.json")
+	t.Setenv("WORKER_KEYSTORE_PASSWORD", "secret")
+	t.Setenv("LIGHTCHAIN_DRAIN_TTL", "-1h")
+
+	_, err := Load()
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "LIGHTCHAIN_DRAIN_TTL")
+	assert.Contains(t, err.Error(), "must be >= 0")
 }
 
 func TestLoad_StuckNonceInvalidBoolean(t *testing.T) {

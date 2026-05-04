@@ -360,9 +360,38 @@ func newDrainHandler(
 	}
 	h.RedisClient = redis.NewClient(opts)
 
-	chainClient := dialChain(cfg, signingKey, logger)
+	// Best-effort: if the chain RPC is unreachable, drain still works
+	// using DrainTTLFallback and undrain's confirmation prompt simply
+	// skips the dispute-window line. The drain feature exists for
+	// operational robustness — it should not be the first thing to
+	// break when the RPC goes down.
+	chainClient, err := tryDialChain(cfg, signingKey, logger)
+	if err != nil {
+		logger.Warn("dial chain failed; drain will use TTL fallback",
+			"error", err,
+			"fallback", cli.DrainTTLFallback,
+		)
+		return h
+	}
 	h.ChainClient = chainClient
 	return h
+}
+
+// tryDialChain mirrors dialChain but returns the error instead of calling
+// os.Exit. Used by newDrainHandler so chain RPC unavailability degrades
+// gracefully into DrainTTLFallback rather than aborting drain entirely.
+func tryDialChain(cfg *config.RegistrationConfig, signingKey *ecdsa.PrivateKey, logger *slog.Logger) (*chain.ChainClient, error) {
+	return chain.NewChainClient(
+		cfg.RPCURL,
+		cfg.ChainID,
+		cfg.WorkerRegistryAddress,
+		cfg.AIConfigAddress,
+		cfg.JobRegistryAddress,
+		signingKey,
+		cfg.GasPriceMultiplierBps,
+		chain.NewSubpoolCoordinator(logger, 0),
+		chain.NewStuckNonceTracker(),
+	)
 }
 
 // loadAndValidateForSettlement is loadAndValidateCfg + the additional

@@ -73,6 +73,19 @@ const drainTTLLookupTimeout = 5 * time.Second
 // worker-gateway HTTP API (external mode).
 func (h *DrainHandler) Drain(ctx context.Context) error {
 	if h.Gateway != nil {
+		// LIGHTCHAIN_DRAIN_TTL is a worker-side knob and has no effect in
+		// gateway mode — the gateway computes the TTL from its own
+		// DRAIN_TTL config. Surface this to the operator so they don't
+		// silently get gateway-default behavior when they thought their
+		// override was active.
+		if h.DrainTTLOverride > 0 {
+			msg := "LIGHTCHAIN_DRAIN_TTL has no effect in gateway mode; " +
+				"TTL is governed by the worker-gateway's DRAIN_TTL setting"
+			if h.Logger != nil {
+				h.Logger.Warn(msg, "override", h.DrainTTLOverride)
+			}
+			fmt.Fprintln(h.out(), "Warning: "+msg)
+		}
 		if err := h.Gateway.SendDrain(ctx); err != nil {
 			return fmt.Errorf("send drain via gateway: %w", err)
 		}
