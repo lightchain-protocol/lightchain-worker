@@ -11,6 +11,8 @@
 //	keygen      Generate/load ECDH encryption key and print public key hex
 //	register    Register worker on-chain (stake + encryption key + models)
 //	add-models  Add models to an already-registered worker
+//	drain       Mark worker ineligible for new sessions (selection-only)
+//	undrain     Reverse drain — restore worker eligibility
 //	deregister  Deregister worker and withdraw stake
 //	status      Check on-chain registration status
 package main
@@ -28,10 +30,12 @@ import (
 	ethkeystore "github.com/ethereum/go-ethereum/accounts/keystore"
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/crypto"
+	"github.com/redis/go-redis/v9"
 
 	"github.com/lightchain/worker/internal/chain"
 	"github.com/lightchain/worker/internal/cli"
 	"github.com/lightchain/worker/internal/config"
+	"github.com/lightchain/worker/internal/gateway"
 	"github.com/lightchain/worker/internal/keystore"
 	"github.com/lightchain/worker/internal/release"
 )
@@ -61,6 +65,10 @@ func main() {
 		runAddModels()
 	case "deregister":
 		runDeregister()
+	case "drain":
+		runDrain()
+	case "undrain":
+		runUndrain()
 	case "status":
 		runStatus()
 	case "balance":
@@ -88,6 +96,8 @@ Commands:
   keygen      Generate/load ECDH encryption key and print public key hex
   register    Register worker on-chain (stake + encryption key + models)
   add-models  Add models to an already-registered worker
+  drain       Mark worker ineligible for new sessions (selection-only)
+  undrain     Reverse drain — restore worker eligibility
   deregister  Deregister worker and withdraw stake
   status      Check on-chain registration status
   balance     Print the worker's accumulated on-chain workerBalance
@@ -96,6 +106,16 @@ Commands:
 
 balance/withdraw/release additionally require JOB_REGISTRY_ADDRESS.
 release additionally reads RELEASE_STATE_PATH (and other RELEASE_* vars).
+drain/undrain require REDIS_URL (direct mode) or WORKER_GATEWAY_URL
+(gateway mode); LIGHTCHAIN_DRAIN_TTL optionally overrides the default
+TTL (disputeWindow + 2h).
+
+drain semantics:
+  drain marks the worker ineligible for new sessions but does NOT stop
+  the running worker process from pulling reassignment jobs already in
+  its queue. To fully stop the process, send SIGTERM to the sidecar
+  (which drains and exits). Use drain when you want to monitor in-flight
+  job settlement before tearing down.
 
 All configuration is via environment variables. See docs/worker-cli.md for details.
 
@@ -268,6 +288,86 @@ func runStatus() {
 		logger.Error("status check failed", "error", err)
 		os.Exit(1)
 	}
+}
+
+func runDrain() {
+	cfg, logger := loadAndValidateCfg()
+	signingKey, workerAddr := loadSigningKey(cfg, logger)
+	h := newDrainHandler(cfg, signingKey, workerAddr, logger, false /*skipConfirm not used by drain*/)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	if err := h.Drain(ctx); err != nil {
+		logger.Error("drain failed", "error", err)
+		os.Exit(1)
+	}
+}
+
+func runUndrain() {
+	fs := flag.NewFlagSet("undrain", flag.ExitOnError)
+	yes := fs.Bool("yes", false, "Skip confirmation prompt")
+	if err := fs.Parse(os.Args[2:]); err != nil {
+		os.Exit(1)
+	}
+
+	cfg, logger := loadAndValidateCfg()
+	signingKey, workerAddr := loadSigningKey(cfg, logger)
+	h := newDrainHandler(cfg, signingKey, workerAddr, logger, *yes)
+	h.Stdin = os.Stdin
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	if err := h.Undrain(ctx); err != nil {
+		logger.Error("undrain failed", "error", err)
+		os.Exit(1)
+	}
+}
+
+// newDrainHandler wires the DrainHandler from the registration config and
+// signing key. Picks gateway mode when WORKER_GATEWAY_URL is set, otherwise
+// direct Redis mode.
+func newDrainHandler(
+	cfg *config.RegistrationConfig,
+	signingKey *ecdsa.PrivateKey,
+	workerAddr common.Address,
+	logger *slog.Logger,
+	skipConfirm bool,
+) *cli.DrainHandler {
+	h := &cli.DrainHandler{
+		WorkerAddr:  workerAddr,
+		SkipConfirm: skipConfirm,
+		Out:         os.Stdout,
+		Logger:      logger,
+	}
+
+	if override := os.Getenv("LIGHTCHAIN_DRAIN_TTL"); override != "" {
+		d, err := time.ParseDuration(override)
+		if err != nil {
+			logger.Error("LIGHTCHAIN_DRAIN_TTL: invalid duration", "value", override, "error", err)
+			quitProcess(1)
+		}
+		h.DrainTTLOverride = d
+	}
+
+	if cfg.WorkerGatewayURL != "" {
+		gwClient := gateway.NewClient(cfg.WorkerGatewayURL, signingKey, logger)
+		h.Gateway = gwClient
+		return h
+	}
+
+	if cfg.RedisURL == "" {
+		logger.Error("drain/undrain require either WORKER_GATEWAY_URL or REDIS_URL")
+		quitProcess(1)
+	}
+
+	opts, err := redis.ParseURL(cfg.RedisURL)
+	if err != nil {
+		logger.Error("parse REDIS_URL failed", "error", err)
+		quitProcess(1)
+	}
+	h.RedisClient = redis.NewClient(opts)
+
+	chainClient := dialChain(cfg, signingKey, logger)
+	h.ChainClient = chainClient
+	return h
 }
 
 // loadAndValidateForSettlement is loadAndValidateCfg + the additional

@@ -30,6 +30,12 @@ type RegistrationConfig struct {
 	// address; chain.NewChainClient skips the JobRegistry binding when zero.
 	JobRegistryAddress common.Address
 
+	// Drain — required only by the drain/undrain subcommands. Exactly one
+	// of these is consulted at runtime: WorkerGatewayURL (gateway mode)
+	// takes precedence if set, otherwise RedisURL (direct mode).
+	RedisURL         string
+	WorkerGatewayURL string
+
 	// Models — comma-separated list
 	SupportedModels []string
 
@@ -53,6 +59,8 @@ func LoadRegistration() (*RegistrationConfig, error) {
 		WorkerKeystorePassword: os.Getenv("WORKER_KEYSTORE_PASSWORD"),
 		EncryptionKeystorePath: envOrDefault("ENCRYPTION_KEYSTORE_PATH", "data/worker-encryption.key"),
 		RPCURL:                 envOrDefault("RPC_URL", "http://localhost:8545"),
+		RedisURL:               os.Getenv("REDIS_URL"),
+		WorkerGatewayURL:       os.Getenv("WORKER_GATEWAY_URL"),
 		LogLevel:               envOrDefault("LOG_LEVEL", "info"),
 		LogFormat:              envOrDefault("LOG_FORMAT", "json"),
 	}
