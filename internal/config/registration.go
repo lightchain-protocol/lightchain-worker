@@ -5,6 +5,7 @@ import (
 	"math/big"
 	"os"
 	"strings"
+	"time"
 
 	"github.com/ethereum/go-ethereum/common"
 )
@@ -35,6 +36,12 @@ type RegistrationConfig struct {
 	// takes precedence if set, otherwise RedisURL (direct mode).
 	RedisURL         string
 	WorkerGatewayURL string
+
+	// DrainTTLOverride is parsed from LIGHTCHAIN_DRAIN_TTL. When > 0 it
+	// is used as the drain marker TTL, bypassing the on-chain dispute
+	// window lookup. Both SIGTERM-driven (sidecar) and CLI-driven drain
+	// consult the same env var so behavior is consistent.
+	DrainTTLOverride time.Duration
 
 	// Models — comma-separated list
 	SupportedModels []string
@@ -131,6 +138,19 @@ func LoadRegistration() (*RegistrationConfig, error) {
 			errs = append(errs, "WORKER_STAKE: must be non-negative")
 		} else {
 			cfg.WorkerStake = stake
+		}
+	}
+
+	// LIGHTCHAIN_DRAIN_TTL — optional drain TTL override (consumed by
+	// drain/undrain subcommands). Empty means "use chain-derived TTL".
+	if ttlStr := os.Getenv("LIGHTCHAIN_DRAIN_TTL"); ttlStr != "" {
+		d, err := time.ParseDuration(ttlStr)
+		if err != nil {
+			errs = append(errs, fmt.Sprintf("LIGHTCHAIN_DRAIN_TTL: invalid duration %q: %v", ttlStr, err))
+		} else if d <= 0 {
+			errs = append(errs, fmt.Sprintf("LIGHTCHAIN_DRAIN_TTL: must be positive, got %s", d))
+		} else {
+			cfg.DrainTTLOverride = d
 		}
 	}
 

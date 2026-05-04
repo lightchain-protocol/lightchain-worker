@@ -47,6 +47,12 @@ const startupHeartbeatTimeout = 5 * time.Second
 // blocking the shutdown sequence on a network round trip.
 const shutdownDrainTimeout = 10 * time.Second
 
+// drainTTLLookupTimeout bounds the on-chain dispute-window RPC so a hung
+// lookup cannot consume the budget reserved for the Redis write that
+// follows. Falling back to drainTTLFallback in this window leaves time
+// for SetDraining to succeed.
+const drainTTLLookupTimeout = 4 * time.Second
+
 // drainTTLFallback is used when the on-chain dispute window cannot be read
 // at drain time (RPC down, context cancelled, etc.). 24h matches the live
 // testnet dispute window, with a small implicit slack via the shutdown
@@ -780,13 +786,12 @@ func (s *Service) runGatewayMode(ctx context.Context, cancel context.CancelFunc)
 // gatewayMode selects between writing via the gateway HTTP API (external
 // workers) and writing directly to Redis (internal workers).
 func (s *Service) markDrainOnShutdown(gatewayMode bool) {
-	ctx, cancel := context.WithTimeout(context.Background(), shutdownDrainTimeout)
-	defer cancel()
-
 	if gatewayMode {
 		if s.gwClient == nil {
 			return
 		}
+		ctx, cancel := context.WithTimeout(context.Background(), shutdownDrainTimeout)
+		defer cancel()
 		if err := s.gwClient.SendDrain(ctx); err != nil {
 			s.logger.Warn("drain_write_failed",
 				"mode", "gateway",
@@ -802,8 +807,17 @@ func (s *Service) markDrainOnShutdown(gatewayMode bool) {
 	if s.redis == nil {
 		return
 	}
-	ttl := s.computeDrainTTL(ctx)
-	if err := pkgtypes.SetDraining(ctx, s.redis, s.workerAddr.Hex(), ttl); err != nil {
+
+	// computeDrainTTL bounds its chain RPC to drainTTLLookupTimeout so a
+	// hung lookup cannot consume the budget reserved for the Redis write.
+	ttl := s.computeDrainTTL()
+
+	// Fresh context for the Redis write so it is not poisoned by the
+	// chain RPC's deadline regardless of how long the lookup actually
+	// took.
+	writeCtx, cancel := context.WithTimeout(context.Background(), shutdownDrainTimeout)
+	defer cancel()
+	if err := pkgtypes.SetDraining(writeCtx, s.redis, s.workerAddr.Hex(), ttl); err != nil {
 		s.logger.Warn("drain_write_failed",
 			"mode", "direct",
 			"worker", s.workerAddr.Hex(),
@@ -818,15 +832,28 @@ func (s *Service) markDrainOnShutdown(gatewayMode bool) {
 	)
 }
 
-// computeDrainTTL derives the drain marker TTL from the on-chain dispute
-// window plus operator slack. Falls back to drainTTLFallback if the chain
-// read fails — drain still works, but the TTL may drift from governance
-// changes until the next read succeeds.
-func (s *Service) computeDrainTTL(ctx context.Context) time.Duration {
+// computeDrainTTL derives the drain marker TTL.
+//
+// Resolution order:
+//  1. cfg.DrainTTLOverride (set from LIGHTCHAIN_DRAIN_TTL at startup) —
+//     same env var honored by the CLI path, so SIGTERM-driven drain and
+//     `lightchain-worker drain` agree.
+//  2. AIConfig.getDisputeWindow() + drainSlack from the chain. Bounded by
+//     drainTTLLookupTimeout so a hung RPC cannot block shutdown.
+//  3. drainTTLFallback if the chain read fails or the chain client is
+//     unavailable.
+func (s *Service) computeDrainTTL() time.Duration {
+	if s.cfg != nil && s.cfg.DrainTTLOverride > 0 {
+		return s.cfg.DrainTTLOverride
+	}
 	if s.chainClient == nil {
 		return drainTTLFallback
 	}
-	disputeWindow, err := s.chainClient.GetDisputeWindow(ctx)
+
+	lookupCtx, cancel := context.WithTimeout(context.Background(), drainTTLLookupTimeout)
+	defer cancel()
+
+	disputeWindow, err := s.chainClient.GetDisputeWindow(lookupCtx)
 	if err != nil {
 		s.logger.Warn("get dispute window for drain TTL failed; using fallback",
 			"fallback", drainTTLFallback,

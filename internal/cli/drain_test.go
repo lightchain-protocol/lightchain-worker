@@ -42,6 +42,16 @@ func (s stubDisputeWindow) GetDisputeWindow(_ context.Context) (time.Duration, e
 	return s.value, s.err
 }
 
+// blockingDisputeWindow simulates a hung chain RPC: it blocks until the
+// caller's context is canceled, then returns ctx.Err. Used to assert the
+// drain TTL lookup is bounded by its own sub-context, not the caller's.
+type blockingDisputeWindow struct{}
+
+func (blockingDisputeWindow) GetDisputeWindow(ctx context.Context) (time.Duration, error) {
+	<-ctx.Done()
+	return 0, ctx.Err()
+}
+
 type stubGateway struct {
 	drainCalls   int
 	undrainCalls int
@@ -96,6 +106,34 @@ func TestDrain_directMode_usesFallbackWhenChainFails(t *testing.T) {
 	ttl := mr.TTL(pkgtypes.DrainRedisKey(testDrainWorker.Hex()))
 	assert.InDelta(t, DrainTTLFallback.Seconds(), ttl.Seconds(), 5,
 		"falls back to DrainTTLFallback when chain read fails")
+}
+
+func TestDrain_directMode_writeStillSucceedsWhenChainHangs(t *testing.T) {
+	t.Parallel()
+	rdb, mr := newDrainTestRedis(t)
+
+	h := &DrainHandler{
+		RedisClient: rdb,
+		ChainClient: blockingDisputeWindow{},
+		WorkerAddr:  testDrainWorker,
+		Logger:      discardLogger(),
+	}
+
+	// Caller's deadline is well beyond the internal lookup timeout.
+	// computeDrainTTL must bound its own RPC so SetDraining still has
+	// time to run with the fallback TTL.
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	start := time.Now()
+	require.NoError(t, h.Drain(ctx))
+	elapsed := time.Since(start)
+
+	assert.Less(t, elapsed, 15*time.Second,
+		"drain must not block on the chain RPC for the full caller deadline")
+	ttl := mr.TTL(pkgtypes.DrainRedisKey(testDrainWorker.Hex()))
+	assert.InDelta(t, DrainTTLFallback.Seconds(), ttl.Seconds(), 5,
+		"falls back to DrainTTLFallback when the chain RPC times out")
 }
 
 func TestDrain_directMode_overrideTakesPrecedence(t *testing.T) {

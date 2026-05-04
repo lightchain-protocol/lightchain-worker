@@ -338,14 +338,9 @@ func newDrainHandler(
 		Logger:      logger,
 	}
 
-	if override := os.Getenv("LIGHTCHAIN_DRAIN_TTL"); override != "" {
-		d, err := time.ParseDuration(override)
-		if err != nil {
-			logger.Error("LIGHTCHAIN_DRAIN_TTL: invalid duration", "value", override, "error", err)
-			quitProcess(1)
-		}
-		h.DrainTTLOverride = d
-	}
+	// LIGHTCHAIN_DRAIN_TTL is parsed once in config.LoadRegistration so
+	// the SIGTERM and CLI paths share the same source of truth.
+	h.DrainTTLOverride = cfg.DrainTTLOverride
 
 	if cfg.WorkerGatewayURL != "" {
 		gwClient := gateway.NewClient(cfg.WorkerGatewayURL, signingKey, logger)

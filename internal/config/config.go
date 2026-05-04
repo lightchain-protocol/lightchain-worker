@@ -101,6 +101,12 @@ type Config struct {
 	// Shutdown
 	ShutdownTimeout time.Duration
 
+	// DrainTTLOverride is parsed from LIGHTCHAIN_DRAIN_TTL. When > 0 it
+	// is used as the drain marker TTL, bypassing the on-chain dispute
+	// window lookup. Both SIGTERM-driven and CLI-driven drain consult
+	// this same field so the override is consistent across entrypoints.
+	DrainTTLOverride time.Duration
+
 	// Gateway mode (optional — when set, worker uses HTTP gateway instead of direct Redis)
 	WorkerGatewayURL string
 
@@ -244,6 +250,11 @@ func Load() (*Config, error) {
 	// Durations
 	cfg.HeartbeatInterval = parseDuration("HEARTBEAT_INTERVAL", "10s", &errs)
 	cfg.ShutdownTimeout = parseDuration("SHUTDOWN_TIMEOUT", "30s", &errs)
+	// Drain TTL override — empty means "consult AIConfig.getDisputeWindow()".
+	// parseDuration treats "0s" as a valid zero, which is what we want
+	// when the env var is unset. Any non-zero value bypasses the chain
+	// lookup and is used as-is.
+	cfg.DrainTTLOverride = parseDuration("LIGHTCHAIN_DRAIN_TTL", "0s", &errs)
 	cfg.OllamaTimeout = parseDuration("OLLAMA_TIMEOUT", "120s", &errs)
 	cfg.AckTxTimeout = parseDuration("ACK_TX_TIMEOUT", "15s", &errs)
 	// BlobTxTimeout bounds stage 8 (submit_blob): slot wait + SendTransaction

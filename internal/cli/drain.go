@@ -62,6 +62,12 @@ type DrainHandler struct {
 // window.
 const DrainTTLFallback = 24 * time.Hour
 
+// drainTTLLookupTimeout bounds the on-chain dispute-window read so it
+// cannot consume the caller's full deadline. If the RPC takes longer
+// than this, computeDrainTTL falls back to DrainTTLFallback while
+// leaving the caller's context budget intact for the Redis write.
+const drainTTLLookupTimeout = 5 * time.Second
+
 // Drain marks the worker as ineligible for new sessions by writing the
 // drain marker either directly to Redis (internal mode) or via the
 // worker-gateway HTTP API (external mode).
@@ -80,6 +86,8 @@ func (h *DrainHandler) Drain(ctx context.Context) error {
 		return fmt.Errorf("drain requires either a Redis client (direct mode) or a gateway client")
 	}
 
+	// computeDrainTTL bounds its chain RPC to its own sub-context so a
+	// hung lookup does not eat the budget for SetDraining below.
 	ttl := h.computeDrainTTL(ctx)
 	if err := pkgtypes.SetDraining(ctx, h.RedisClient, h.WorkerAddr.Hex(), ttl); err != nil {
 		return fmt.Errorf("set drain marker: %w", err)
@@ -160,7 +168,14 @@ func (h *DrainHandler) computeDrainTTL(ctx context.Context) time.Duration {
 	if h.ChainClient == nil {
 		return DrainTTLFallback
 	}
-	dw, err := h.ChainClient.GetDisputeWindow(ctx)
+
+	// Bound the RPC to its own sub-context so a hung chain client cannot
+	// burn the caller's deadline — the Redis write that follows must
+	// still have time to run with the fallback TTL.
+	lookupCtx, cancel := context.WithTimeout(ctx, drainTTLLookupTimeout)
+	defer cancel()
+
+	dw, err := h.ChainClient.GetDisputeWindow(lookupCtx)
 	if err != nil {
 		if h.Logger != nil {
 			h.Logger.Warn("get dispute window failed; using drain TTL fallback",
