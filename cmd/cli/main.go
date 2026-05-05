@@ -108,10 +108,13 @@ balance/withdraw/release additionally require JOB_REGISTRY_ADDRESS.
 release additionally reads RELEASE_STATE_PATH (and other RELEASE_* vars).
 drain/undrain require REDIS_URL (direct mode) or WORKER_GATEWAY_URL
 (gateway mode). In direct mode, LIGHTCHAIN_DRAIN_TTL optionally
-overrides the chain-derived default TTL (disputeWindow + 2h). In
-gateway mode, the TTL is governed by the worker-gateway's own
-DRAIN_TTL setting; LIGHTCHAIN_DRAIN_TTL has no effect and the CLI
-emits a warning if it is set.
+overrides the chain-derived default TTL (disputeWindow + slack).
+LIGHTCHAIN_DRAIN_SLACK overrides the slack added to the dispute
+window (default 2h); useful for E2E tests that lower the dispute
+window and want a tight drain marker. In gateway mode, the TTL is
+governed by the worker-gateway's own DRAIN_TTL setting;
+LIGHTCHAIN_DRAIN_TTL and LIGHTCHAIN_DRAIN_SLACK have no effect and
+the CLI emits a warning if LIGHTCHAIN_DRAIN_TTL is set.
 
 drain semantics:
   drain marks the worker ineligible for new sessions but does NOT stop
@@ -341,9 +344,11 @@ func newDrainHandler(
 		Logger:      logger,
 	}
 
-	// LIGHTCHAIN_DRAIN_TTL is parsed once in config.LoadRegistration so
-	// the SIGTERM and CLI paths share the same source of truth.
+	// LIGHTCHAIN_DRAIN_TTL and LIGHTCHAIN_DRAIN_SLACK are parsed once in
+	// config.LoadRegistration so the SIGTERM and CLI paths share the same
+	// source of truth.
 	h.DrainTTLOverride = cfg.DrainTTLOverride
+	h.DrainSlack = cfg.DrainSlack
 
 	if cfg.WorkerGatewayURL != "" {
 		gwClient := gateway.NewClient(cfg.WorkerGatewayURL, signingKey, logger)

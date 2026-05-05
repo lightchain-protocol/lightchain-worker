@@ -59,11 +59,12 @@ const drainTTLLookupTimeout = 4 * time.Second
 // timeout. See docs/worker-drain-plan.md.
 const drainTTLFallback = 24 * time.Hour
 
-// drainSlack is added to the on-chain dispute window when computing the
-// drain TTL. Gives the operator time to run claimTimeout/releaseJobs/
-// deregister/withdraw after the dispute window passes without the drain
-// marker silently expiring mid-cleanup.
-const drainSlack = 2 * time.Hour
+// defaultDrainSlack is the fallback added to the on-chain dispute window
+// when computing the drain TTL if cfg.DrainSlack is zero. It gives the
+// operator time to run claimTimeout/releaseJobs/deregister/withdraw after
+// the dispute window passes without the drain marker silently expiring
+// mid-cleanup. Override via LIGHTCHAIN_DRAIN_SLACK.
+const defaultDrainSlack = 2 * time.Hour
 
 // Service owns all worker sidecar components and coordinates startup and shutdown.
 type Service struct {
@@ -838,8 +839,9 @@ func (s *Service) markDrainOnShutdown(gatewayMode bool) {
 //  1. cfg.DrainTTLOverride (set from LIGHTCHAIN_DRAIN_TTL at startup) —
 //     same env var honored by the CLI path, so SIGTERM-driven drain and
 //     `lightchain-worker drain` agree.
-//  2. AIConfig.getDisputeWindow() + drainSlack from the chain. Bounded by
-//     drainTTLLookupTimeout so a hung RPC cannot block shutdown.
+//  2. AIConfig.getDisputeWindow() + cfg.DrainSlack (LIGHTCHAIN_DRAIN_SLACK,
+//     default 2h) from the chain. Bounded by drainTTLLookupTimeout so a
+//     hung RPC cannot block shutdown.
 //  3. drainTTLFallback if the chain read fails or the chain client is
 //     unavailable.
 func (s *Service) computeDrainTTL() time.Duration {
@@ -861,7 +863,17 @@ func (s *Service) computeDrainTTL() time.Duration {
 		)
 		return drainTTLFallback
 	}
-	return disputeWindow + drainSlack
+	return disputeWindow + s.drainSlack()
+}
+
+// drainSlack returns cfg.DrainSlack when set, otherwise defaultDrainSlack.
+// Keeping the fallback localized here means a future caller that builds a
+// Service with cfg=nil (test harness) still gets sane behavior.
+func (s *Service) drainSlack() time.Duration {
+	if s.cfg != nil && s.cfg.DrainSlack > 0 {
+		return s.cfg.DrainSlack
+	}
+	return defaultDrainSlack
 }
 
 // startReleaseSubsystem launches the Scheduler and the periodic Reconciler.

@@ -23,7 +23,7 @@ var allEnvKeys = []string{
 	"MAX_CONCURRENT_JOBS", "ACK_TX_TIMEOUT", "BLOB_TX_TIMEOUT", "BLOB_FETCH_TIMEOUT",
 	"BLOB_FETCH_RETRIES", "RECEIPT_POLL_INTERVAL", "REDIS_PUBLISH_TIMEOUT",
 	"SHUTDOWN_TIMEOUT",
-	"LIGHTCHAIN_DRAIN_TTL",
+	"LIGHTCHAIN_DRAIN_TTL", "LIGHTCHAIN_DRAIN_SLACK",
 	"LOG_LEVEL", "LOG_FORMAT",
 }
 
@@ -123,6 +123,52 @@ func TestLoad_DrainTTLOverride_rejectsNegativeDuration(t *testing.T) {
 	_, err := Load()
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "LIGHTCHAIN_DRAIN_TTL")
+	assert.Contains(t, err.Error(), "must be >= 0")
+}
+
+func TestLoad_DrainSlack_defaultsTo2h(t *testing.T) {
+	validEnv(t)
+	t.Setenv("WORKER_KEYSTORE_PATH", "/tmp/keystore.json")
+	t.Setenv("WORKER_KEYSTORE_PASSWORD", "secret")
+
+	cfg, err := Load()
+	require.NoError(t, err)
+	assert.Equal(t, 2*time.Hour, cfg.DrainSlack,
+		"unset LIGHTCHAIN_DRAIN_SLACK should default to 2h")
+}
+
+func TestLoad_DrainSlack_acceptsShortDuration(t *testing.T) {
+	validEnv(t)
+	t.Setenv("WORKER_KEYSTORE_PATH", "/tmp/keystore.json")
+	t.Setenv("WORKER_KEYSTORE_PASSWORD", "secret")
+	t.Setenv("LIGHTCHAIN_DRAIN_SLACK", "10s")
+
+	cfg, err := Load()
+	require.NoError(t, err)
+	assert.Equal(t, 10*time.Second, cfg.DrainSlack)
+}
+
+func TestLoad_DrainSlack_acceptsZero(t *testing.T) {
+	validEnv(t)
+	t.Setenv("WORKER_KEYSTORE_PATH", "/tmp/keystore.json")
+	t.Setenv("WORKER_KEYSTORE_PASSWORD", "secret")
+	t.Setenv("LIGHTCHAIN_DRAIN_SLACK", "0s")
+
+	cfg, err := Load()
+	require.NoError(t, err)
+	assert.Equal(t, time.Duration(0), cfg.DrainSlack,
+		"zero is valid (drain TTL == dispute window with no slack)")
+}
+
+func TestLoad_DrainSlack_rejectsNegativeDuration(t *testing.T) {
+	validEnv(t)
+	t.Setenv("WORKER_KEYSTORE_PATH", "/tmp/keystore.json")
+	t.Setenv("WORKER_KEYSTORE_PASSWORD", "secret")
+	t.Setenv("LIGHTCHAIN_DRAIN_SLACK", "-5m")
+
+	_, err := Load()
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "LIGHTCHAIN_DRAIN_SLACK")
 	assert.Contains(t, err.Error(), "must be >= 0")
 }
 

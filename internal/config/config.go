@@ -107,6 +107,12 @@ type Config struct {
 	// this same field so the override is consistent across entrypoints.
 	DrainTTLOverride time.Duration
 
+	// DrainSlack is added to the on-chain dispute window when computing
+	// the drain marker TTL. Parsed from LIGHTCHAIN_DRAIN_SLACK; defaults
+	// to 2h when unset. Lowering it is the lever E2E suites use to keep
+	// drain windows short without touching the chain dispute window.
+	DrainSlack time.Duration
+
 	// Gateway mode (optional — when set, worker uses HTTP gateway instead of direct Redis)
 	WorkerGatewayURL string
 
@@ -259,6 +265,14 @@ func Load() (*Config, error) {
 	cfg.DrainTTLOverride = parseDuration("LIGHTCHAIN_DRAIN_TTL", "0s", &errs)
 	if cfg.DrainTTLOverride < 0 {
 		errs = append(errs, fmt.Sprintf("LIGHTCHAIN_DRAIN_TTL: must be >= 0, got %s", cfg.DrainTTLOverride))
+	}
+	// LIGHTCHAIN_DRAIN_SLACK extends the on-chain dispute window. Default
+	// 2h matches the value previously hardcoded in service.go; tests
+	// override it to 10s or so to keep drain windows tight without
+	// touching the chain dispute window.
+	cfg.DrainSlack = parseDuration("LIGHTCHAIN_DRAIN_SLACK", "2h", &errs)
+	if cfg.DrainSlack < 0 {
+		errs = append(errs, fmt.Sprintf("LIGHTCHAIN_DRAIN_SLACK: must be >= 0, got %s", cfg.DrainSlack))
 	}
 	cfg.OllamaTimeout = parseDuration("OLLAMA_TIMEOUT", "120s", &errs)
 	cfg.AckTxTimeout = parseDuration("ACK_TX_TIMEOUT", "15s", &errs)

@@ -43,6 +43,12 @@ type RegistrationConfig struct {
 	// consult the same env var so behavior is consistent.
 	DrainTTLOverride time.Duration
 
+	// DrainSlack is added to the on-chain dispute window when the CLI
+	// computes the drain marker TTL. Parsed from LIGHTCHAIN_DRAIN_SLACK;
+	// zero means "use the handler default (2h)". Mirrors the sidecar
+	// config so SIGTERM and CLI agree on the same value.
+	DrainSlack time.Duration
+
 	// Models — comma-separated list
 	SupportedModels []string
 
@@ -151,6 +157,20 @@ func LoadRegistration() (*RegistrationConfig, error) {
 			errs = append(errs, fmt.Sprintf("LIGHTCHAIN_DRAIN_TTL: must be positive, got %s", d))
 		} else {
 			cfg.DrainTTLOverride = d
+		}
+	}
+
+	// LIGHTCHAIN_DRAIN_SLACK — optional slack added to the dispute window
+	// (consumed by the drain subcommand). Empty means "use the handler
+	// default (2h)". Negative is rejected to match the sidecar config.
+	if slackStr := os.Getenv("LIGHTCHAIN_DRAIN_SLACK"); slackStr != "" {
+		d, err := time.ParseDuration(slackStr)
+		if err != nil {
+			errs = append(errs, fmt.Sprintf("LIGHTCHAIN_DRAIN_SLACK: invalid duration %q: %v", slackStr, err))
+		} else if d < 0 {
+			errs = append(errs, fmt.Sprintf("LIGHTCHAIN_DRAIN_SLACK: must be >= 0, got %s", d))
+		} else {
+			cfg.DrainSlack = d
 		}
 	}
 
