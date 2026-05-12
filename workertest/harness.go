@@ -192,6 +192,7 @@ func New(t testing.TB, opts Options) *Harness {
 			ChainID:             opts.ChainID,
 			JobRegistryAddr:     opts.JobRegistryAddr,
 		},
+		nil, // publisher — fallback wires RedisResponsePublisher from RedisClient
 		checkpoints,
 		// Each harness instance gets its own metrics registry — keeps
 		// integration tests isolated from each other and from any global

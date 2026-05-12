@@ -50,9 +50,9 @@ type JobExecutionClient interface {
 	CompleteJob(ctx context.Context, jobID uint64, responseBlobHash [32]byte, responseCiphertextHash [32]byte) error
 	HasJobAcknowledged(ctx context.Context, jobID uint64) (bool, error)
 	HasJobCompleted(ctx context.Context, jobID uint64) (bool, error)
-	// GetSessionEncWorkerKey returns the most recent encrypted worker session key
-	// for the given session — queries both SessionCreated and SessionKeyUpdated
-	// events and returns the one from the highest-numbered block.
+	// GetSessionEncWorkerKey retrieves the current encrypted worker key for a session
+	// from JobRegistry session storage. Returns the latest key whether set at creation
+	// or after rotation via updateSessionKey. Rejects sessions that are not active.
 	GetSessionEncWorkerKey(ctx context.Context, sessionID uint64) ([]byte, error)
 	// GetJobBlobInfo returns the single prompt and response blob hashes for a
 	// completed job along with the blocks they were submitted in. Used to build
@@ -119,9 +119,9 @@ type JobHandler struct {
 	// are distinguishable in dashboards. Set once at construction.
 	delivery string
 	// checkpoints is optional. When nil, the handler runs without retry
-	// caching — equivalent to pre-PR-2 behavior. Production wires a
-	// Redis-backed store here; tests that exercise the cache path do the
-	// same via miniredis.
+	// caching. In direct (Asynq) mode the cache prevents re-running stages
+	// 2-6 on retries; in gateway mode it has the same effect if the gateway
+	// redelivers a jobID after worker disconnect.
 	checkpoints *CheckpointStore
 	// releaseTracker is optional. When set (via SetReleaseTracker), the
 	// handler records a stage-8b success so the release scheduler can
@@ -160,6 +160,7 @@ func NewJobHandler(
 	jobCounter *atomic.Int32,
 	logger *slog.Logger,
 	cfg HandlerConfig,
+	publisher ResponsePublisher,
 	checkpoints *CheckpointStore,
 	metricsCollector *metrics.Metrics,
 	delivery string,
@@ -185,7 +186,7 @@ func NewJobHandler(
 		keyStore:          keyStore,
 		ollamaClient:      ollamaClient,
 		redisClient:       redisClient,
-		responsePublisher: rp,
+		responsePublisher: publisher,
 		signingKey:        signingKey,
 		ecdhKey:           ecdhKey,
 		jobCounter:        jobCounter,
@@ -212,6 +213,9 @@ func (h *JobHandler) modelLabel(modelID string) string {
 }
 
 // RedisResponsePublisher publishes responses directly to Redis pub/sub.
+// publishTimeout bounds each PUBLISH so a slow Redis cannot eat into stage 8's
+// BlobTxTimeout budget (stage 7 is non-fatal but synchronous). When zero the
+// publish runs with the caller-supplied context only.
 type RedisResponsePublisher struct {
 	client         *redis.Client
 	logger         *slog.Logger
@@ -254,8 +258,15 @@ func (p *RedisResponsePublisher) PublishResponse(
 		return
 	}
 
+	pubCtx := ctx
+	if p.publishTimeout > 0 {
+		var cancel context.CancelFunc
+		pubCtx, cancel = context.WithTimeout(ctx, p.publishTimeout)
+		defer cancel()
+	}
+
 	channel := fmt.Sprintf("session:%d:responses", sessionID)
-	if err := p.client.Publish(ctx, channel, data).Err(); err != nil {
+	if err := p.client.Publish(pubCtx, channel, data).Err(); err != nil {
 		p.logger.Warn("failed to publish response to Redis", "jobID", jobID, "channel", channel, "error", err)
 		if p.metrics != nil {
 			p.metrics.RedisPublishFailures.Inc()
@@ -915,7 +926,7 @@ func (h *JobHandler) getOrDeriveSessionKey(ctx context.Context, logger *slog.Log
 }
 
 // refreshSessionKey skips the local cache and derives the latest session key
-// directly from chain events. Used on decryption failure to pick up a rotated
+// directly from chain. Used on decryption failure to pick up a rotated
 // session key.
 func (h *JobHandler) refreshSessionKey(ctx context.Context, logger *slog.Logger, sessionID uint64) ([]byte, error) {
 	h.metrics.SessionKeyEvents.WithLabelValues(metrics.SessionKeyPathRefresh).Inc()
@@ -994,43 +1005,16 @@ func (h *JobHandler) publishToRedis(
 
 	sig, err := signMismatchEvidence(h.cfg.ChainID, h.cfg.JobRegistryAddr, jobID, sessionID, ciphertext, h.signingKey)
 	if err != nil {
-		h.logger.Warn("failed to sign response", "jobID", jobID, "error", err)
-		return
-	}
-
-	resp := pkgtypes.PubSubMessage{
-		Type:          pkgtypes.MessageTypeComplete,
-		JobID:         pkgtypes.JobID(jobID),
-		SessionID:     pkgtypes.SessionID(sessionID),
-		Sequence:      0,
-		TotalChunks:   1,
-		Payload:       ciphertext,
-		Signature:     "0x" + hex.EncodeToString(sig),
-		CorrelationID: correlationID,
-		Timestamp:     time.Now().Unix(),
-	}
-
-	data, err := json.Marshal(resp)
-	if err != nil {
-		logger.Warn("failed to marshal response for Redis",
+		h.logger.Warn("failed to sign response",
 			"stage", "redis_publish",
+			"jobID", jobID,
 			"error", err,
 		)
 		return
 	}
 
-	channel := fmt.Sprintf("session:%d:responses", sessionID)
-	// Bound the PUBLISH so a slow Redis cannot eat into stage 8's
-	// BlobTxTimeout budget (stage 7 is non-fatal but synchronous).
-	pubCtx, pubCancel := context.WithTimeout(ctx, h.cfg.RedisPublishTimeout)
-	defer pubCancel()
-	if err := h.redisClient.Publish(pubCtx, channel, data).Err(); err != nil {
-		logger.Warn("failed to publish response to Redis",
-			"stage", "redis_publish",
-			"channel", channel,
-			"error", err,
-		)
-	}
+	sigHex := "0x" + hex.EncodeToString(sig)
+	h.responsePublisher.PublishResponse(ctx, jobID, sessionID, correlationID, sigHex, ciphertext)
 }
 
 // signMismatchEvidence produces an EIP-191 worker signature over the domain-separated

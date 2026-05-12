@@ -135,10 +135,10 @@ type JobExecutionClient interface {
 	// HasJobCompleted reports whether JobCompleted has already been observed for the job.
 	HasJobCompleted(ctx context.Context, jobID uint64) (bool, error)
 
-	// GetSessionEncWorkerKey returns the most recent encrypted worker key for a
-	// session by filtering historical SessionCreated and SessionKeyUpdated event
-	// logs, returning whichever was emitted in the highest-numbered block. This
-	// picks up post-creation key rotations.
+	// GetSessionEncWorkerKey retrieves the current encrypted worker key for a session
+	// from JobRegistry session storage. After reassignment, the consumer is expected
+	// to re-wrap the same underlying symmetric session key for the replacement worker.
+	// Implementations must reject sessions that are not currently active.
 	GetSessionEncWorkerKey(ctx context.Context, sessionID uint64) ([]byte, error)
 
 	// GetJobBlobInfo returns the prompt blob hash, response blob hash,

@@ -458,68 +458,30 @@ func (c *ChainClient) HasJobCompleted(ctx context.Context, jobID uint64) (bool, 
 	return false, nil
 }
 
-// GetSessionEncWorkerKey returns the most recent encrypted worker key for a
-// session. It queries both SessionCreated and SessionKeyUpdated event logs
-// and returns whichever was emitted in the highest-numbered block, so the
-// post-audit updateSessionKey flow (LSC-15) transparently rotates the key
-// worker-side without any explicit event subscription.
-//
-// Event iteration is required because the JobRegistry ABI has no view functions
-// that expose session data.
+// sessionStatusActive matches the Solidity enum JobRegistry.SessionStatus.Active (index 0).
+// Source: contracts/src/interfaces/IJobRegistry.sol — enum SessionStatus { Active, ... }
+const sessionStatusActive uint8 = 0
+
+// GetSessionEncWorkerKey retrieves the current encrypted worker key for a session
+// from JobRegistry session storage. Sessions that are not currently Active are
+// blocked until on-chain failover has completed.
 func (c *ChainClient) GetSessionEncWorkerKey(ctx context.Context, sessionID uint64) ([]byte, error) {
 	if err := c.requireJobRegistry(); err != nil {
 		return nil, err
 	}
-	sessionIDBig := new(big.Int).SetUint64(sessionID)
-	filterOpts := &bind.FilterOpts{Context: ctx}
-
-	// Baseline: the SessionCreated event carries the original encWorkerKey and
-	// is the only event guaranteed to exist for any valid session.
-	createdIter, err := c.jobRegistry.FilterSessionCreated(filterOpts, []*big.Int{sessionIDBig}, nil, nil)
+	sess, err := c.jobRegistry.GetSession(&bind.CallOpts{Context: ctx}, new(big.Int).SetUint64(sessionID))
 	if err != nil {
 		return nil, fmt.Errorf("GetSession %d: %w", sessionID, err)
 	}
-	defer createdIter.Close()
-
-	if !createdIter.Next() {
-		if createdIter.Error() != nil {
-			return nil, fmt.Errorf("iterate SessionCreated events: %w", createdIter.Error())
-		}
-		return nil, fmt.Errorf("no SessionCreated event found for session %d", sessionID)
+	if sess.Status != sessionStatusActive {
+		return nil, fmt.Errorf("session %d not active: status=%d", sessionID, sess.Status)
+	}
+	encWorkerKey := sess.EncWorkerKey
+	if len(encWorkerKey) == 0 {
+		return nil, fmt.Errorf("session %d has empty encWorkerKey", sessionID)
 	}
 
-	latestBlock := createdIter.Event.Raw.BlockNumber
-	latestKey := createdIter.Event.EncWorkerKey
-	if len(latestKey) == 0 {
-		return nil, fmt.Errorf("SessionCreated event for session %d has empty encWorkerKey", sessionID)
-	}
-
-	// Layer any SessionKeyUpdated events over the baseline. Each such event
-	// carries a replacement encWorkerKey; the newest one wins.
-	updatedIter, err := c.jobRegistry.FilterSessionKeyUpdated(filterOpts, []*big.Int{sessionIDBig})
-	if err != nil {
-		return nil, fmt.Errorf("filter SessionKeyUpdated for session %d: %w", sessionID, err)
-	}
-	defer updatedIter.Close()
-
-	for updatedIter.Next() {
-		block := updatedIter.Event.Raw.BlockNumber
-		if block < latestBlock {
-			continue
-		}
-		if len(updatedIter.Event.EncWorkerKey) == 0 {
-			// Defensive: ignore an empty rotation rather than crash — contract
-			// enforces 125-byte length, so this should never happen in practice.
-			continue
-		}
-		latestBlock = block
-		latestKey = updatedIter.Event.EncWorkerKey
-	}
-	if err := updatedIter.Error(); err != nil {
-		return nil, fmt.Errorf("iterate SessionKeyUpdated events: %w", err)
-	}
-
-	return latestKey, nil
+	return encWorkerKey, nil
 }
 
 // GetJobBlobInfo reads a job from the contract and returns its prompt blob

@@ -398,6 +398,7 @@ func New(cfg *config.Config) (*Service, error) {
 			ChainID:             big.NewInt(cfg.ChainID),
 			JobRegistryAddr:     cfg.JobRegistryAddress,
 		},
+		nil, // publisher — fallback wires RedisResponsePublisher from redisClient
 		checkpoints,
 		metricsCollector,
 		metrics.DeliveryAsynq,

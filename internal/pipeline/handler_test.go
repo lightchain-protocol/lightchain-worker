@@ -224,6 +224,7 @@ func newTestHandlerWithConfig(
 		chain, fetcher, submitter, keyStore, ollama,
 		redisClient, testSigningKey(t), testECDHKey(t), counter, logger,
 		cfg,
+		nil, // publisher — fallback wires RedisResponsePublisher
 		nil, // checkpoints — disabled in most handler tests; see TestHandleTask_Checkpoint* for coverage
 		testMetrics(t),
 		metrics.DeliveryAsynq,
@@ -302,6 +303,7 @@ func TestHandleTask_FullPipelineSuccess(t *testing.T) {
 				expectedModelID: "llama3-8b",
 			},
 		},
+		nil, // publisher — fallback wires RedisResponsePublisher
 		nil, // checkpoints disabled for this test
 		testMetrics(t),
 		metrics.DeliveryAsynq,
@@ -759,10 +761,12 @@ func TestPublishToRedis_SignsContractCompatibleDigest(t *testing.T) {
 	signingKey := testSigningKey(t)
 	chainID := big.NewInt(31337)
 	jobRegistryAddr := common.HexToAddress("0x0000000000000000000000000000000000001337")
+	logger := slog.New(slog.NewTextHandler(io.Discard, &slog.HandlerOptions{Level: slog.LevelError}))
 	handler := &JobHandler{
-		redisClient: rc,
-		signingKey:  signingKey,
-		logger:      slog.New(slog.NewTextHandler(io.Discard, &slog.HandlerOptions{Level: slog.LevelError})),
+		redisClient:       rc,
+		signingKey:        signingKey,
+		logger:            logger,
+		responsePublisher: &RedisResponsePublisher{client: rc, logger: logger, publishTimeout: 5 * time.Second},
 		cfg: HandlerConfig{
 			ChainID:             chainID,
 			JobRegistryAddr:     jobRegistryAddr,
@@ -822,14 +826,15 @@ func TestPublishToRedis_RespectsRedisPublishTimeout(t *testing.T) {
 	rc := redis.NewClient(&redis.Options{Addr: "192.0.2.1:6379"})
 	t.Cleanup(func() { rc.Close() })
 
+	logger := slog.New(slog.NewTextHandler(io.Discard, &slog.HandlerOptions{Level: slog.LevelError}))
 	handler := &JobHandler{
-		redisClient: rc,
-		signingKey:  testSigningKey(t),
-		logger:      slog.New(slog.NewTextHandler(io.Discard, &slog.HandlerOptions{Level: slog.LevelError})),
+		redisClient:       rc,
+		signingKey:        testSigningKey(t),
+		logger:            logger,
+		responsePublisher: &RedisResponsePublisher{client: rc, logger: logger, publishTimeout: 50 * time.Millisecond},
 		cfg: HandlerConfig{
-			ChainID:             big.NewInt(31337),
-			JobRegistryAddr:     common.HexToAddress("0x0000000000000000000000000000000000001337"),
-			RedisPublishTimeout: 50 * time.Millisecond,
+			ChainID:         big.NewInt(31337),
+			JobRegistryAddr: common.HexToAddress("0x0000000000000000000000000000000000001337"),
 		},
 	}
 
@@ -993,6 +998,7 @@ func TestHandleTask_CheckpointHit_SkipsInference(t *testing.T) {
 		chain, fetcher, submitter, newMockKeyStore(), ollama,
 		rc, testSigningKey(t), ecdhKey, counter, logger,
 		HandlerConfig{AckTxTimeout: 5 * time.Second, BlobTxTimeout: 60 * time.Second, RedisPublishTimeout: 5 * time.Second},
+		nil, // publisher — fallback wires RedisResponsePublisher
 		store,
 		testMetrics(t),
 		metrics.DeliveryAsynq,
@@ -1066,6 +1072,7 @@ func TestHandleTask_CheckpointRaceLoserUsesCanonical(t *testing.T) {
 		chain, fetcher, submitter, newMockKeyStore(), ollama,
 		rc, testSigningKey(t), ecdhKey, counter, logger,
 		HandlerConfig{AckTxTimeout: 5 * time.Second, BlobTxTimeout: 60 * time.Second, RedisPublishTimeout: 5 * time.Second},
+		nil, // publisher — fallback wires RedisResponsePublisher
 		store,
 		testMetrics(t),
 		metrics.DeliveryAsynq,
@@ -1149,6 +1156,7 @@ func TestHandleTask_CheckpointTombstonedAfterCompletion(t *testing.T) {
 		chain, fetcher, submitter, newMockKeyStore(), ollama,
 		rc, testSigningKey(t), ecdhKey, counter, logger,
 		HandlerConfig{AckTxTimeout: 5 * time.Second, BlobTxTimeout: 60 * time.Second, RedisPublishTimeout: 5 * time.Second},
+		nil, // publisher — fallback wires RedisResponsePublisher
 		store,
 		testMetrics(t),
 		metrics.DeliveryAsynq,
@@ -1210,6 +1218,7 @@ func TestHandleTask_CheckpointRetained_WhenStage8bFails(t *testing.T) {
 		chain, fetcher, submitter, newMockKeyStore(), ollama,
 		rc, testSigningKey(t), ecdhKey, counter, logger,
 		HandlerConfig{AckTxTimeout: 5 * time.Second, BlobTxTimeout: 60 * time.Second, RedisPublishTimeout: 5 * time.Second},
+		nil, // publisher — fallback wires RedisResponsePublisher
 		store,
 		testMetrics(t),
 		metrics.DeliveryAsynq,
