@@ -1,0 +1,604 @@
+package release
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"log/slog"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/ethereum/go-ethereum/common"
+
+	"github.com/lightchain/worker/internal/chain"
+)
+
+// CycleResult summarises the outcome of one release cycle. Reserved
+// for expected settlement signals — RunOnce returns an error only for
+// unrecoverable infrastructure failures (chain RPC, store IO).
+//
+// A "successful" cycle can take many shapes: nothing pending, batch
+// landed, batch reverted but per-job fallback caught everything,
+// contract paused, gate active. Each lands as a different
+// CycleResult; the CLI picks the right human-readable message and
+// exit code from the fields.
+type CycleResult struct {
+	Candidates    int   // jobs admitted by the prefilter (post per-job backoff)
+	Released      int   // jobs released on-chain (batch + per-job fallback)
+	Failed        int   // per-job releases that failed (excluding pause)
+	Dropped       int   // terminal-state jobs removed from pending
+	Paused        bool  // contract pause hit (batch or mid-fallback)
+	BatchReverted bool  // batch failed; per-job fallback ran
+	BackoffActive bool  // gate active; cycle did not run
+	NextAllowedAt int64 // populated when BackoffActive or Paused
+}
+
+// schedulerChain is the narrow chain interface the Scheduler needs. Defined
+// at the consumer; chain.SettlementClient satisfies it.
+type schedulerChain interface {
+	Head(ctx context.Context) (chain.HeadInfo, error)
+	GetDisputeWindow(ctx context.Context) (time.Duration, error)
+	GetJobState(ctx context.Context, jobID uint64) (chain.JobStateInfo, error)
+	ReleaseJob(ctx context.Context, jobID uint64) error
+	ReleaseJobs(ctx context.Context, jobIDs []uint64) error
+}
+
+// Scheduler runs a background loop that periodically settles eligible jobs.
+// It triggers on either a count threshold or an elapsed-time interval
+// (whichever fires first), and falls back from batched to per-job releases
+// when the batch tx reverts so a single stale job cannot jam the loop.
+type Scheduler struct {
+	store      Store
+	chain      schedulerChain
+	workerAddr common.Address
+	cfg        Config
+	logger     *slog.Logger
+	metrics    Metrics
+
+	done     chan struct{}
+	wg       sync.WaitGroup
+	stopOnce sync.Once
+}
+
+// NewScheduler constructs a Scheduler. logger may be nil.
+func NewScheduler(store Store, settlement schedulerChain, workerAddr common.Address, cfg Config, logger *slog.Logger) *Scheduler {
+	if logger == nil {
+		logger = slog.Default()
+	}
+	return &Scheduler{
+		store:      store,
+		chain:      settlement,
+		workerAddr: workerAddr,
+		cfg:        cfg,
+		logger:     logger,
+		metrics:    noopMetrics{},
+		done:       make(chan struct{}),
+	}
+}
+
+// SetMetrics installs the observability sink. Optional; defaults to a
+// silent no-op. Must be called before Start.
+func (s *Scheduler) SetMetrics(m Metrics) {
+	s.metrics = callMetrics(m)
+}
+
+// Start launches the background goroutine. Returns immediately.
+func (s *Scheduler) Start(ctx context.Context) {
+	if s.cfg.ProbeInterval <= 0 {
+		s.logger.Warn("scheduler: ProbeInterval not positive; not starting", "probe", s.cfg.ProbeInterval)
+		return
+	}
+	s.wg.Add(1)
+	go func() {
+		defer s.wg.Done()
+		ticker := time.NewTicker(s.cfg.ProbeInterval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ticker.C:
+				s.tick(ctx)
+			case <-s.done:
+				return
+			case <-ctx.Done():
+				return
+			}
+		}
+	}()
+}
+
+// Stop signals the background goroutine and waits for it to exit. Idempotent.
+func (s *Scheduler) Stop() {
+	s.stopOnce.Do(func() {
+		close(s.done)
+	})
+	s.wg.Wait()
+}
+
+// tick is the per-probe evaluation. Reads chain.Head once and decides
+// whether to fire a release cycle.
+func (s *Scheduler) tick(ctx context.Context) {
+	cycleCtx, cancel := context.WithTimeout(ctx, s.cfg.TxTimeout)
+	defer cancel()
+
+	head, err := s.chain.Head(cycleCtx)
+	if err != nil {
+		s.logger.Warn("scheduler: read chain head failed", "err", err)
+		return
+	}
+
+	// Cycle-backoff gate. Honored before the threshold and time-trigger
+	// checks so that a paused contract (or any other condition that
+	// scheduled a future attempt) cannot be silently bypassed by either
+	// path. Reading this from the store keeps the gate persistent across
+	// process restarts.
+	nextAllowed, err := s.store.GetNextAllowedAttempt(cycleCtx)
+	if err != nil {
+		s.logger.Warn("scheduler: read next allowed attempt failed", "err", err)
+		return
+	}
+	if head.Timestamp < nextAllowed {
+		s.logger.Debug("scheduler: cycle backoff active; skipping probe",
+			"head_timestamp", head.Timestamp, "next_allowed", nextAllowed)
+		return
+	}
+
+	window, err := s.disputeWindow(cycleCtx)
+	if err != nil {
+		s.logger.Warn("scheduler: read dispute window failed", "err", err)
+		return
+	}
+
+	pending, err := s.store.Pending(cycleCtx)
+	if err != nil {
+		s.logger.Warn("scheduler: read pending failed", "err", err)
+		return
+	}
+	s.metrics.SetPending(len(pending))
+
+	lastReleaseTs, err := s.store.GetLastReleaseTs(cycleCtx)
+	if err != nil {
+		s.logger.Warn("scheduler: read last release ts failed", "err", err)
+		return
+	}
+
+	readyNow := countReadyForStateCheck(pending, head.Timestamp)
+	dueByTime := head.Timestamp-lastReleaseTs >= int64(s.cfg.Interval/time.Second)
+
+	if readyNow < s.cfg.BatchThreshold && !dueByTime {
+		return
+	}
+
+	s.logger.Debug("scheduler: firing release cycle",
+		"ready_now", readyNow,
+		"pending_total", len(pending),
+		"due_by_time", dueByTime,
+		"head_block", head.Number,
+		"head_timestamp", head.Timestamp,
+	)
+
+	// The periodic loop discards the result; metrics are updated
+	// inside runReleaseCycle / applyPauseBackoff. RunOnce surfaces
+	// the result to the CLI.
+	_ = s.runReleaseCycle(cycleCtx, head, window, pending)
+}
+
+// runReleaseCycle is the actual settlement work. Exposed for the CLI's
+// `release` subcommand; the periodic loop calls it via tick.
+//
+// pending is the snapshot taken under shared lock by tick; passing it in
+// avoids a second lock acquisition inside the cycle. Returns a
+// CycleResult summarising the outcome — the caller (RunOnce / tick)
+// decides whether to surface it to the user.
+//
+// Pause handling is consolidated here: whether pause is detected by the
+// initial batch revert OR by perJobFallback mid-loop, this function is
+// the single place that calls recordAttemptWithBackoff and emits the
+// IncPauseEvent metric. Previously perJobFallback's pause path
+// returned silently and the caller wrote a normal recordAttempt,
+// letting the next probe retry immediately (CodeRabbit PR #23).
+func (s *Scheduler) runReleaseCycle(ctx context.Context, head chain.HeadInfo, window time.Duration, pending []PendingJob) CycleResult {
+	result := CycleResult{}
+
+	candidates := s.collectCandidates(pending, window, head.Timestamp)
+	result.Candidates = len(candidates)
+	if len(candidates) == 0 {
+		// Still record the attempt so the time trigger does not fire
+		// hot-loop on the next tick.
+		s.recordAttempt(ctx, head.Timestamp)
+		return result
+	}
+
+	releaseBatch, dropIDs, staleDisputed := s.partition(ctx, candidates, window, head.Timestamp)
+
+	for _, id := range staleDisputed {
+		s.logger.Warn("scheduler: job has been Disputed for an unusually long time",
+			"job_id", id, "stale_after", s.cfg.StaleDisputeWarnAfter)
+	}
+
+	if len(dropIDs) > 0 {
+		if err := s.store.Remove(ctx, dropIDs); err != nil {
+			s.logger.Warn("scheduler: remove terminal-state jobs failed",
+				"count", len(dropIDs), "err", err)
+		} else {
+			result.Dropped = len(dropIDs)
+		}
+	}
+
+	if len(releaseBatch) == 0 {
+		s.recordAttempt(ctx, head.Timestamp)
+		return result
+	}
+
+	err := s.chain.ReleaseJobs(ctx, releaseBatch)
+	if err == nil {
+		if rErr := s.store.Remove(ctx, releaseBatch); rErr != nil {
+			s.logger.Warn("scheduler: post-release Remove failed",
+				"count", len(releaseBatch), "err", rErr)
+		}
+		s.metrics.IncReleased(len(releaseBatch))
+		s.metrics.SetLastSuccessTimestamp(head.Timestamp)
+		s.logger.Info("scheduler: batch release succeeded",
+			"released", len(releaseBatch), "head_block", head.Number)
+		result.Released = len(releaseBatch)
+		s.recordAttempt(ctx, head.Timestamp)
+		return result
+	}
+
+	// Batch reverted. Classify and either back off (pause) or fall back.
+	result.BatchReverted = true
+	if isPauseError(err) {
+		s.logger.Warn("scheduler: contract paused on batch; backing off without per-job blame",
+			"err", err, "back_off", s.cfg.PausedCycleBackoff)
+		result.Paused = true
+		s.applyPauseBackoff(ctx, head.Timestamp, &result)
+		return result
+	}
+
+	s.logger.Warn("scheduler: batch release reverted; falling back to per-job",
+		"batch_size", len(releaseBatch), "err", err)
+	fallback := s.perJobFallback(ctx, releaseBatch, window, head)
+	result.Released += fallback.Released
+	result.Failed += fallback.Failed
+	result.Dropped += fallback.Dropped
+
+	if fallback.Paused {
+		// Pause hit mid-fallback. Apply the same cycle-level backoff
+		// the batch-pause path uses, so the next probe does not
+		// retry immediately. recordAttempt is intentionally NOT
+		// called here — the gate IS the next-attempt signal.
+		s.logger.Warn("scheduler: pause detected mid-fallback; applying cycle backoff",
+			"back_off", s.cfg.PausedCycleBackoff)
+		result.Paused = true
+		s.applyPauseBackoff(ctx, head.Timestamp, &result)
+		return result
+	}
+
+	s.recordAttempt(ctx, head.Timestamp)
+	return result
+}
+
+// applyPauseBackoff is the single place that emits IncPauseEvent and
+// writes NextAllowedAttempt. Folding both paths (batch pause and
+// per-job fallback pause) through here prevents double-counting and
+// keeps the "exactly one place applies cycle backoff" invariant
+// trivially true.
+func (s *Scheduler) applyPauseBackoff(ctx context.Context, chainNow int64, result *CycleResult) {
+	s.metrics.IncPauseEvent()
+	s.recordAttemptWithBackoff(ctx, chainNow, s.cfg.PausedCycleBackoff)
+	result.NextAllowedAt = chainNow + int64(s.cfg.PausedCycleBackoff/time.Second)
+}
+
+// RunOnce executes a single release cycle synchronously. Used by the CLI
+// `release` subcommand. Reads chain head + pending snapshot itself.
+// Honors the same NextAllowedAttempt gate as the periodic tick so a
+// paused-cycle backoff cannot be bypassed by an operator-initiated
+// invocation.
+//
+// Returns:
+//   - error  for unrecoverable infrastructure failures (Head, gate read,
+//     dispute window, Pending). The cycle did not run.
+//   - CycleResult with nil error for every expected outcome — including
+//     "blocked by gate", "paused mid-cycle", "no candidates", and
+//     "batch reverted, all recovered via per-job". The caller (CLI)
+//     decides how to surface each.
+func (s *Scheduler) RunOnce(ctx context.Context) (CycleResult, error) {
+	cycleCtx, cancel := context.WithTimeout(ctx, s.cfg.TxTimeout)
+	defer cancel()
+
+	head, err := s.chain.Head(cycleCtx)
+	if err != nil {
+		return CycleResult{}, fmt.Errorf("read chain head: %w", err)
+	}
+	nextAllowed, err := s.store.GetNextAllowedAttempt(cycleCtx)
+	if err != nil {
+		return CycleResult{}, fmt.Errorf("read next allowed attempt: %w", err)
+	}
+	if head.Timestamp < nextAllowed {
+		s.logger.Info("scheduler: RunOnce skipped; cycle backoff active",
+			"head_timestamp", head.Timestamp, "next_allowed", nextAllowed)
+		return CycleResult{BackoffActive: true, NextAllowedAt: nextAllowed}, nil
+	}
+	window, err := s.disputeWindow(cycleCtx)
+	if err != nil {
+		return CycleResult{}, fmt.Errorf("read dispute window: %w", err)
+	}
+	pending, err := s.store.Pending(cycleCtx)
+	if err != nil {
+		return CycleResult{}, fmt.Errorf("read pending: %w", err)
+	}
+	return s.runReleaseCycle(cycleCtx, head, window, pending), nil
+}
+
+// disputeWindow returns the contract's dispute window or the configured
+// override. The override is intended for dev/test where AIConfig is not
+// deployed.
+func (s *Scheduler) disputeWindow(ctx context.Context) (time.Duration, error) {
+	if s.cfg.DisputeWindowOverride > 0 {
+		return s.cfg.DisputeWindowOverride, nil
+	}
+	return s.chain.GetDisputeWindow(ctx)
+}
+
+// collectCandidates picks pending jobs that are ready for on-chain
+// state inspection by partition. Filters by per-job backoff only and
+// caps at MaxBatchSize. Deliberately does NOT enforce the dispute
+// window here: a job that resolves on-chain before its window elapses
+// becomes eligible for release immediately (partition allows
+// JobStateResolved with positive escrow regardless of CompletedAt),
+// and we have no local signal for that transition. Letting all
+// non-backoff jobs through means partition does the authoritative
+// gating using on-chain state at the cost of up to MaxBatchSize extra
+// GetJobState RPCs per probe — bounded and acceptable.
+func (s *Scheduler) collectCandidates(pending []PendingJob, _ time.Duration, chainNow int64) []PendingJob {
+	out := pending[:0:0]
+	for _, p := range pending {
+		if p.BackoffUntil > chainNow {
+			continue
+		}
+		out = append(out, p)
+		if len(out) >= s.cfg.MaxBatchSize {
+			break
+		}
+	}
+	return out
+}
+
+// partition resolves each candidate against on-chain state and bins it.
+// Returns:
+//
+//	releaseBatch  — jobs to include in ReleaseJobs (and the per-job fallback)
+//	dropIDs       — terminal-state jobs to delete from the pending set
+//	staleDisputed — Disputed jobs older than StaleDisputeWarnAfter (warned but kept)
+func (s *Scheduler) partition(ctx context.Context, candidates []PendingJob, window time.Duration, chainNow int64) ([]uint64, []uint64, []uint64) {
+	var releaseBatch, dropIDs, staleDisputed []uint64
+	windowSec := int64(window / time.Second)
+
+	for _, p := range candidates {
+		info, err := s.chain.GetJobState(ctx, p.JobID)
+		if err != nil {
+			s.logger.Warn("scheduler: GetJobState failed; deferring",
+				"job_id", p.JobID, "err", err)
+			continue
+		}
+		if info.Worker != s.workerAddr {
+			s.logger.Warn("scheduler: pending job has foreign worker; dropping",
+				"job_id", p.JobID, "stored_worker", info.Worker.Hex())
+			dropIDs = append(dropIDs, p.JobID)
+			s.metrics.IncDropped(DropReasonForeignWorker)
+			continue
+		}
+		switch info.State {
+		case chain.JobStateCompleted:
+			if info.CompletedAt+windowSec <= chainNow {
+				releaseBatch = append(releaseBatch, p.JobID)
+			}
+			// else: dispute window not elapsed by chain reckoning; leave
+			// in pending without log noise.
+		case chain.JobStateResolved:
+			if info.EscrowedFee != nil && info.EscrowedFee.Sign() > 0 {
+				releaseBatch = append(releaseBatch, p.JobID)
+			} else {
+				s.logger.Info("scheduler: dropping Resolved job with zero escrow (guilty path)",
+					"job_id", p.JobID)
+				dropIDs = append(dropIDs, p.JobID)
+				s.metrics.IncDropped(DropReasonResolvedZeroFee)
+			}
+		case chain.JobStateReleased:
+			dropIDs = append(dropIDs, p.JobID)
+			s.metrics.IncDropped(DropReasonTerminalState)
+		case chain.JobStateTimedOut:
+			s.logger.Info("scheduler: dropping TimedOut job (slashed; no payout)",
+				"job_id", p.JobID)
+			dropIDs = append(dropIDs, p.JobID)
+			s.metrics.IncDropped(DropReasonTerminalState)
+		case chain.JobStateDisputed:
+			if s.cfg.StaleDisputeWarnAfter > 0 {
+				ageSec := chainNow - p.CompletedAt
+				if time.Duration(ageSec)*time.Second > s.cfg.StaleDisputeWarnAfter {
+					staleDisputed = append(staleDisputed, p.JobID)
+				}
+			}
+			// Keep in pending; the dispute will resolve eventually.
+		default:
+			// Submitted / Acknowledged should be impossible — the pipeline
+			// only marks eligible after CompleteJob succeeds.
+			s.logger.Warn("scheduler: pending job in unexpected state",
+				"job_id", p.JobID, "state", info.State.String())
+		}
+	}
+	return releaseBatch, dropIDs, staleDisputed
+}
+
+// perJobFallback retries each job individually after a batch revert.
+// State is re-read so a job that became ineligible between the batch
+// and now is handled correctly. Returns a partial CycleResult — only
+// the fields it owns: Released, Failed, Dropped, Paused. The caller
+// merges it into the cycle-level result and applies pause backoff
+// (single point of control; metrics also bumped there).
+func (s *Scheduler) perJobFallback(ctx context.Context, batch []uint64, window time.Duration, head chain.HeadInfo) CycleResult {
+	windowSec := int64(window / time.Second)
+	out := CycleResult{}
+	for _, id := range batch {
+		info, err := s.chain.GetJobState(ctx, id)
+		if err != nil {
+			s.logger.Warn("scheduler: per-job GetJobState failed",
+				"job_id", id, "err", err)
+			s.recordPerJobFailure(ctx, id, head.Timestamp)
+			out.Failed++
+			continue
+		}
+		eligible := false
+		switch info.State {
+		case chain.JobStateCompleted:
+			eligible = info.CompletedAt+windowSec <= head.Timestamp
+		case chain.JobStateResolved:
+			eligible = info.EscrowedFee != nil && info.EscrowedFee.Sign() > 0
+		case chain.JobStateReleased, chain.JobStateTimedOut:
+			// Already terminal — drop and continue.
+			if rErr := s.store.Remove(ctx, []uint64{id}); rErr != nil {
+				s.logger.Warn("scheduler: per-job drop failed", "job_id", id, "err", rErr)
+			} else {
+				out.Dropped++
+			}
+			continue
+		}
+		if !eligible {
+			// Defer; do not increment fail_count (state-change is not
+			// the job's "fault" from the scheduler's perspective).
+			continue
+		}
+		if rErr := s.chain.ReleaseJob(ctx, id); rErr != nil {
+			if isPauseError(rErr) {
+				// Pause hit mid-fallback. Stop the per-job loop and
+				// signal the caller to apply cycle backoff exactly
+				// once (the caller bumps IncPauseEvent — we do NOT
+				// bump it here to avoid double-counting).
+				s.logger.Warn("scheduler: pause detected mid-fallback; stopping per-job loop",
+					"job_id", id, "err", rErr)
+				out.Paused = true
+				return out
+			}
+			s.logger.Warn("scheduler: per-job release failed",
+				"job_id", id, "err", rErr)
+			s.recordPerJobFailure(ctx, id, head.Timestamp)
+			s.metrics.IncFailed(1)
+			out.Failed++
+			continue
+		}
+		if rErr := s.store.Remove(ctx, []uint64{id}); rErr != nil {
+			s.logger.Warn("scheduler: per-job remove failed", "job_id", id, "err", rErr)
+		}
+		s.metrics.IncReleased(1)
+		s.metrics.SetLastSuccessTimestamp(head.Timestamp)
+		out.Released++
+	}
+	s.logger.Info("scheduler: per-job fallback complete",
+		"released", out.Released, "failed", out.Failed, "dropped", out.Dropped)
+	return out
+}
+
+func (s *Scheduler) recordPerJobFailure(ctx context.Context, jobID uint64, chainNow int64) {
+	// We need the current fail_count to compute backoff; read pending and
+	// look it up. Cheap (in-memory, file-locked).
+	pending, err := s.store.Pending(ctx)
+	if err != nil {
+		s.logger.Warn("scheduler: read pending for backoff failed",
+			"job_id", jobID, "err", err)
+		return
+	}
+	failCount := 0
+	for _, p := range pending {
+		if p.JobID == jobID {
+			failCount = p.FailCount
+			break
+		}
+	}
+	backoff := computeBackoff(s.cfg.BackoffBase, s.cfg.BackoffMax, failCount+1)
+	until := chainNow + int64(backoff/time.Second)
+	if err := s.store.RecordFailure(ctx, jobID, until); err != nil {
+		s.logger.Warn("scheduler: RecordFailure failed",
+			"job_id", jobID, "err", err)
+	}
+}
+
+func (s *Scheduler) recordAttempt(ctx context.Context, chainNow int64) {
+	if err := s.store.SetLastReleaseTs(ctx, chainNow); err != nil {
+		s.logger.Warn("scheduler: SetLastReleaseTs failed", "err", err)
+	}
+}
+
+// recordAttemptWithBackoff writes NextAllowedAttempt = chainNow + back so
+// neither the threshold path nor the time-trigger fires another cycle
+// for `back` of chain time. Used for cycle-level backoffs (e.g. paused
+// contract). Distinct from recordAttempt, which writes LastReleaseTs
+// for the periodic time-trigger; conflating the two (the previous
+// behavior) let the threshold path bypass backoff entirely and stretched
+// the time path's next fire by an extra Interval.
+func (s *Scheduler) recordAttemptWithBackoff(ctx context.Context, chainNow int64, back time.Duration) {
+	until := chainNow + int64(back/time.Second)
+	if err := s.store.SetNextAllowedAttempt(ctx, until); err != nil {
+		s.logger.Warn("scheduler: SetNextAllowedAttempt (with backoff) failed",
+			"backoff", back, "err", err)
+	}
+}
+
+// countReadyForStateCheck returns the number of pending jobs that are
+// out of per-job backoff and therefore ready for on-chain state
+// inspection by partition. It deliberately skips the dispute-window
+// check (see collectCandidates for the rationale): a job that
+// resolves before its window elapses is immediately releasable, and
+// we have no local signal for the resolved transition. The threshold
+// path may now fire while many jobs are still inside the window;
+// partition is the authoritative gate using on-chain state.
+func countReadyForStateCheck(pending []PendingJob, chainNow int64) int {
+	n := 0
+	for _, p := range pending {
+		if p.BackoffUntil > chainNow {
+			continue
+		}
+		n++
+	}
+	return n
+}
+
+// computeBackoff returns base * 2^(attempt-1), capped at maxBackoff.
+// attempt is 1-indexed (the first failure yields `base`, not `base/2`).
+func computeBackoff(base, maxBackoff time.Duration, attempt int) time.Duration {
+	if attempt < 1 {
+		attempt = 1
+	}
+	// Guard against overflow: shift up to attempt-1, but cap the shift.
+	const maxShift = 30 // 2^30 * 15min = ~30,000 years; anything more is meaningless
+	shift := attempt - 1
+	if shift > maxShift {
+		shift = maxShift
+	}
+	d := base << shift
+	if d > maxBackoff || d <= 0 { // overflow check
+		return maxBackoff
+	}
+	return d
+}
+
+// isPauseError reports whether err signals a pause revert from a
+// Pausable contract. v5 contracts (which we deploy) emit the custom
+// error EnforcedPause(); go-ethereum returns only the 4-byte selector
+// in rpc.DataError, so the chain client decodes it post-receipt and
+// wraps ErrContractPaused — detected here via errors.Is.
+//
+// The "Pausable: paused" substring fallback exists for two cases:
+// v4 contracts (which surface the reason as Error(string) text), and
+// test stubs that pass plain error strings rather than going through
+// the chain client. The previous broad "enforcedpause" substring was
+// removed because it never matched a real production revert (geth does
+// not expose custom error names as text).
+func isPauseError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, chain.ErrContractPaused) {
+		return true
+	}
+	return strings.Contains(strings.ToLower(err.Error()), "pausable: paused")
+}

@@ -2,12 +2,16 @@ package service
 
 import (
 	"crypto/tls"
+	"io"
+	"log/slog"
 	"testing"
 	"time"
 
 	"github.com/hibiken/asynq"
 	"github.com/redis/go-redis/v9"
 	"github.com/stretchr/testify/assert"
+
+	"github.com/lightchain/worker/internal/config"
 )
 
 func TestAsynqRedisClientOptFromRedisOptions(t *testing.T) {
@@ -41,4 +45,29 @@ func TestAsynqRedisClientOptFromRedisOptions(t *testing.T) {
 		PoolSize:     opts.PoolSize,
 		TLSConfig:    opts.TLSConfig,
 	}, got)
+}
+
+func TestService_computeDrainTTL_overrideTakesPrecedence(t *testing.T) {
+	t.Parallel()
+
+	// Service with cfg override set; chain client nil to prove the
+	// override short-circuits before any RPC attempt.
+	s := &Service{
+		cfg:    &config.Config{DrainTTLOverride: 7 * time.Minute},
+		logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
+	}
+
+	assert.Equal(t, 7*time.Minute, s.computeDrainTTL(),
+		"LIGHTCHAIN_DRAIN_TTL must be honored on the SIGTERM path, not just CLI")
+}
+
+func TestService_computeDrainTTL_fallbackWhenNoChainClient(t *testing.T) {
+	t.Parallel()
+	s := &Service{
+		cfg:    &config.Config{},
+		logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
+	}
+
+	got := s.computeDrainTTL()
+	assert.Equal(t, drainTTLFallback, got)
 }

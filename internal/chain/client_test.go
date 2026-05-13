@@ -2,8 +2,11 @@ package chain
 
 import (
 	"context"
+	"errors"
 	"math/big"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/ethereum/go-ethereum/accounts/abi/bind"
 	"github.com/ethereum/go-ethereum/common"
@@ -55,7 +58,7 @@ func (m *MockRegistrationClient) GetWorkerEncryptionKey(ctx context.Context, wor
 // MockJobExecutionClient is a hand-rolled mock for JobExecutionClient.
 type MockJobExecutionClient struct {
 	AcknowledgeJobFn         func(ctx context.Context, jobID uint64) error
-	CompleteJobFn            func(ctx context.Context, jobID uint64, responseBlobHashes [][32]byte, responseCiphertextHash [32]byte) error
+	CompleteJobFn            func(ctx context.Context, jobID uint64, responseBlobHash [32]byte, responseCiphertextHash [32]byte) error
 	HasJobAcknowledgedFn     func(ctx context.Context, jobID uint64) (bool, error)
 	HasJobCompletedFn        func(ctx context.Context, jobID uint64) (bool, error)
 	GetSessionEncWorkerKeyFn func(ctx context.Context, sessionID uint64) ([]byte, error)
@@ -68,10 +71,10 @@ func (m *MockJobExecutionClient) AcknowledgeJob(ctx context.Context, jobID uint6
 func (m *MockJobExecutionClient) CompleteJob(
 	ctx context.Context,
 	jobID uint64,
-	responseBlobHashes [][32]byte,
+	responseBlobHash [32]byte,
 	responseCiphertextHash [32]byte,
 ) error {
-	return m.CompleteJobFn(ctx, jobID, responseBlobHashes, responseCiphertextHash)
+	return m.CompleteJobFn(ctx, jobID, responseBlobHash, responseCiphertextHash)
 }
 
 func (m *MockJobExecutionClient) HasJobAcknowledged(ctx context.Context, jobID uint64) (bool, error) {
@@ -86,8 +89,8 @@ func (m *MockJobExecutionClient) GetSessionEncWorkerKey(ctx context.Context, ses
 	return m.GetSessionEncWorkerKeyFn(ctx, sessionID)
 }
 
-func (m *MockJobExecutionClient) GetJobBlobHashes(_ context.Context, _ uint64) ([]common.Hash, []common.Hash, uint64, uint64, error) {
-	return nil, nil, 0, 0, nil
+func (m *MockJobExecutionClient) GetJobBlobInfo(_ context.Context, _ uint64) (common.Hash, common.Hash, uint64, uint64, error) {
+	return common.Hash{}, common.Hash{}, 0, 0, nil
 }
 
 // TestMockImplementsInterface verifies mocks satisfy their interfaces.
@@ -186,6 +189,177 @@ func TestSubmitPreparedTx_ResetsNonceOnPreBroadcastSendFailure(t *testing.T) {
 	assert.Equal(t, 1, client.jobTxBackend.(*mockJobTxBackend).sendCalls)
 }
 
+// TestSubmitPreparedTx_RecordsStuckNonceHitWithoutReplacement asserts that
+// a non-blob tx hitting "address already reserved" records a hit into the
+// shared tracker but does NOT itself attempt replacement — the blob pool
+// only accepts blob replacements, so the non-blob path defers recovery to
+// the next blob broadcast's decision.
+func TestSubmitPreparedTx_RecordsStuckNonceHitWithoutReplacement(t *testing.T) {
+	t.Parallel()
+
+	tracker := NewStuckNonceTracker()
+	client := newTestChainClient(t)
+	client.stuckTracker = tracker
+	client.jobTxBackend.(*mockJobTxBackend).sendErr = errors.New("eth_sendRawTransaction: address already reserved")
+
+	for i := 0; i < 3; i++ {
+		err := client.submitPreparedTx(context.Background(), "AcknowledgeJob", nil, func(opts *bind.TransactOpts) (*types.Transaction, error) {
+			return types.NewTx(&types.LegacyTx{Nonce: opts.Nonce.Uint64()}), nil
+		})
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "address already reserved")
+	}
+
+	assert.Equal(t, 3, tracker.MaxConsecutiveHits(),
+		"three consecutive reservation rejections must accumulate in the shared tracker")
+	// The legacy path doesn't bump for any nonce, so checking BumpAttemptsUsedFor
+	// for the broadcast nonce (0 — mock backend uses opts.Nonce starting at 0)
+	// must report 0. Reading by nonce is required since the global reader was
+	// removed to fix per-nonce budget leakage (PR #20 follow-up).
+	assert.Equal(t, 0, tracker.BumpAttemptsUsedFor(0),
+		"non-blob path must not attempt any replacement bumps")
+}
+
+// TestSubmitPreparedTx_BlocksOnBlobInFlight asserts that cross-class
+// serialization works: a blob Enter held in the coordinator (simulating a
+// concurrent BlobTxSubmitter broadcast) prevents submitPreparedTx — which
+// enters ClassLegacy — from reaching SendTransaction. This is the geth
+// cross-subpool exclusion invariant (blobpool.go:336).
+func TestSubmitPreparedTx_BlocksOnBlobInFlight(t *testing.T) {
+	t.Parallel()
+
+	coordinator := NewSubpoolCoordinator(nil, 0)
+	defer coordinator.Close()
+	client := newTestChainClient(t)
+	client.coordinator = coordinator
+	client.jobTxBackend.(*mockJobTxBackend).sendErr = assert.AnError
+
+	// External holder simulates a concurrent BlobTxSubmitter in its
+	// SendTransaction..WaitMined window. Same coordinator pointer => the
+	// Legacy Enter inside submitPreparedTx must block until release.
+	blobTok, err := coordinator.Enter(context.Background(), ClassBlob)
+	require.NoError(t, err)
+
+	submitDone := make(chan error, 1)
+	go func() {
+		submitDone <- client.submitPreparedTx(context.Background(), "AcknowledgeJob", nil, func(opts *bind.TransactOpts) (*types.Transaction, error) {
+			return types.NewTx(&types.LegacyTx{Nonce: opts.Nonce.Uint64()}), nil
+		})
+	}()
+
+	time.Sleep(100 * time.Millisecond)
+	assert.Equal(t, 0, client.jobTxBackend.(*mockJobTxBackend).sendCalls,
+		"submitPreparedTx must not reach SendTransaction while a blob is in flight")
+
+	blobTok.Done()
+
+	select {
+	case err := <-submitDone:
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "send AcknowledgeJob tx")
+		assert.Equal(t, 1, client.jobTxBackend.(*mockJobTxBackend).sendCalls,
+			"SendTransaction must fire exactly once after blob drains")
+	case <-time.After(2 * time.Second):
+		t.Fatal("submitPreparedTx did not proceed within 2s of blob drain — coordinator is not shared correctly")
+	}
+}
+
+// TestSubmitPreparedTx_LegacyParallelism asserts that two concurrent legacy
+// broadcasts DO NOT block each other — they share the class, and geth's
+// legacypool handles nonce ordering internally. This is the within-class
+// throughput win over the old single-slot BroadcastSerializer.
+func TestSubmitPreparedTx_LegacyParallelism(t *testing.T) {
+	t.Parallel()
+
+	coordinator := NewSubpoolCoordinator(nil, 0)
+	defer coordinator.Close()
+
+	// Two independent test clients share ONE coordinator (same signing
+	// key in production). Each client has its own backend so sendCalls
+	// is attributed separately.
+	c1 := newTestChainClient(t)
+	c1.coordinator = coordinator
+	c2 := newTestChainClient(t)
+	c2.coordinator = coordinator
+
+	// Make SendTransaction block on a channel so we can observe both
+	// entering their critical section simultaneously.
+	release := make(chan struct{})
+	blockingSend := func() error {
+		<-release
+		return assert.AnError // fail cheaply so WaitMined isn't called
+	}
+	c1.jobTxBackend.(*mockJobTxBackend).sendFn = blockingSend
+	c2.jobTxBackend.(*mockJobTxBackend).sendFn = blockingSend
+
+	done1 := make(chan error, 1)
+	done2 := make(chan error, 1)
+	go func() {
+		done1 <- c1.submitPreparedTx(context.Background(), "AcknowledgeJob", nil, func(opts *bind.TransactOpts) (*types.Transaction, error) {
+			return types.NewTx(&types.LegacyTx{Nonce: opts.Nonce.Uint64()}), nil
+		})
+	}()
+	go func() {
+		done2 <- c2.submitPreparedTx(context.Background(), "AcknowledgeJob", nil, func(opts *bind.TransactOpts) (*types.Transaction, error) {
+			return types.NewTx(&types.LegacyTx{Nonce: opts.Nonce.Uint64()}), nil
+		})
+	}()
+
+	// Both must reach SendTransaction before we release either — proof
+	// that the coordinator did NOT serialize them.
+	require.Eventually(t, func() bool {
+		return coordinator.Inflight(ClassLegacy) == 2
+	}, 500*time.Millisecond, 10*time.Millisecond,
+		"both legacy broadcasts must be in flight simultaneously")
+
+	close(release)
+	<-done1
+	<-done2
+}
+
+// TestSubmitPreparedTx_CtxCancelDuringEnter asserts that a submitPreparedTx
+// call blocked in coordinator.Enter exits promptly on ctx cancel without
+// reaching SendTransaction.
+func TestSubmitPreparedTx_CtxCancelDuringEnter(t *testing.T) {
+	t.Parallel()
+
+	coordinator := NewSubpoolCoordinator(nil, 0)
+	defer coordinator.Close()
+	client := newTestChainClient(t)
+	client.coordinator = coordinator
+
+	// External blob holder keeps the legacy lane blocked until test end.
+	blobTok, err := coordinator.Enter(context.Background(), ClassBlob)
+	require.NoError(t, err)
+	defer blobTok.Done()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	submitDone := make(chan error, 1)
+	go func() {
+		submitDone <- client.submitPreparedTx(ctx, "AcknowledgeJob", nil, func(opts *bind.TransactOpts) (*types.Transaction, error) {
+			return types.NewTx(&types.LegacyTx{Nonce: opts.Nonce.Uint64()}), nil
+		})
+	}()
+
+	time.Sleep(50 * time.Millisecond)
+	cancelAt := time.Now()
+	cancel()
+
+	select {
+	case err := <-submitDone:
+		require.Error(t, err)
+		assert.ErrorIs(t, err, context.Canceled)
+		assert.Less(t, time.Since(cancelAt), 500*time.Millisecond,
+			"submitPreparedTx must exit within 500ms of ctx cancel")
+		assert.Equal(t, 0, client.jobTxBackend.(*mockJobTxBackend).sendCalls,
+			"SendTransaction must not fire when ctx is cancelled during Enter")
+		assert.False(t, client.nonceMgr.initialized,
+			"cancelled Enter must not reserve a nonce")
+	case <-time.After(2 * time.Second):
+		t.Fatal("submitPreparedTx did not return within 2s of ctx cancel")
+	}
+}
+
 type staticNonceFetcher struct {
 	nonce uint64
 	calls int
@@ -200,6 +374,11 @@ type mockJobTxBackend struct {
 	gasPrice  *big.Int
 	sendErr   error
 	sendCalls int
+	// sendFn, if set, is invoked BEFORE sendErr is returned. Used in
+	// concurrency tests to synchronize multiple goroutines at the
+	// SendTransaction boundary.
+	sendFn func() error
+	mu     sync.Mutex
 }
 
 func (m *mockJobTxBackend) SuggestGasPrice(context.Context) (*big.Int, error) {
@@ -207,8 +386,15 @@ func (m *mockJobTxBackend) SuggestGasPrice(context.Context) (*big.Int, error) {
 }
 
 func (m *mockJobTxBackend) SendTransaction(context.Context, *types.Transaction) error {
+	m.mu.Lock()
 	m.sendCalls++
-	return m.sendErr
+	fn := m.sendFn
+	err := m.sendErr
+	m.mu.Unlock()
+	if fn != nil {
+		return fn()
+	}
+	return err
 }
 
 func newTestChainClient(t *testing.T) *ChainClient {
@@ -233,10 +419,14 @@ func newTestChainClient(t *testing.T) *ChainClient {
 
 type mockRPCError struct {
 	code int
+	msg  string
 }
 
 func (e mockRPCError) Error() string {
-	return "rpc error"
+	if e.msg == "" {
+		return "rpc error"
+	}
+	return e.msg
 }
 
 func (e mockRPCError) ErrorCode() int {

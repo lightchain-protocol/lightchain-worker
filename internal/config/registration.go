@@ -5,6 +5,7 @@ import (
 	"math/big"
 	"os"
 	"strings"
+	"time"
 
 	"github.com/ethereum/go-ethereum/common"
 )
@@ -25,6 +26,28 @@ type RegistrationConfig struct {
 	ChainID               int64
 	WorkerRegistryAddress common.Address
 	AIConfigAddress       common.Address
+	// JobRegistryAddress is required only for settlement subcommands
+	// (balance, withdraw, release). Other subcommands leave it as the zero
+	// address; chain.NewChainClient skips the JobRegistry binding when zero.
+	JobRegistryAddress common.Address
+
+	// Drain — required only by the drain/undrain subcommands. Exactly one
+	// of these is consulted at runtime: WorkerGatewayURL (gateway mode)
+	// takes precedence if set, otherwise RedisURL (direct mode).
+	RedisURL         string
+	WorkerGatewayURL string
+
+	// DrainTTLOverride is parsed from LIGHTCHAIN_DRAIN_TTL. When > 0 it
+	// is used as the drain marker TTL, bypassing the on-chain dispute
+	// window lookup. Both SIGTERM-driven (sidecar) and CLI-driven drain
+	// consult the same env var so behavior is consistent.
+	DrainTTLOverride time.Duration
+
+	// DrainSlack is added to the on-chain dispute window when the CLI
+	// computes the drain marker TTL. Parsed from LIGHTCHAIN_DRAIN_SLACK;
+	// zero means "use the handler default (2h)". Mirrors the sidecar
+	// config so SIGTERM and CLI agree on the same value.
+	DrainSlack time.Duration
 
 	// Models — comma-separated list
 	SupportedModels []string
@@ -49,6 +72,8 @@ func LoadRegistration() (*RegistrationConfig, error) {
 		WorkerKeystorePassword: os.Getenv("WORKER_KEYSTORE_PASSWORD"),
 		EncryptionKeystorePath: envOrDefault("ENCRYPTION_KEYSTORE_PATH", "data/worker-encryption.key"),
 		RPCURL:                 envOrDefault("RPC_URL", "http://localhost:8545"),
+		RedisURL:               os.Getenv("REDIS_URL"),
+		WorkerGatewayURL:       os.Getenv("WORKER_GATEWAY_URL"),
 		LogLevel:               envOrDefault("LOG_LEVEL", "info"),
 		LogFormat:              envOrDefault("LOG_FORMAT", "json"),
 	}
@@ -90,6 +115,16 @@ func LoadRegistration() (*RegistrationConfig, error) {
 		cfg.AIConfigAddress = common.HexToAddress(aiConfigStr)
 	}
 
+	// JobRegistryAddress — optional at load time; required only for settlement
+	// subcommands (balance, withdraw, release) via ValidateForSettlement.
+	if jobRegStr := os.Getenv("JOB_REGISTRY_ADDRESS"); jobRegStr != "" {
+		if !common.IsHexAddress(jobRegStr) {
+			errs = append(errs, fmt.Sprintf("JOB_REGISTRY_ADDRESS: invalid hex address %q", jobRegStr))
+		} else {
+			cfg.JobRegistryAddress = common.HexToAddress(jobRegStr)
+		}
+	}
+
 	// SupportedModels — required for register/add-models; may be empty for other commands
 	modelsStr := os.Getenv("SUPPORTED_MODELS")
 	if modelsStr != "" {
@@ -109,6 +144,33 @@ func LoadRegistration() (*RegistrationConfig, error) {
 			errs = append(errs, "WORKER_STAKE: must be non-negative")
 		} else {
 			cfg.WorkerStake = stake
+		}
+	}
+
+	// LIGHTCHAIN_DRAIN_TTL — optional drain TTL override (consumed by
+	// drain/undrain subcommands). Empty means "use chain-derived TTL".
+	if ttlStr := os.Getenv("LIGHTCHAIN_DRAIN_TTL"); ttlStr != "" {
+		d, err := time.ParseDuration(ttlStr)
+		if err != nil {
+			errs = append(errs, fmt.Sprintf("LIGHTCHAIN_DRAIN_TTL: invalid duration %q: %v", ttlStr, err))
+		} else if d <= 0 {
+			errs = append(errs, fmt.Sprintf("LIGHTCHAIN_DRAIN_TTL: must be positive, got %s", d))
+		} else {
+			cfg.DrainTTLOverride = d
+		}
+	}
+
+	// LIGHTCHAIN_DRAIN_SLACK — optional slack added to the dispute window
+	// (consumed by the drain subcommand). Empty means "use the handler
+	// default (2h)". Negative is rejected to match the sidecar config.
+	if slackStr := os.Getenv("LIGHTCHAIN_DRAIN_SLACK"); slackStr != "" {
+		d, err := time.ParseDuration(slackStr)
+		if err != nil {
+			errs = append(errs, fmt.Sprintf("LIGHTCHAIN_DRAIN_SLACK: invalid duration %q: %v", slackStr, err))
+		} else if d < 0 {
+			errs = append(errs, fmt.Sprintf("LIGHTCHAIN_DRAIN_SLACK: must be >= 0, got %s", d))
+		} else {
+			cfg.DrainSlack = d
 		}
 	}
 
@@ -162,5 +224,16 @@ func (c *RegistrationConfig) Validate() []string {
 		errs = append(errs, fmt.Sprintf("LOG_FORMAT: must be \"json\" or \"text\", got %q", c.LogFormat))
 	}
 
+	return errs
+}
+
+// ValidateForSettlement adds checks required only by settlement subcommands
+// (balance, withdraw, release). Callers should run Validate() first and merge
+// the returned slices, since these checks are additive.
+func (c *RegistrationConfig) ValidateForSettlement() []string {
+	var errs []string
+	if c.JobRegistryAddress == (common.Address{}) {
+		errs = append(errs, "JOB_REGISTRY_ADDRESS must be a non-zero address for balance/withdraw/release")
+	}
 	return errs
 }

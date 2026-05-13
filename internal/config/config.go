@@ -10,6 +10,8 @@ import (
 
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/crypto"
+
+	"github.com/lightchain/worker/internal/metrics"
 )
 
 // Config holds all worker sidecar configuration parsed from environment variables.
@@ -50,15 +52,103 @@ type Config struct {
 	BeaconAPIURL string
 
 	// Job execution
-	MaxConcurrentJobs int
-	AckTxTimeout      time.Duration
-	BlobFetchTimeout  time.Duration
-	BlobFetchRetries  int
-	SessionKeyFile    string
+	MaxConcurrentJobs   int
+	AckTxTimeout        time.Duration
+	BlobTxTimeout       time.Duration
+	BlobFetchTimeout    time.Duration
+	BlobFetchRetries    int
+	SessionKeyFile      string
 	ReceiptPollInterval time.Duration
+
+	// RedisPublishTimeout bounds stage 7 (redis_publish): a single
+	// PUBLISH on the session response channel. Stage 7 is non-fatal but
+	// runs synchronously inside processJob, so a slow Redis must not be
+	// allowed to eat into stage 8's BlobTxTimeout budget.
+	RedisPublishTimeout time.Duration
+
+	// JobCheckpoint — retry-safety cache for stages 2-6.
+	//
+	// CheckpointTTL is how long a checkpoint record lives after the first
+	// write. Chosen generously (2h) so asynq retries over long backoffs
+	// still hit the cache; a shorter TTL is applied after on-chain
+	// completion (see Tombstone).
+	//
+	// CheckpointMaxBytes caps the cached ciphertext size. Oversized
+	// responses are refused and fall through to per-retry re-inference.
+	// Default 256 KiB comfortably fits llama-scale responses with headroom.
+	CheckpointTTL      time.Duration
+	CheckpointMaxBytes int
+
+	// Stuck-nonce recovery (Hazard B). When the worker's signing key has a
+	// tx stuck in the mempool — e.g. BlobFeeCap underbid the current blob
+	// base fee — every SendTransaction is rejected with "address already
+	// reserved" and the ResetNonce+refetch loop cannot clear it. These
+	// settings bound detection and automated replacement.
+	//
+	// StuckNonceThreshold — consecutive rejections at the same nonce before
+	// declaring it stuck. Default 5 tolerates transient pool flakiness.
+	//
+	// StuckNonceMaxBumps — max replacement-tx attempts per stuck nonce
+	// before returning a loud error. Default 3 caps the worst-case gas
+	// cost of automated recovery.
+	//
+	// StuckNonceAutoReplace — operator kill-switch. When false the tracker
+	// still detects and logs, but no replacement tx is submitted.
+	StuckNonceThreshold   int
+	StuckNonceMaxBumps    int
+	StuckNonceAutoReplace bool
 
 	// Shutdown
 	ShutdownTimeout time.Duration
+
+	// DrainTTLOverride is parsed from LIGHTCHAIN_DRAIN_TTL. When > 0 it
+	// is used as the drain marker TTL, bypassing the on-chain dispute
+	// window lookup. Both SIGTERM-driven and CLI-driven drain consult
+	// this same field so the override is consistent across entrypoints.
+	DrainTTLOverride time.Duration
+
+	// DrainSlack is added to the on-chain dispute window when computing
+	// the drain marker TTL. Parsed from LIGHTCHAIN_DRAIN_SLACK; defaults
+	// to 2h when unset. Lowering it is the lever E2E suites use to keep
+	// drain windows short without touching the chain dispute window.
+	DrainSlack time.Duration
+
+	// Gateway mode (optional — when set, worker uses HTTP gateway instead of direct Redis)
+	WorkerGatewayURL string
+
+	// Metrics — Prometheus /metrics HTTP endpoint.
+	//
+	// MetricsListenAddr defaults to 127.0.0.1:9101 (loopback-only, scraped
+	// by the same-host Ops Agent). Set to empty to disable the endpoint.
+	//
+	// MetricsAllowPublic is a deliberate escape hatch: when false (default)
+	// Validate rejects any non-loopback host to prevent accidentally
+	// exposing /metrics on 0.0.0.0. Set true only when fronted by an
+	// authenticated reverse proxy or scraped from outside the host.
+	MetricsListenAddr  string
+	MetricsAllowPublic bool
+
+	// Release scheduler — settles completed jobs on-chain after the
+	// dispute window. ReleaseEnabled gates the entire subsystem; when
+	// false the pipeline still runs (no MarkEligible writes occur)
+	// and the operator settles via worker-cli release.
+	ReleaseEnabled               bool
+	ReleaseStatePath             string
+	ReleaseInterval              time.Duration
+	ReleaseProbeInterval         time.Duration
+	ReleaseBatchThreshold        int
+	ReleaseMaxBatchSize          int
+	ReleaseTxTimeout             time.Duration
+	ReleaseStartBlock            uint64
+	ReleaseChunkSize             uint64
+	ReleaseConfirmations         uint64
+	ReleaseReconcileInterval     time.Duration
+	ReleaseBackoffBase           time.Duration
+	ReleaseBackoffMax            time.Duration
+	ReleasePausedCycleBackoff    time.Duration
+	ReleaseStaleDisputeWarnAfter time.Duration
+	ReleaseDisputeWindowOverride time.Duration
+	ReleaseDisputeWindowCacheTTL time.Duration
 
 	// Logging
 	LogLevel  string
@@ -78,6 +168,8 @@ func Load() (*Config, error) {
 		OllamaURL:              envOrDefault("OLLAMA_URL", "http://localhost:11434"),
 		BeaconAPIURL:           envOrDefault("BEACON_API_URL", "http://localhost:3500"),
 		SessionKeyFile:         envOrDefault("SESSION_KEY_FILE", "data/session-keys.enc"),
+		WorkerGatewayURL:       os.Getenv("WORKER_GATEWAY_URL"),
+		MetricsListenAddr:      envOrDefault("WORKER_METRICS_ADDR", "127.0.0.1:9101"),
 		LogLevel:               envOrDefault("LOG_LEVEL", "info"),
 		LogFormat:              envOrDefault("LOG_FORMAT", "json"),
 	}
@@ -164,14 +256,67 @@ func Load() (*Config, error) {
 	// Durations
 	cfg.HeartbeatInterval = parseDuration("HEARTBEAT_INTERVAL", "10s", &errs)
 	cfg.ShutdownTimeout = parseDuration("SHUTDOWN_TIMEOUT", "30s", &errs)
+	// Drain TTL override — empty means "consult AIConfig.getDisputeWindow()".
+	// parseDuration treats "0s" as a valid zero, which is what we want
+	// when the env var is unset. Any positive value bypasses the chain
+	// lookup; negative values are rejected so a typo like "-1h" fails
+	// fast instead of silently disabling the override (the > 0 short-
+	// circuit in computeDrainTTL would treat it as "unset" otherwise).
+	cfg.DrainTTLOverride = parseDuration("LIGHTCHAIN_DRAIN_TTL", "0s", &errs)
+	if cfg.DrainTTLOverride < 0 {
+		errs = append(errs, fmt.Sprintf("LIGHTCHAIN_DRAIN_TTL: must be >= 0, got %s", cfg.DrainTTLOverride))
+	}
+	// LIGHTCHAIN_DRAIN_SLACK extends the on-chain dispute window. Default
+	// 2h matches the value previously hardcoded in service.go; tests
+	// override it to 10s or so to keep drain windows tight without
+	// touching the chain dispute window.
+	cfg.DrainSlack = parseDuration("LIGHTCHAIN_DRAIN_SLACK", "2h", &errs)
+	if cfg.DrainSlack < 0 {
+		errs = append(errs, fmt.Sprintf("LIGHTCHAIN_DRAIN_SLACK: must be >= 0, got %s", cfg.DrainSlack))
+	}
 	cfg.OllamaTimeout = parseDuration("OLLAMA_TIMEOUT", "120s", &errs)
 	cfg.AckTxTimeout = parseDuration("ACK_TX_TIMEOUT", "15s", &errs)
+	// BlobTxTimeout bounds stage 8 (submit_blob): slot wait + SendTransaction
+	// + WaitMined. Default 90s = ~15 blocks at 6s block time, generous buffer
+	// over the ~12s typical to absorb network jitter and queued broadcasts.
+	cfg.BlobTxTimeout = parseDuration("BLOB_TX_TIMEOUT", "90s", &errs)
 	cfg.BlobFetchTimeout = parseDuration("BLOB_FETCH_TIMEOUT", "10s", &errs)
 	cfg.ReceiptPollInterval = parseDuration("RECEIPT_POLL_INTERVAL", "2s", &errs)
+	cfg.RedisPublishTimeout = parseDuration("REDIS_PUBLISH_TIMEOUT", "5s", &errs)
 
 	// Job execution integers
 	cfg.MaxConcurrentJobs = parseInt("MAX_CONCURRENT_JOBS", 2, &errs)
 	cfg.BlobFetchRetries = parseInt("BLOB_FETCH_RETRIES", 3, &errs)
+
+	// Stuck-nonce recovery config
+	cfg.StuckNonceThreshold = parseInt("WORKER_STUCK_NONCE_THRESHOLD", 5, &errs)
+	cfg.StuckNonceMaxBumps = parseInt("WORKER_STUCK_NONCE_MAX_BUMPS", 3, &errs)
+	cfg.StuckNonceAutoReplace = parseBool("WORKER_STUCK_NONCE_AUTOREPLACE", true, &errs)
+	cfg.MetricsAllowPublic = parseBool("WORKER_METRICS_ALLOW_PUBLIC", false, &errs)
+
+	// Job checkpoint (retry-safety cache)
+	cfg.CheckpointTTL = parseDuration("WORKER_CHECKPOINT_TTL", "2h", &errs)
+	cfg.CheckpointMaxBytes = parseInt("WORKER_CHECKPOINT_MAX_BYTES", 262144, &errs)
+
+	// Release scheduler. Defaults match release.DefaultConfig() — when
+	// they drift, both must be updated.
+	cfg.ReleaseEnabled = parseBool("RELEASE_ENABLED", true, &errs)
+	cfg.ReleaseStatePath = envOrDefault("RELEASE_STATE_PATH", "./release_state.json")
+	cfg.ReleaseInterval = parseDuration("RELEASE_INTERVAL", "8h", &errs)
+	cfg.ReleaseProbeInterval = parseDuration("RELEASE_PROBE_INTERVAL", "5m", &errs)
+	cfg.ReleaseBatchThreshold = parseInt("RELEASE_BATCH_THRESHOLD", 20, &errs)
+	cfg.ReleaseMaxBatchSize = parseInt("RELEASE_MAX_BATCH_SIZE", 50, &errs)
+	cfg.ReleaseTxTimeout = parseDuration("RELEASE_TX_TIMEOUT", "120s", &errs)
+	cfg.ReleaseStartBlock = parseUint64("RELEASE_RECONCILE_START_BLOCK", 0, &errs)
+	cfg.ReleaseChunkSize = parseUint64("RELEASE_RECONCILE_CHUNK_SIZE", 5000, &errs)
+	cfg.ReleaseConfirmations = parseUint64("RELEASE_RECONCILE_CONFIRMATIONS", 5, &errs)
+	cfg.ReleaseReconcileInterval = parseDuration("RELEASE_RECONCILE_INTERVAL", "1h", &errs)
+	cfg.ReleaseBackoffBase = parseDuration("RELEASE_BACKOFF_BASE", "15m", &errs)
+	cfg.ReleaseBackoffMax = parseDuration("RELEASE_BACKOFF_MAX", "24h", &errs)
+	cfg.ReleasePausedCycleBackoff = parseDuration("RELEASE_PAUSED_CYCLE_BACKOFF", "1h", &errs)
+	cfg.ReleaseStaleDisputeWarnAfter = parseDuration("RELEASE_STALE_DISPUTE_WARN_AFTER", "168h", &errs)
+	cfg.ReleaseDisputeWindowOverride = parseDuration("RELEASE_DISPUTE_WINDOW_OVERRIDE", "0s", &errs)
+	cfg.ReleaseDisputeWindowCacheTTL = parseDuration("RELEASE_DISPUTE_WINDOW_CACHE_TTL", "15m", &errs)
 
 	if len(errs) > 0 {
 		return nil, fmt.Errorf("config load errors:\n  - %s", strings.Join(errs, "\n  - "))
@@ -225,6 +370,9 @@ func (c *Config) Validate() []string {
 	if c.AckTxTimeout <= 0 {
 		errs = append(errs, "ACK_TX_TIMEOUT must be positive")
 	}
+	if c.BlobTxTimeout <= 0 {
+		errs = append(errs, "BLOB_TX_TIMEOUT must be positive")
+	}
 	if c.BlobFetchTimeout <= 0 {
 		errs = append(errs, "BLOB_FETCH_TIMEOUT must be positive")
 	}
@@ -234,8 +382,66 @@ func (c *Config) Validate() []string {
 	if c.ReceiptPollInterval <= 0 {
 		errs = append(errs, "RECEIPT_POLL_INTERVAL must be positive")
 	}
+	if c.RedisPublishTimeout <= 0 {
+		errs = append(errs, "REDIS_PUBLISH_TIMEOUT must be positive")
+	}
 	if c.LogFormat != "json" && c.LogFormat != "text" {
 		errs = append(errs, fmt.Sprintf("LOG_FORMAT: must be \"json\" or \"text\", got %q", c.LogFormat))
+	}
+	if c.StuckNonceThreshold <= 0 {
+		errs = append(errs, "WORKER_STUCK_NONCE_THRESHOLD must be positive")
+	}
+	if c.StuckNonceMaxBumps <= 0 {
+		errs = append(errs, "WORKER_STUCK_NONCE_MAX_BUMPS must be positive")
+	}
+	if err := metrics.ValidateListenAddr(c.MetricsListenAddr, c.MetricsAllowPublic); err != nil {
+		errs = append(errs, fmt.Sprintf("WORKER_METRICS_ADDR: %v", err))
+	}
+
+	// Release scheduler validation. The Tracker needs StatePath even when
+	// the rest of the subsystem is disabled, so it is checked regardless.
+	if c.ReleaseStatePath == "" {
+		errs = append(errs, "RELEASE_STATE_PATH must not be empty")
+	}
+	if c.ReleaseEnabled {
+		if c.ReleaseInterval <= 0 {
+			errs = append(errs, "RELEASE_INTERVAL must be positive")
+		}
+		if c.ReleaseProbeInterval <= 0 {
+			errs = append(errs, "RELEASE_PROBE_INTERVAL must be positive")
+		}
+		if c.ReleaseProbeInterval > c.ReleaseInterval {
+			errs = append(errs, fmt.Sprintf("RELEASE_PROBE_INTERVAL (%s) must be ≤ RELEASE_INTERVAL (%s)",
+				c.ReleaseProbeInterval, c.ReleaseInterval))
+		}
+		if c.ReleaseBatchThreshold < 1 {
+			errs = append(errs, "RELEASE_BATCH_THRESHOLD must be ≥ 1")
+		}
+		if c.ReleaseMaxBatchSize < 1 {
+			errs = append(errs, "RELEASE_MAX_BATCH_SIZE must be ≥ 1")
+		}
+		if c.ReleaseTxTimeout <= 0 {
+			errs = append(errs, "RELEASE_TX_TIMEOUT must be positive")
+		}
+		if c.ReleaseChunkSize == 0 {
+			errs = append(errs, "RELEASE_RECONCILE_CHUNK_SIZE must be ≥ 1")
+		}
+		if c.ReleaseReconcileInterval <= 0 {
+			errs = append(errs, "RELEASE_RECONCILE_INTERVAL must be positive")
+		}
+		if c.ReleaseBackoffBase <= 0 {
+			errs = append(errs, "RELEASE_BACKOFF_BASE must be positive")
+		}
+		if c.ReleaseBackoffMax < c.ReleaseBackoffBase {
+			errs = append(errs, fmt.Sprintf("RELEASE_BACKOFF_MAX (%s) must be ≥ RELEASE_BACKOFF_BASE (%s)",
+				c.ReleaseBackoffMax, c.ReleaseBackoffBase))
+		}
+		if c.ReleasePausedCycleBackoff <= 0 {
+			errs = append(errs, "RELEASE_PAUSED_CYCLE_BACKOFF must be positive")
+		}
+		if c.ReleaseDisputeWindowCacheTTL < 0 {
+			errs = append(errs, "RELEASE_DISPUTE_WINDOW_CACHE_TTL must be ≥ 0")
+		}
 	}
 
 	return errs
@@ -311,6 +517,48 @@ func parseDuration(key, defaultVal string, errs *[]string) time.Duration {
 		return 0
 	}
 	return d
+}
+
+// parseBool reads an env var and parses standard truthy/falsy strings.
+// Accepts: true/false, 1/0, yes/no, on/off (case-insensitive). Empty
+// defaults to defaultVal.
+func parseBool(key string, defaultVal bool, errs *[]string) bool {
+	raw := strings.TrimSpace(os.Getenv(key))
+	if raw == "" {
+		return defaultVal
+	}
+	switch strings.ToLower(raw) {
+	case "true", "1", "yes", "on":
+		return true
+	case "false", "0", "no", "off":
+		return false
+	default:
+		*errs = append(*errs, fmt.Sprintf("%s: invalid boolean %q", key, raw))
+		return defaultVal
+	}
+}
+
+// parseUint64 reads an env var as a non-negative integer that fits in uint64.
+// Returns defaultVal on empty/missing.
+func parseUint64(key string, defaultVal uint64, errs *[]string) uint64 {
+	raw := os.Getenv(key)
+	if raw == "" {
+		return defaultVal
+	}
+	v := new(big.Int)
+	if _, ok := v.SetString(raw, 10); !ok {
+		*errs = append(*errs, fmt.Sprintf("%s: invalid integer %q", key, raw))
+		return defaultVal
+	}
+	if v.Sign() < 0 {
+		*errs = append(*errs, fmt.Sprintf("%s: must be non-negative", key))
+		return defaultVal
+	}
+	if !v.IsUint64() {
+		*errs = append(*errs, fmt.Sprintf("%s: value %q overflows uint64", key, raw))
+		return defaultVal
+	}
+	return v.Uint64()
 }
 
 func parseInt(key string, defaultVal int, errs *[]string) int {

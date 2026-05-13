@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"log/slog"
 	"math/big"
+	"net/http"
 	"os"
 	"os/signal"
 	"strings"
@@ -22,24 +23,55 @@ import (
 	"github.com/hibiken/asynq"
 	"github.com/redis/go-redis/v9"
 
+	pkgtypes "github.com/lightchain/pkg/types"
+
 	"github.com/lightchain/worker/internal/blob"
 	"github.com/lightchain/worker/internal/chain"
 	"github.com/lightchain/worker/internal/config"
+	gw "github.com/lightchain/worker/internal/gateway"
 	"github.com/lightchain/worker/internal/heartbeat"
 	"github.com/lightchain/worker/internal/keystore"
+	"github.com/lightchain/worker/internal/metrics"
 	"github.com/lightchain/worker/internal/ollama"
 	"github.com/lightchain/worker/internal/pipeline"
 	"github.com/lightchain/worker/internal/registration"
+	"github.com/lightchain/worker/internal/release"
 )
 
 // startupHeartbeatTimeout is the maximum time allowed for the initial heartbeat
 // write during service startup. It validates Redis connectivity before accepting traffic.
 const startupHeartbeatTimeout = 5 * time.Second
 
+// shutdownDrainTimeout is the maximum time allowed for the SIGTERM-driven
+// drain marker write. Set short — the goal is best-effort signalling, not
+// blocking the shutdown sequence on a network round trip.
+const shutdownDrainTimeout = 10 * time.Second
+
+// drainTTLLookupTimeout bounds the on-chain dispute-window RPC so a hung
+// lookup cannot consume the budget reserved for the Redis write that
+// follows. Falling back to drainTTLFallback in this window leaves time
+// for SetDraining to succeed.
+const drainTTLLookupTimeout = 4 * time.Second
+
+// drainTTLFallback is used when the on-chain dispute window cannot be read
+// at drain time (RPC down, context cancelled, etc.). 24h matches the live
+// testnet dispute window, with a small implicit slack via the shutdown
+// timeout. See docs/worker-drain-plan.md.
+const drainTTLFallback = 24 * time.Hour
+
+// defaultDrainSlack is the fallback added to the on-chain dispute window
+// when computing the drain TTL if cfg.DrainSlack is zero. It gives the
+// operator time to run claimTimeout/releaseJobs/deregister/withdraw after
+// the dispute window passes without the drain marker silently expiring
+// mid-cleanup. Override via LIGHTCHAIN_DRAIN_SLACK.
+const defaultDrainSlack = 2 * time.Hour
+
 // Service owns all worker sidecar components and coordinates startup and shutdown.
 type Service struct {
 	cfg             *config.Config
+	workerAddr      common.Address
 	chainClient     *chain.ChainClient
+	coordinator     *chain.SubpoolCoordinator
 	redis           *redis.Client
 	monitor         *heartbeat.Monitor
 	asynqServer     *asynq.Server
@@ -47,6 +79,68 @@ type Service struct {
 	sessionKeyStore *keystore.SessionKeyStore
 	jobCounter      *atomic.Int32
 	logger          *slog.Logger
+
+	// metrics owns the Prometheus registry; metricsServer is the HTTP server
+	// exposing /metrics. Server is non-nil iff cfg.MetricsListenAddr != "".
+	metrics       *metrics.Metrics
+	metricsServer *http.Server
+
+	// Gateway mode (non-nil when WORKER_GATEWAY_URL is set)
+	gwClient  *gw.Client
+	gwHandler *pipeline.JobHandler
+
+	// Release subsystem. Store is always non-nil (the Tracker writes to it
+	// from the pipeline regardless of cfg.ReleaseEnabled). Scheduler and
+	// Reconciler are nil when ReleaseEnabled=false; in that case the
+	// operator is expected to settle via worker-cli release.
+	releaseStore      release.Store
+	releaseTracker    *release.Tracker
+	releaseScheduler  *release.Scheduler
+	releaseReconciler *release.Reconciler
+}
+
+// releaseMetricsAdapter bridges release.Metrics (a tiny consumer-side
+// interface) to the worker's Prometheus collectors. Service constructs
+// one instance and passes it to both the Scheduler and the Reconciler.
+type releaseMetricsAdapter struct{ m *metrics.Metrics }
+
+func (a releaseMetricsAdapter) SetPending(n int)  { a.m.ReleasePending.Set(float64(n)) }
+func (a releaseMetricsAdapter) IncReleased(n int) { a.m.ReleaseReleasedTotal.Add(float64(n)) }
+func (a releaseMetricsAdapter) IncFailed(n int)   { a.m.ReleaseFailedTotal.Add(float64(n)) }
+func (a releaseMetricsAdapter) IncDropped(reason string) {
+	a.m.ReleaseDroppedTotal.WithLabelValues(reason).Inc()
+}
+func (a releaseMetricsAdapter) IncPauseEvent() { a.m.ReleasePauseEventsTotal.Inc() }
+func (a releaseMetricsAdapter) SetLastSuccessTimestamp(ts int64) {
+	a.m.ReleaseLastSuccessTimestamp.Set(float64(ts))
+}
+func (a releaseMetricsAdapter) SetReconcileLastBlock(block uint64) {
+	a.m.ReleaseReconcileLastBlock.Set(float64(block))
+}
+
+// buildReleaseConfig translates the flat env-var fields on config.Config
+// into the release package's typed Config. Lives in the service package so
+// the release package never has to import config (which would cycle).
+func buildReleaseConfig(cfg *config.Config) release.Config {
+	return release.Config{
+		Enabled:               cfg.ReleaseEnabled,
+		StatePath:             cfg.ReleaseStatePath,
+		Interval:              cfg.ReleaseInterval,
+		ProbeInterval:         cfg.ReleaseProbeInterval,
+		BatchThreshold:        cfg.ReleaseBatchThreshold,
+		MaxBatchSize:          cfg.ReleaseMaxBatchSize,
+		TxTimeout:             cfg.ReleaseTxTimeout,
+		StartBlock:            cfg.ReleaseStartBlock,
+		ChunkSize:             cfg.ReleaseChunkSize,
+		Confirmations:         cfg.ReleaseConfirmations,
+		ReconcileInterval:     cfg.ReleaseReconcileInterval,
+		BackoffBase:           cfg.ReleaseBackoffBase,
+		BackoffMax:            cfg.ReleaseBackoffMax,
+		PausedCycleBackoff:    cfg.ReleasePausedCycleBackoff,
+		StaleDisputeWarnAfter: cfg.ReleaseStaleDisputeWarnAfter,
+		DisputeWindowOverride: cfg.ReleaseDisputeWindowOverride,
+		DisputeWindowCacheTTL: cfg.ReleaseDisputeWindowCacheTTL,
+	}
 }
 
 // New initializes all components: loads keys, dials chain + Redis, registers on-chain,
@@ -107,6 +201,18 @@ func New(cfg *config.Config) (*Service, error) {
 		modelIDToName[strings.TrimPrefix(strings.ToLower(modelHex), "0x")] = cfg.SupportedModels[i]
 	}
 
+	// Per-signing-key subpool coordinator. ONE instance is shared across
+	// every tx submission path (BlobTxSubmitter and ChainClient). It
+	// serializes ACROSS tx classes (blob vs legacy) — which geth requires
+	// at the sender-reservation boundary — while allowing unbounded
+	// within-class concurrency. See internal/chain/subpool_coordinator.go.
+	coordinator := chain.NewSubpoolCoordinator(logger, 0)
+
+	// Per-signing-key stuck-nonce tracker. Shared across submitters so
+	// "address already reserved" hits from ACK/CompleteJob broadcasts
+	// accumulate into the blob path's replacement decision.
+	stuckTracker := chain.NewStuckNonceTracker()
+
 	// Dial chain (now includes JobRegistry binding)
 	chainClient, err := chain.NewChainClient(
 		cfg.RPCURL,
@@ -116,8 +222,11 @@ func New(cfg *config.Config) (*Service, error) {
 		cfg.JobRegistryAddress,
 		signingKey,
 		cfg.GasPriceMultiplierBps,
+		coordinator,
+		stuckTracker,
 	)
 	if err != nil {
+		coordinator.Close()
 		return nil, fmt.Errorf("connect to chain: %w", err)
 	}
 
@@ -146,23 +255,25 @@ func New(cfg *config.Config) (*Service, error) {
 		logger.Warn("ollama model verification failed (non-fatal)", "error", err)
 	}
 
-	// Dial Redis (before blob setup — RedisBlobFetcher needs the client)
-	redisOpts, err := redis.ParseURL(cfg.RedisURL)
-	if err != nil {
-		chainClient.Close()
-		return nil, fmt.Errorf("parse Redis URL %q: %w", cfg.RedisURL, err)
-	}
-	if cfg.RedisPassword != "" {
-		redisOpts.Password = cfg.RedisPassword
-	}
-	redisClient := redis.NewClient(redisOpts)
-
 	// Blob fetcher + submitter (mode-dependent)
 	blobMode := strings.ToLower(strings.TrimSpace(os.Getenv("BLOB_MODE")))
 	var blobFetcher blob.BlobFetcher
 	var blobSubmitter blob.BlobSubmitter
+	var redisClient *redis.Client
+	var redisOpts *redis.Options
+
 	switch blobMode {
 	case "redis":
+		// Redis blob mode requires a Redis connection for blob I/O.
+		redisOpts, err = redis.ParseURL(cfg.RedisURL)
+		if err != nil {
+			chainClient.Close()
+			return nil, fmt.Errorf("parse Redis URL %q: %w", cfg.RedisURL, err)
+		}
+		if cfg.RedisPassword != "" {
+			redisOpts.Password = cfg.RedisPassword
+		}
+		redisClient = redis.NewClient(redisOpts)
 		blobFetcher = blob.NewRedisBlobFetcher(redisClient)
 		blobSubmitter = blob.NewRedisBlobSubmitter(redisClient)
 		logger.Info("blob mode: redis (dev)")
@@ -179,18 +290,120 @@ func New(cfg *config.Config) (*Service, error) {
 			big.NewInt(cfg.ChainID),
 			chainClient.NonceManager(),
 			cfg.MaxGasPrice,
+			coordinator,
+			stuckTracker,
+			blob.StuckNonceConfig{
+				Threshold:   cfg.StuckNonceThreshold,
+				MaxBumps:    cfg.StuckNonceMaxBumps,
+				AutoReplace: cfg.StuckNonceAutoReplace,
+			},
+			logger,
 		)
 		logger.Info("blob mode: eip-4844 (beacon)")
 	default:
-		_ = redisClient.Close()
 		chainClient.Close()
 		return nil, fmt.Errorf("unsupported BLOB_MODE %q", blobMode)
+	}
+
+	// In direct Redis mode (non-gateway), we always need a Redis client for
+	// heartbeat, Asynq job queue, and response publishing. Create it now if
+	// blob mode didn't already create one.
+	if cfg.WorkerGatewayURL == "" && redisClient == nil {
+		redisOpts, err = redis.ParseURL(cfg.RedisURL)
+		if err != nil {
+			chainClient.Close()
+			return nil, fmt.Errorf("parse Redis URL %q: %w", cfg.RedisURL, err)
+		}
+		if cfg.RedisPassword != "" {
+			redisOpts.Password = cfg.RedisPassword
+		}
+		redisClient = redis.NewClient(redisOpts)
 	}
 
 	// Redis already dialed above
 
 	// Shared job counter between pipeline handler and heartbeat monitor
 	jobCounter := &atomic.Int32{}
+
+	// Prometheus metrics. Owns its own registry — no global pollution.
+	// MaxJobs is set immediately because it's a config-derived constant;
+	// Bind wires GaugeFunc/CounterFunc collectors to the live atomics on
+	// jobCounter, coordinator, and stuckTracker so each scrape reflects
+	// current state without any background goroutine.
+	metricsCollector := metrics.New(cfg.SupportedModels)
+	metricsCollector.MaxJobs.Set(float64(cfg.MaxConcurrentJobs))
+	if err := metricsCollector.Bind(
+		jobCounter,
+		func() int { return coordinator.Inflight(chain.ClassBlob) },
+		func() int { return coordinator.Inflight(chain.ClassLegacy) },
+		coordinator.OrphanCount,
+		stuckTracker.Size,
+		stuckTracker.MaxConsecutiveHits,
+	); err != nil {
+		// Bind only fails on duplicate-call; can't happen here unless someone
+		// shares the *Metrics across two service.New invocations, which is
+		// itself a bug. Surface loudly.
+		chainClient.Close()
+		return nil, fmt.Errorf("metrics.Bind: %w", err)
+	}
+
+	// Retry-safety checkpoint store. Backed by the same Redis client so
+	// cache records ride the same connection pool as heartbeat and
+	// response pub/sub. Tombstone TTL is fixed at 10 minutes — long enough
+	// that a late retry observes "completed" via the cached record, short
+	// enough that stale entries don't accumulate.
+	// In gateway+beacon mode redisClient is nil — skip checkpoints (the
+	// handler treats nil checkpoints as a no-op).
+	var checkpoints *pipeline.CheckpointStore
+	if redisClient != nil {
+		checkpoints = pipeline.NewCheckpointStore(
+			redisClient,
+			cfg.CheckpointTTL,
+			10*time.Minute,
+			cfg.CheckpointMaxBytes,
+		)
+	}
+
+	// Release subsystem. The Store opens with chain/contract/worker
+	// identity — mismatches fail loudly so a worker can never settle the
+	// wrong chain's jobs. The Tracker is wired into the pipeline handler
+	// below regardless of cfg.ReleaseEnabled; if the scheduler is off, the
+	// Tracker still records eligibility so worker-cli release can settle
+	// later.
+	releaseStore, err := release.NewFileStore(cfg.ReleaseStatePath, release.StoreIdentity{
+		ChainID:       uint64(cfg.ChainID),
+		JobRegistry:   cfg.JobRegistryAddress,
+		WorkerAddress: workerAddr,
+	}, logger)
+	if err != nil {
+		if redisClient != nil {
+			_ = redisClient.Close()
+		}
+		chainClient.Close()
+		return nil, fmt.Errorf("open release store: %w", err)
+	}
+	releaseTracker := release.NewTracker(releaseStore, logger)
+	chainClient.SetDisputeWindowCacheTTL(cfg.ReleaseDisputeWindowCacheTTL)
+
+	releaseCfg := buildReleaseConfig(cfg)
+	releaseMetrics := releaseMetricsAdapter{m: metricsCollector}
+	var releaseScheduler *release.Scheduler
+	var releaseReconciler *release.Reconciler
+	if cfg.ReleaseEnabled {
+		releaseReconciler = release.NewReconciler(releaseStore, chainClient, workerAddr, releaseCfg, logger)
+		releaseReconciler.SetMetrics(releaseMetrics)
+		// Run a startup reconciliation pass best-effort. Errors are logged
+		// but never fatal — the periodic reconciler retries on its own
+		// timer.
+		startupRecCtx, startupRecCancel := context.WithTimeout(context.Background(), 30*time.Second)
+		if recErr := releaseReconciler.Run(startupRecCtx); recErr != nil {
+			logger.Warn("startup reconciliation failed; periodic reconciler will retry",
+				"error", recErr)
+		}
+		startupRecCancel()
+		releaseScheduler = release.NewScheduler(releaseStore, chainClient, workerAddr, releaseCfg, logger)
+		releaseScheduler.SetMetrics(releaseMetrics)
+	}
 
 	// Job pipeline handler
 	handler := pipeline.NewJobHandler(
@@ -205,10 +418,109 @@ func New(cfg *config.Config) (*Service, error) {
 		jobCounter,
 		logger,
 		pipeline.HandlerConfig{
-			AckTxTimeout:  cfg.AckTxTimeout,
-			ModelIDToName: modelIDToName,
+			AckTxTimeout:        cfg.AckTxTimeout,
+			BlobTxTimeout:       cfg.BlobTxTimeout,
+			RedisPublishTimeout: cfg.RedisPublishTimeout,
+			ModelIDToName:       modelIDToName,
+			ChainID:             big.NewInt(cfg.ChainID),
+			JobRegistryAddr:     cfg.JobRegistryAddress,
 		},
+		nil, // publisher — fallback wires RedisResponsePublisher from redisClient
+		checkpoints,
+		metricsCollector,
+		metrics.DeliveryAsynq,
 	)
+	handler.SetReleaseTracker(releaseTracker)
+
+	// --- Gateway mode: skip Asynq and direct Redis heartbeat ---
+	if cfg.WorkerGatewayURL != "" {
+		gwClient := gw.NewClient(cfg.WorkerGatewayURL, signingKey, logger)
+
+		gwCtx, gwCancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer gwCancel()
+		if err := gwClient.Authenticate(gwCtx); err != nil {
+			if redisClient != nil {
+				_ = redisClient.Close()
+			}
+			chainClient.Close()
+			return nil, fmt.Errorf("authenticate with worker-gateway: %w", err)
+		}
+
+		// Create handler with a gateway-based response publisher.
+		// RedisPublishTimeout is intentionally omitted from HandlerConfig: gateway
+		// mode publishes via gwPublisher (HTTP), which has its own timeout via
+		// gwClient.httpClient. checkpoints is shared with the direct-mode handler
+		// (would be, if both ran together) — the store is jobID-keyed and stateless,
+		// so the cache benefits any redelivered job regardless of delivery channel.
+		gwPublisher := &gatewayResponsePublisher{client: gwClient, logger: logger, metrics: metricsCollector}
+		gwHandler := pipeline.NewJobHandler(
+			chainClient,
+			blobFetcher,
+			blobSubmitter,
+			sessionKeyStore,
+			ollamaClient,
+			redisClient,
+			signingKey,
+			ecdhKey,
+			jobCounter,
+			logger,
+			pipeline.HandlerConfig{
+				AckTxTimeout:    cfg.AckTxTimeout,
+				BlobTxTimeout:   cfg.BlobTxTimeout,
+				ModelIDToName:   modelIDToName,
+				ChainID:         big.NewInt(cfg.ChainID),
+				JobRegistryAddr: cfg.JobRegistryAddress,
+			},
+			gwPublisher,
+			checkpoints,
+			metricsCollector,
+			metrics.DeliveryGateway,
+		)
+		gwHandler.SetReleaseTracker(releaseTracker)
+
+		logger.Info("worker service initialized (gateway mode)",
+			"address", workerAddr.Hex(),
+			"gateway", cfg.WorkerGatewayURL,
+			"models", len(modelIDs),
+		)
+
+		// Seed the coordinator from the chain's pending-vs-latest nonce gap
+		// so gateway mode also recovers from a previous crash's stuck txs.
+		seedCtx, seedCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		pendingNonce, perr := chainClient.EthClient().PendingNonceAt(seedCtx, workerAddr)
+		latestNonce, lerr := chainClient.EthClient().NonceAt(seedCtx, workerAddr, nil)
+		seedCancel()
+		if perr == nil && lerr == nil {
+			coordinator.Seed(pendingNonce, latestNonce)
+		} else {
+			logger.Warn("coordinator seed skipped — pending/latest nonce read failed",
+				"pendingErr", perr,
+				"latestErr", lerr,
+				"hint", "first legacy broadcast may race a stuck pool tx; existing ShouldResetNonceOnSendError will recover",
+			)
+		}
+
+		return &Service{
+			cfg:               cfg,
+			workerAddr:        workerAddr,
+			chainClient:       chainClient,
+			coordinator:       coordinator,
+			redis:             redisClient,
+			sessionKeyStore:   sessionKeyStore,
+			jobCounter:        jobCounter,
+			logger:            logger,
+			metrics:           metricsCollector,
+			metricsServer:     buildMetricsServer(cfg, metricsCollector),
+			gwClient:          gwClient,
+			gwHandler:         gwHandler,
+			releaseStore:      releaseStore,
+			releaseTracker:    releaseTracker,
+			releaseScheduler:  releaseScheduler,
+			releaseReconciler: releaseReconciler,
+		}, nil
+	}
+
+	// --- Direct Redis mode (default) ---
 
 	// Asynq server — listens on worker-specific queue
 	// Queue name must match dispatcher's workerQueueName(): "worker:{lowercase_hex_with_0x}"
@@ -230,7 +542,7 @@ func New(cfg *config.Config) (*Service, error) {
 		OllamaURL: cfg.OllamaURL,
 	}
 	addrHex := checksumHexNoPrefix(workerAddr)
-	monitor := heartbeat.NewMonitor(redisClient, monitorCfg, addrHex, modelHexStrings, jobCounter, cfg.MaxConcurrentJobs, logger)
+	monitor := heartbeat.NewMonitor(redisClient, monitorCfg, addrHex, modelHexStrings, jobCounter, cfg.MaxConcurrentJobs, logger, metricsCollector)
 
 	// Gate startup on a real heartbeat write
 	startCtx, startCancel := context.WithTimeout(context.Background(), startupHeartbeatTimeout)
@@ -246,36 +558,134 @@ func New(cfg *config.Config) (*Service, error) {
 		"models", len(modelIDs),
 		"maxConcurrentJobs", cfg.MaxConcurrentJobs,
 		"queue", queueName,
+		"ackTxTimeout", cfg.AckTxTimeout.String(),
+		"blobTxTimeout", cfg.BlobTxTimeout.String(),
+		"minExpectedTaskBudget", (cfg.AckTxTimeout + cfg.BlobTxTimeout + 10*time.Second).String(),
+		"stuckNonceThreshold", cfg.StuckNonceThreshold,
+		"stuckNonceMaxBumps", cfg.StuckNonceMaxBumps,
+		"stuckNonceAutoReplace", cfg.StuckNonceAutoReplace,
 	)
 
+	// Seed the coordinator from the chain's pending-vs-latest nonce gap.
+	// If the previous process crashed between SendTransaction and WaitMined,
+	// geth's reserver still holds those pending txs and our fresh in-memory
+	// coordinator must block cross-class broadcasts until the pool drains.
+	seedCtx, seedCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	pendingNonce, perr := chainClient.EthClient().PendingNonceAt(seedCtx, workerAddr)
+	latestNonce, lerr := chainClient.EthClient().NonceAt(seedCtx, workerAddr, nil)
+	seedCancel()
+	if perr == nil && lerr == nil {
+		coordinator.Seed(pendingNonce, latestNonce)
+	} else {
+		logger.Warn("coordinator seed skipped — pending/latest nonce read failed",
+			"pendingErr", perr,
+			"latestErr", lerr,
+			"hint", "first legacy broadcast may race a stuck pool tx; existing ShouldResetNonceOnSendError will recover",
+		)
+	}
+
 	return &Service{
-		cfg:             cfg,
-		chainClient:     chainClient,
-		redis:           redisClient,
-		monitor:         monitor,
-		asynqServer:     asynqSrv,
-		asynqMux:        mux,
-		sessionKeyStore: sessionKeyStore,
-		jobCounter:      jobCounter,
-		logger:          logger,
+		cfg:               cfg,
+		workerAddr:        workerAddr,
+		chainClient:       chainClient,
+		coordinator:       coordinator,
+		redis:             redisClient,
+		monitor:           monitor,
+		asynqServer:       asynqSrv,
+		asynqMux:          mux,
+		sessionKeyStore:   sessionKeyStore,
+		jobCounter:        jobCounter,
+		logger:            logger,
+		metrics:           metricsCollector,
+		metricsServer:     buildMetricsServer(cfg, metricsCollector),
+		releaseStore:      releaseStore,
+		releaseTracker:    releaseTracker,
+		releaseScheduler:  releaseScheduler,
+		releaseReconciler: releaseReconciler,
 	}, nil
 }
 
-// Run starts the heartbeat goroutine and Asynq server, waits for SIGINT/SIGTERM,
-// then gracefully shuts down. Shutdown must complete within cfg.ShutdownTimeout.
+// buildMetricsServer returns the configured Prometheus HTTP server, or nil
+// if metrics are disabled via empty MetricsListenAddr. Constructed here
+// rather than inline in New() so both the direct and gateway paths share
+// the same configuration logic.
+func buildMetricsServer(cfg *config.Config, m *metrics.Metrics) *http.Server {
+	if cfg.MetricsListenAddr == "" {
+		return nil
+	}
+	return m.Server(cfg.MetricsListenAddr)
+}
+
+// startMetricsServer launches the Prometheus /metrics HTTP listener in a
+// background goroutine. No-op when metricsServer is nil (cfg disabled the
+// endpoint). Errors are logged but never returned — the main lifecycle
+// must continue serving jobs even if observability fails.
+func (s *Service) startMetricsServer() {
+	if s.metricsServer == nil {
+		s.logger.Info("metrics endpoint disabled (WORKER_METRICS_ADDR is empty)")
+		return
+	}
+	s.logger.Info("starting metrics endpoint", "addr", s.metricsServer.Addr)
+	go func() {
+		if err := s.metricsServer.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			s.logger.Error("metrics endpoint failed (job processing continues)",
+				"addr", s.metricsServer.Addr,
+				"error", err,
+			)
+		}
+	}()
+}
+
+// gatewayResponsePublisher publishes responses via the worker-gateway HTTP API.
+type gatewayResponsePublisher struct {
+	client  *gw.Client
+	logger  *slog.Logger
+	metrics *metrics.Metrics
+}
+
+func (p *gatewayResponsePublisher) PublishResponse(
+	ctx context.Context,
+	jobID, sessionID uint64,
+	correlationID string,
+	signature string,
+	ciphertext []byte,
+) {
+	if err := p.client.PublishResponse(ctx, jobID, sessionID, correlationID, signature, ciphertext); err != nil {
+		p.logger.Warn("gateway response publish failed (non-fatal)", "jobID", jobID, "error", err)
+		if p.metrics != nil {
+			p.metrics.RedisPublishFailures.Inc()
+		}
+	}
+}
+
+// Run starts the heartbeat goroutine and Asynq server (or gateway poll loop),
+// waits for SIGINT/SIGTERM, then gracefully shuts down.
 func (s *Service) Run(ctx context.Context) error {
 	runCtx, runCancel := context.WithCancel(ctx)
 	defer runCancel()
 
+	sigCtx, stop := signal.NotifyContext(runCtx, syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+
+	// Metrics endpoint runs in both modes. Non-fatal: a bind failure or
+	// transient ListenAndServe error logs loudly but does not stop job
+	// processing — observability outages must not cascade into job
+	// outages. Shutdown is handled in s.shutdown() via srv.Shutdown(ctx).
+	s.startMetricsServer()
+
+	// Gateway mode: poll loop + gateway heartbeat
+	if s.gwClient != nil {
+		return s.runGatewayMode(sigCtx, runCancel)
+	}
+
+	// Direct Redis mode
 	s.monitor.Start(runCtx)
+	s.startReleaseSubsystem(runCtx)
 
 	asynqErrCh := make(chan error, 1)
 	go func() {
 		asynqErrCh <- s.asynqServer.Run(s.asynqMux)
 	}()
-
-	sigCtx, stop := signal.NotifyContext(runCtx, syscall.SIGINT, syscall.SIGTERM)
-	defer stop()
 
 	s.logger.Info("worker sidecar running — waiting for shutdown signal")
 	var runErr error
@@ -297,6 +707,11 @@ func (s *Service) Run(ctx context.Context) error {
 
 	s.logger.Info("shutdown signal received, stopping gracefully")
 
+	// Set the drain marker BEFORE asynq.Shutdown waits for in-flight jobs.
+	// New sessions stop being routed to this worker while existing jobs
+	// drain naturally. Use a fresh context — sigCtx is cancelled.
+	s.markDrainOnShutdown(false)
+
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), s.cfg.ShutdownTimeout)
 	defer cancel()
 
@@ -311,12 +726,193 @@ func (s *Service) Run(ctx context.Context) error {
 	return runErr
 }
 
+// runGatewayMode runs the worker in gateway mode: connects to the worker-gateway
+// via WebSocket for instant job delivery, and sends heartbeats via HTTP.
+func (s *Service) runGatewayMode(ctx context.Context, cancel context.CancelFunc) error {
+	s.logger.Info("worker sidecar running (gateway mode) — waiting for shutdown signal")
+
+	// Release subsystem runs identically in both modes.
+	s.startReleaseSubsystem(ctx)
+
+	// Heartbeat loop (HTTP POST, unchanged)
+	go func() {
+		ticker := time.NewTicker(s.cfg.HeartbeatInterval)
+		defer ticker.Stop()
+		for {
+			payload := gw.HeartbeatPayload{
+				ActiveJobs:   int(s.jobCounter.Load()),
+				MaxJobs:      s.cfg.MaxConcurrentJobs,
+				OllamaStatus: "ready",
+				Uptime:       0, // simplified for MVP
+			}
+			if err := s.gwClient.SendHeartbeat(ctx, payload); err != nil {
+				s.logger.Warn("gateway heartbeat failed", "error", err)
+			}
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+			}
+		}
+	}()
+
+	// Job stream via WebSocket (BRPOP-backed, instant delivery)
+	go s.gwClient.StreamJobs(ctx, s.cfg.MaxConcurrentJobs, func(jobCtx context.Context, job pipeline.JobPayload) error {
+		if err := s.gwHandler.HandleJobPayload(jobCtx, job); err != nil {
+			s.logger.Error("gateway job processing failed", "jobID", job.JobID, "error", err)
+			return err
+		}
+		return nil
+	})
+
+	<-ctx.Done()
+	s.logger.Info("shutdown signal received, stopping gracefully")
+
+	// Set the drain marker via the gateway BEFORE shutdown closes the
+	// gateway client. New sessions stop being routed; in-flight stream
+	// jobs continue draining via the WebSocket reader until ctx
+	// propagation closes it.
+	s.markDrainOnShutdown(true)
+
+	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), s.cfg.ShutdownTimeout)
+	defer shutdownCancel()
+	return s.shutdown(shutdownCtx)
+}
+
+// markDrainOnShutdown writes the drain marker as the worker exits. Failure
+// is non-fatal — a missing drain marker just means the worker will be
+// filtered out by stale-detection (TTL expiry on the heartbeat key)
+// instead of by drain. The shutdown sequence proceeds regardless.
+//
+// gatewayMode selects between writing via the gateway HTTP API (external
+// workers) and writing directly to Redis (internal workers).
+func (s *Service) markDrainOnShutdown(gatewayMode bool) {
+	if gatewayMode {
+		if s.gwClient == nil {
+			return
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), shutdownDrainTimeout)
+		defer cancel()
+		if err := s.gwClient.SendDrain(ctx); err != nil {
+			s.logger.Warn("drain_write_failed",
+				"mode", "gateway",
+				"worker", s.workerAddr.Hex(),
+				"error", err,
+			)
+			return
+		}
+		s.logger.Info("drain marker set via gateway", "worker", s.workerAddr.Hex())
+		return
+	}
+
+	if s.redis == nil {
+		return
+	}
+
+	// computeDrainTTL bounds its chain RPC to drainTTLLookupTimeout so a
+	// hung lookup cannot consume the budget reserved for the Redis write.
+	ttl := s.computeDrainTTL()
+
+	// Fresh context for the Redis write so it is not poisoned by the
+	// chain RPC's deadline regardless of how long the lookup actually
+	// took.
+	writeCtx, cancel := context.WithTimeout(context.Background(), shutdownDrainTimeout)
+	defer cancel()
+	if err := pkgtypes.SetDraining(writeCtx, s.redis, s.workerAddr.Hex(), ttl); err != nil {
+		s.logger.Warn("drain_write_failed",
+			"mode", "direct",
+			"worker", s.workerAddr.Hex(),
+			"ttl", ttl,
+			"error", err,
+		)
+		return
+	}
+	s.logger.Info("drain marker set via redis",
+		"worker", s.workerAddr.Hex(),
+		"ttl", ttl,
+	)
+}
+
+// computeDrainTTL derives the drain marker TTL.
+//
+// Resolution order:
+//  1. cfg.DrainTTLOverride (set from LIGHTCHAIN_DRAIN_TTL at startup) —
+//     same env var honored by the CLI path, so SIGTERM-driven drain and
+//     `lightchain-worker drain` agree.
+//  2. AIConfig.getDisputeWindow() + cfg.DrainSlack (LIGHTCHAIN_DRAIN_SLACK,
+//     default 2h) from the chain. Bounded by drainTTLLookupTimeout so a
+//     hung RPC cannot block shutdown.
+//  3. drainTTLFallback if the chain read fails or the chain client is
+//     unavailable.
+func (s *Service) computeDrainTTL() time.Duration {
+	if s.cfg != nil && s.cfg.DrainTTLOverride > 0 {
+		return s.cfg.DrainTTLOverride
+	}
+	if s.chainClient == nil {
+		return drainTTLFallback
+	}
+
+	lookupCtx, cancel := context.WithTimeout(context.Background(), drainTTLLookupTimeout)
+	defer cancel()
+
+	disputeWindow, err := s.chainClient.GetDisputeWindow(lookupCtx)
+	if err != nil {
+		s.logger.Warn("get dispute window for drain TTL failed; using fallback",
+			"fallback", drainTTLFallback,
+			"error", err,
+		)
+		return drainTTLFallback
+	}
+	return disputeWindow + s.drainSlack()
+}
+
+// drainSlack returns cfg.DrainSlack when set, otherwise defaultDrainSlack.
+// Keeping the fallback localized here means a future caller that builds a
+// Service with cfg=nil (test harness) still gets sane behavior.
+func (s *Service) drainSlack() time.Duration {
+	if s.cfg != nil && s.cfg.DrainSlack > 0 {
+		return s.cfg.DrainSlack
+	}
+	return defaultDrainSlack
+}
+
+// startReleaseSubsystem launches the Scheduler and the periodic Reconciler.
+// No-op when ReleaseEnabled=false. Safe to call exactly once per Service.
+func (s *Service) startReleaseSubsystem(ctx context.Context) {
+	if s.releaseScheduler == nil && s.releaseReconciler == nil {
+		s.logger.Info("release subsystem disabled (RELEASE_ENABLED=false); operator must run worker-cli release")
+		return
+	}
+	if s.releaseReconciler != nil {
+		s.releaseReconciler.StartPeriodic(ctx)
+	}
+	if s.releaseScheduler != nil {
+		s.releaseScheduler.Start(ctx)
+	}
+	s.logger.Info("release subsystem started",
+		"interval", s.cfg.ReleaseInterval,
+		"probe_interval", s.cfg.ReleaseProbeInterval,
+		"reconcile_interval", s.cfg.ReleaseReconcileInterval,
+	)
+}
+
 // shutdown coordinates all cleanup steps within the given context deadline.
 func (s *Service) shutdown(ctx context.Context) error {
 	var shutdownErr error
 
-	// Stop Asynq server — waits for in-flight jobs
-	s.asynqServer.Shutdown()
+	// Stop the metrics endpoint first — its handlers don't hold locks on
+	// anything else we need to drain, and stopping it early prevents new
+	// scrapes during teardown that might observe inconsistent state.
+	if s.metricsServer != nil {
+		if err := s.metricsServer.Shutdown(ctx); err != nil {
+			s.logger.Warn("metrics server shutdown error (non-fatal)", "error", err)
+		}
+	}
+
+	// Stop Asynq server — waits for in-flight jobs (nil in gateway mode)
+	if s.asynqServer != nil {
+		s.asynqServer.Shutdown()
+	}
 
 	// Zero all session keys
 	if err := s.sessionKeyStore.ZeroAll(); err != nil {
@@ -324,22 +920,62 @@ func (s *Service) shutdown(ctx context.Context) error {
 		shutdownErr = errors.Join(shutdownErr, fmt.Errorf("zero session keys: %w", err))
 	}
 
-	monitorDone := make(chan struct{})
-	go func() {
-		s.monitor.Stop()
-		close(monitorDone)
-	}()
-	select {
-	case <-monitorDone:
-	case <-ctx.Done():
-		s.logger.Warn("heartbeat monitor stop timed out")
+	// Stop heartbeat monitor (nil in gateway mode)
+	if s.monitor != nil {
+		monitorDone := make(chan struct{})
+		go func() {
+			s.monitor.Stop()
+			close(monitorDone)
+		}()
+		select {
+		case <-monitorDone:
+		case <-ctx.Done():
+			s.logger.Warn("heartbeat monitor stop timed out")
+		}
 	}
 
-	if err := s.redis.Close(); err != nil {
-		s.logger.Warn("redis close error", "error", err)
+	// Stop release subsystem before closing the chain client, since the
+	// scheduler/reconciler goroutines may still be holding a chain call.
+	if s.releaseScheduler != nil {
+		schedDone := make(chan struct{})
+		go func() {
+			s.releaseScheduler.Stop()
+			close(schedDone)
+		}()
+		select {
+		case <-schedDone:
+		case <-ctx.Done():
+			s.logger.Warn("release scheduler stop timed out")
+		}
+	}
+	if s.releaseReconciler != nil {
+		recDone := make(chan struct{})
+		go func() {
+			s.releaseReconciler.StopPeriodic()
+			close(recDone)
+		}()
+		select {
+		case <-recDone:
+		case <-ctx.Done():
+			s.logger.Warn("release reconciler stop timed out")
+		}
+	}
+	if s.releaseStore != nil {
+		if err := s.releaseStore.Close(); err != nil {
+			s.logger.Warn("release store close error", "error", err)
+		}
+	}
+
+	if s.redis != nil {
+		if err := s.redis.Close(); err != nil {
+			s.logger.Warn("redis close error", "error", err)
+		}
 	}
 
 	s.chainClient.Close()
+	if s.coordinator != nil {
+		s.coordinator.Close()
+	}
 
 	select {
 	case <-ctx.Done():

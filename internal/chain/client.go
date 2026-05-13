@@ -5,6 +5,8 @@ import (
 	"crypto/ecdsa"
 	"fmt"
 	"math/big"
+	"sync"
+	"time"
 
 	"github.com/ethereum/go-ethereum/accounts/abi/bind"
 	"github.com/ethereum/go-ethereum/common"
@@ -15,11 +17,17 @@ import (
 	"github.com/lightchain/pkg/chain/bindings"
 )
 
+// defaultDisputeWindowCacheTTL is used when SetDisputeWindowCacheTTL has not
+// been called. Governance changes the dispute window rarely; 15m balances
+// staleness against contract round-trips.
+const defaultDisputeWindowCacheTTL = 15 * time.Minute
+
 // Compile-time interface assertions.
 var (
 	_ RegistrationClient = (*ChainClient)(nil)
 	_ ValidationClient   = (*ChainClient)(nil)
 	_ JobExecutionClient = (*ChainClient)(nil)
+	_ SettlementClient   = (*ChainClient)(nil)
 )
 
 // ChainClient implements RegistrationClient, ValidationClient, and JobExecutionClient
@@ -37,6 +45,26 @@ type ChainClient struct {
 	chainID         *big.Int
 	gasPriceMulBps  int
 	nonceMgr        *NonceManager
+	// coordinator is the shared per-signing-key subpool coordinator. It
+	// serializes broadcasts ACROSS tx classes (blob vs legacy) while
+	// allowing unbounded within-class parallelism. Shared with
+	// BlobTxSubmitter via injection at the service layer. Nil-safe via
+	// broadcastCoordinator() lazy init for tests that don't inject one.
+	coordinator     *SubpoolCoordinator
+	coordinatorOnce sync.Once
+	// stuckTracker is the shared per-sender stuck-nonce tracker. Also
+	// shared with BlobTxSubmitter. Nil-safe via stuckNonceTracker()
+	// lazy init for tests that don't inject one.
+	stuckTracker     *StuckNonceTracker
+	stuckTrackerOnce sync.Once
+	// disputeWindowCache memoizes AIConfig.getDisputeWindow() to avoid an
+	// eth_call on every release-cycle eligibility check. TTL is bounded so
+	// governance changes propagate without a worker restart. Guarded by
+	// disputeWindowMu.
+	disputeWindowMu       sync.Mutex
+	disputeWindowValue    time.Duration
+	disputeWindowExpires  time.Time
+	disputeWindowCacheTTL time.Duration // zero means defaultDisputeWindowCacheTTL
 }
 
 type jobTxBackend interface {
@@ -46,6 +74,7 @@ type jobTxBackend interface {
 
 // NewChainClient dials the RPC endpoint, instantiates the contract bindings, and
 // returns a ChainClient ready to submit registration and job transactions.
+// coordinator and stuckTracker must be the shared per-signing-key instances.
 func NewChainClient(
 	rpcURL string,
 	chainID int64,
@@ -54,6 +83,8 @@ func NewChainClient(
 	jobRegistryAddr common.Address,
 	signingKey *ecdsa.PrivateKey,
 	gasMulBps int,
+	coordinator *SubpoolCoordinator,
+	stuckTracker *StuckNonceTracker,
 ) (*ChainClient, error) {
 	if signingKey == nil {
 		return nil, fmt.Errorf("signingKey must not be nil")
@@ -106,7 +137,34 @@ func NewChainClient(
 		chainID:         big.NewInt(chainID),
 		gasPriceMulBps:  gasMulBps,
 		nonceMgr:        nonceMgr,
+		coordinator:     coordinator,
+		stuckTracker:    stuckTracker,
 	}, nil
+}
+
+// broadcastCoordinator returns the shared coordinator, lazy-initializing a
+// private one if none was injected (useful for tests that construct
+// ChainClient via struct literal and don't need cross-submitter sharing).
+func (c *ChainClient) broadcastCoordinator() *SubpoolCoordinator {
+	c.coordinatorOnce.Do(func() {
+		if c.coordinator == nil {
+			c.coordinator = NewSubpoolCoordinator(nil, 0)
+		}
+	})
+	return c.coordinator
+}
+
+// stuckNonceTracker returns the shared tracker, lazy-initializing a private
+// one if none was injected. Shared with BlobTxSubmitter in production so
+// hits from the non-blob path accumulate into the blob path's replacement
+// decision.
+func (c *ChainClient) stuckNonceTracker() *StuckNonceTracker {
+	c.stuckTrackerOnce.Do(func() {
+		if c.stuckTracker == nil {
+			c.stuckTracker = NewStuckNonceTracker()
+		}
+	})
+	return c.stuckTracker
 }
 
 // Close shuts down the underlying ethclient connection.
@@ -173,6 +231,30 @@ func checkReceipt(receipt *types.Receipt, txName string) error {
 	return nil
 }
 
+// classifyReceiptRevert wraps a checkReceipt error with ErrContractPaused
+// when the original transaction reverted because the callee contract is
+// paused. Replays the tx via eth_call against the receipt's block to
+// extract revert data; classification is best-effort and degrades to
+// the generic revert error on any decode failure (so a transient RPC
+// problem never escalates a generic revert into "paused").
+//
+// The wrapped error preserves the status-0 context the operator sees
+// in logs while letting the scheduler use errors.Is(err,
+// chain.ErrContractPaused) to apply cycle-level backoff.
+func (c *ChainClient) classifyReceiptRevert(
+	ctx context.Context,
+	txName string,
+	tx *types.Transaction,
+	receipt *types.Receipt,
+	revertErr error,
+) error {
+	if !decodePauseRevert(ctx, c.ethClient, c.workerAddr, tx, receipt.BlockNumber) {
+		return revertErr
+	}
+	return fmt.Errorf("%s transaction reverted (status 0, tx %s): %w",
+		txName, receipt.TxHash.Hex(), ErrContractPaused)
+}
+
 // adjustGasPrice applies the configured gas price multiplier: basePrice * gasPriceMulBps / 10000.
 func (c *ChainClient) adjustGasPrice(basePrice *big.Int) *big.Int {
 	adjusted := new(big.Int).Mul(basePrice, big.NewInt(int64(c.gasPriceMulBps)))
@@ -197,6 +279,18 @@ func (c *ChainClient) submitPreparedTx(
 		return fmt.Errorf("suggest gas price: %w", err)
 	}
 
+	// Enter the coordinator's legacy lane before reserving a nonce. This
+	// blocks only if the BLOB lane has pending txs (cross-subpool exclusion
+	// required by geth's sender reservation). Same-class callers run in
+	// parallel — geth's legacypool orders them by nonce.
+	coordinator := c.broadcastCoordinator()
+	token, err := coordinator.Enter(ctx, ClassLegacy)
+	if err != nil {
+		return fmt.Errorf("wait for %s broadcast slot: %w", txName, err)
+	}
+	// Token.Done is idempotent, so deferring on every exit path is safe.
+	defer token.Done()
+
 	auth, err := bind.NewKeyedTransactorWithChainID(c.signingKey, c.chainID)
 	if err != nil {
 		return fmt.Errorf("create transactor: %w", err)
@@ -219,20 +313,60 @@ func (c *ChainClient) submitPreparedTx(
 		return fmt.Errorf("%s transaction: %w", txName, err)
 	}
 
+	if err := ctx.Err(); err != nil {
+		c.nonceMgr.ResetNonce()
+		return fmt.Errorf("broadcast %s tx: %w", txName, err)
+	}
+
 	if err := backend.SendTransaction(ctx, tx); err != nil {
 		if ShouldResetNonceOnSendError(err) {
 			c.nonceMgr.ResetNonce()
 		}
+		// Stuck-nonce detection (Hazard B): record "address already
+		// reserved" hits at this nonce into the shared tracker. The
+		// blob-tx path watches this counter and triggers replacement
+		// when it crosses the threshold. Non-blob txs cannot themselves
+		// evict a stuck blob from the pool (go-ethereum blob pool only
+		// accepts blob replacements), so we defer the actual fix to
+		// the next blob broadcast's decision.
+		//
+		// Under the SubpoolCoordinator, IsAlreadyReservedError in
+		// normal flow is an anomaly — the coordinator should have
+		// prevented cross-subpool contention. A hit here suggests an
+		// orphaned blob token in the coordinator (previous pipeline
+		// crashed between Send and release). The tracker's per-nonce
+		// counter makes this detectable.
+		if IsAlreadyReservedError(err) {
+			c.stuckNonceTracker().Record(tx.Nonce())
+		}
 		return fmt.Errorf("send %s tx: %w", txName, err)
 	}
 
+	// Broadcast succeeded — record the hash on the token so janitor
+	// eviction logs can identify stuck entries by tx hash.
+	token.Registered(tx.Hash())
+
 	receipt, err := bind.WaitMined(ctx, c.ethClient, tx)
 	if err != nil {
+		// Symmetric with BlobTxSubmitter.SubmitBlobTx: SendTransaction
+		// already succeeded, so the tx is on the wire and the local nonce
+		// has advanced past it. A WaitMined failure (ctx deadline, dead
+		// EL) without a reset here leaves the counter drifting from chain
+		// pending, which is the same cascading-gap failure mode seen on
+		// testnet. Reset forces the next NextNonce() to refetch pending
+		// from chain. Unlike the blob path, no logger is threaded through
+		// ChainClient — the chain-refetch on subsequent NextNonce is
+		// currently silent, tracked as a separate observability follow-up.
+		c.nonceMgr.ResetNonce()
 		return fmt.Errorf("wait for %s tx %s: %w", txName, tx.Hash().Hex(), err)
 	}
 	if err := checkReceipt(receipt, txName); err != nil {
-		return err
+		return c.classifyReceiptRevert(ctx, txName, tx, receipt, err)
 	}
+
+	// A mined receipt means this tx is no longer in the pool. Clear the
+	// stuck tracker — future rejections at a new nonce start fresh.
+	c.stuckNonceTracker().Clear()
 
 	return nil
 }
@@ -256,18 +390,21 @@ func (c *ChainClient) AcknowledgeJob(ctx context.Context, jobID uint64) error {
 	})
 }
 
-// CompleteJob submits a completeJob transaction with the response blob hashes.
+// CompleteJob submits a completeJob transaction with a single bytes32 response
+// blob hash. Post-audit the contract takes one bytes32 and enforces
+// `blobhash(0) == responseBlobHash`, so the blob-carrying TX must contain
+// exactly one blob matching this hash.
 func (c *ChainClient) CompleteJob(
 	ctx context.Context,
 	jobID uint64,
-	responseBlobHashes [][32]byte,
+	responseBlobHash [32]byte,
 	responseCiphertextHash [32]byte,
 ) error {
 	if err := c.requireJobRegistry(); err != nil {
 		return err
 	}
 	return c.submitPreparedTx(ctx, "CompleteJob", nil, func(opts *bind.TransactOpts) (*types.Transaction, error) {
-		return c.jobRegistry.CompleteJob(opts, new(big.Int).SetUint64(jobID), responseBlobHashes, responseCiphertextHash)
+		return c.jobRegistry.CompleteJob(opts, new(big.Int).SetUint64(jobID), responseBlobHash, responseCiphertextHash)
 	})
 }
 
@@ -321,60 +458,51 @@ func (c *ChainClient) HasJobCompleted(ctx context.Context, jobID uint64) (bool, 
 	return false, nil
 }
 
-// GetSessionEncWorkerKey retrieves the encrypted worker key for a session by filtering
-// historical SessionCreated event logs. This is necessary because the JobRegistry ABI
-// has no view functions for session data (see Concern C-1).
+// sessionStatusActive matches the Solidity enum JobRegistry.SessionStatus.Active (index 0).
+// Source: contracts/src/interfaces/IJobRegistry.sol — enum SessionStatus { Active, ... }
+const sessionStatusActive uint8 = 0
+
+// GetSessionEncWorkerKey retrieves the current encrypted worker key for a session
+// from JobRegistry session storage. Sessions that are not currently Active are
+// blocked until on-chain failover has completed.
 func (c *ChainClient) GetSessionEncWorkerKey(ctx context.Context, sessionID uint64) ([]byte, error) {
 	if err := c.requireJobRegistry(); err != nil {
 		return nil, err
 	}
-	sessionIDBig := new(big.Int).SetUint64(sessionID)
-	filterOpts := &bind.FilterOpts{Context: ctx}
-
-	iter, err := c.jobRegistry.FilterSessionCreated(filterOpts, []*big.Int{sessionIDBig}, nil, nil)
+	sess, err := c.jobRegistry.GetSession(&bind.CallOpts{Context: ctx}, new(big.Int).SetUint64(sessionID))
 	if err != nil {
-		return nil, fmt.Errorf("filter SessionCreated for session %d: %w", sessionID, err)
+		return nil, fmt.Errorf("GetSession %d: %w", sessionID, err)
 	}
-	defer iter.Close()
-
-	if !iter.Next() {
-		if iter.Error() != nil {
-			return nil, fmt.Errorf("iterate SessionCreated events: %w", iter.Error())
-		}
-		return nil, fmt.Errorf("no SessionCreated event found for session %d", sessionID)
+	if sess.Status != sessionStatusActive {
+		return nil, fmt.Errorf("session %d not active: status=%d", sessionID, sess.Status)
 	}
-
-	encWorkerKey := iter.Event.EncWorkerKey
+	encWorkerKey := sess.EncWorkerKey
 	if len(encWorkerKey) == 0 {
-		return nil, fmt.Errorf("SessionCreated event for session %d has empty encWorkerKey", sessionID)
+		return nil, fmt.Errorf("session %d has empty encWorkerKey", sessionID)
 	}
 
 	return encWorkerKey, nil
 }
 
-// GetJobBlobHashes reads a job from the contract and returns its prompt blob hashes,
-// response blob hashes, submitBlockNumber, and completionBlockNumber.
-func (c *ChainClient) GetJobBlobHashes(ctx context.Context, jobID uint64) ([]common.Hash, []common.Hash, uint64, uint64, error) {
+// GetJobBlobInfo reads a job from the contract and returns its prompt blob
+// hash, response blob hash, submitBlockNumber, and completionBlockNumber.
+// Post-audit each job carries a single prompt blob and a single
+// response blob.
+func (c *ChainClient) GetJobBlobInfo(ctx context.Context, jobID uint64) (common.Hash, common.Hash, uint64, uint64, error) {
 	if err := c.requireJobRegistry(); err != nil {
-		return nil, nil, 0, 0, err
+		return common.Hash{}, common.Hash{}, 0, 0, err
 	}
 
 	job, err := c.jobRegistry.GetJob(&bind.CallOpts{Context: ctx}, new(big.Int).SetUint64(jobID))
 	if err != nil {
-		return nil, nil, 0, 0, fmt.Errorf("GetJob %d: %w", jobID, err)
+		return common.Hash{}, common.Hash{}, 0, 0, fmt.Errorf("GetJob %d: %w", jobID, err)
 	}
 
-	promptHashes := make([]common.Hash, len(job.PromptBlobHashes))
-	for i, h := range job.PromptBlobHashes {
-		promptHashes[i] = common.Hash(h)
-	}
-
-	responseHashes := make([]common.Hash, len(job.ResponseBlobHashes))
-	for i, h := range job.ResponseBlobHashes {
-		responseHashes[i] = common.Hash(h)
-	}
-
-	return promptHashes, responseHashes, job.SubmitBlockNumber.Uint64(), job.CompletionBlockNumber.Uint64(), nil
+	return common.Hash(job.PromptBlobHash),
+		common.Hash(job.ResponseBlobHash),
+		job.SubmitBlockNumber.Uint64(),
+		job.CompletionBlockNumber.Uint64(),
+		nil
 }
 
 // EthClient returns the underlying ethclient for use by blob layer components.
@@ -390,4 +518,190 @@ func (c *ChainClient) NonceManager() *NonceManager {
 // WorkerAddr returns the worker's Ethereum address.
 func (c *ChainClient) WorkerAddr() common.Address {
 	return c.workerAddr
+}
+
+// SetDisputeWindowCacheTTL configures how long GetDisputeWindow memoizes the
+// on-chain value. Pass <= 0 to fall back to defaultDisputeWindowCacheTTL.
+// Service wiring sets this from cfg.ReleaseDisputeWindowCacheTTL.
+func (c *ChainClient) SetDisputeWindowCacheTTL(ttl time.Duration) {
+	c.disputeWindowMu.Lock()
+	defer c.disputeWindowMu.Unlock()
+	c.disputeWindowCacheTTL = ttl
+	// Invalidate the cached value so the next call reflects the new TTL
+	// regime (and fetches fresh data).
+	c.disputeWindowExpires = time.Time{}
+}
+
+// ReleaseJob settles a single job's escrowed fee. The contract reverts if the
+// job is not Completed-past-window or Resolved; callers should pre-filter via
+// GetJobState to avoid wasted gas.
+func (c *ChainClient) ReleaseJob(ctx context.Context, jobID uint64) error {
+	if err := c.requireJobRegistry(); err != nil {
+		return err
+	}
+	return c.submitPreparedTx(ctx, "ReleaseJob", nil, func(opts *bind.TransactOpts) (*types.Transaction, error) {
+		return c.jobRegistry.ReleaseJob(opts, new(big.Int).SetUint64(jobID))
+	})
+}
+
+// ReleaseJobs is the batch variant. The contract reverts the entire batch if
+// any single job is not in a releasable state, so callers must pre-filter.
+func (c *ChainClient) ReleaseJobs(ctx context.Context, jobIDs []uint64) error {
+	if err := c.requireJobRegistry(); err != nil {
+		return err
+	}
+	if len(jobIDs) == 0 {
+		return fmt.Errorf("ReleaseJobs: empty jobIDs slice")
+	}
+	idsBig := make([]*big.Int, len(jobIDs))
+	for i, id := range jobIDs {
+		idsBig[i] = new(big.Int).SetUint64(id)
+	}
+	return c.submitPreparedTx(ctx, "ReleaseJobs", nil, func(opts *bind.TransactOpts) (*types.Transaction, error) {
+		return c.jobRegistry.ReleaseJobs(opts, idsBig)
+	})
+}
+
+// GetJobState reads the on-chain Job struct and returns the subset of fields
+// needed by the release scheduler.
+func (c *ChainClient) GetJobState(ctx context.Context, jobID uint64) (JobStateInfo, error) {
+	if err := c.requireJobRegistry(); err != nil {
+		return JobStateInfo{}, err
+	}
+	job, err := c.jobRegistry.GetJob(&bind.CallOpts{Context: ctx}, new(big.Int).SetUint64(jobID))
+	if err != nil {
+		return JobStateInfo{}, fmt.Errorf("GetJob %d: %w", jobID, err)
+	}
+	completedAt := int64(0)
+	if job.CompletedAt != nil {
+		completedAt = job.CompletedAt.Int64()
+	}
+	fee := job.EscrowedFee
+	if fee == nil {
+		fee = new(big.Int)
+	}
+	return JobStateInfo{
+		State:       JobState(job.State),
+		Worker:      job.Worker,
+		CompletedAt: completedAt,
+		EscrowedFee: fee,
+	}, nil
+}
+
+// GetDisputeWindow reads AIConfig.getDisputeWindow() with TTL'd caching. The
+// returned duration is the contract's window in seconds (converted to
+// time.Duration).
+func (c *ChainClient) GetDisputeWindow(ctx context.Context) (time.Duration, error) {
+	c.disputeWindowMu.Lock()
+	if !c.disputeWindowExpires.IsZero() && time.Now().Before(c.disputeWindowExpires) {
+		v := c.disputeWindowValue
+		c.disputeWindowMu.Unlock()
+		return v, nil
+	}
+	c.disputeWindowMu.Unlock()
+
+	raw, err := c.aiConfig.GetDisputeWindow(&bind.CallOpts{Context: ctx})
+	if err != nil {
+		return 0, fmt.Errorf("AIConfig.getDisputeWindow: %w", err)
+	}
+	if raw == nil || raw.Sign() <= 0 {
+		return 0, fmt.Errorf("AIConfig.getDisputeWindow returned non-positive value: %v", raw)
+	}
+	window := time.Duration(raw.Int64()) * time.Second
+
+	c.disputeWindowMu.Lock()
+	defer c.disputeWindowMu.Unlock()
+	ttl := c.disputeWindowCacheTTL
+	if ttl <= 0 {
+		ttl = defaultDisputeWindowCacheTTL
+	}
+	c.disputeWindowValue = window
+	c.disputeWindowExpires = time.Now().Add(ttl)
+	return window, nil
+}
+
+// WorkerBalance returns the withdrawable balance accumulated for `worker`.
+func (c *ChainClient) WorkerBalance(ctx context.Context, worker common.Address) (*big.Int, error) {
+	if err := c.requireJobRegistry(); err != nil {
+		return nil, err
+	}
+	bal, err := c.jobRegistry.WorkerBalance(&bind.CallOpts{Context: ctx}, worker)
+	if err != nil {
+		return nil, fmt.Errorf("WorkerBalance %s: %w", worker.Hex(), err)
+	}
+	if bal == nil {
+		return new(big.Int), nil
+	}
+	return bal, nil
+}
+
+// Withdraw moves the calling address's full workerBalance to itself. The
+// contract sends ETH to msg.sender; there is no destination parameter.
+func (c *ChainClient) Withdraw(ctx context.Context) error {
+	if err := c.requireJobRegistry(); err != nil {
+		return err
+	}
+	return c.submitPreparedTx(ctx, "Withdraw", nil, func(opts *bind.TransactOpts) (*types.Transaction, error) {
+		return c.jobRegistry.Withdraw(opts)
+	})
+}
+
+// Head returns the latest block number and timestamp. Used to make settlement
+// decisions against block.timestamp instead of wall-clock time.
+func (c *ChainClient) Head(ctx context.Context) (HeadInfo, error) {
+	header, err := c.ethClient.HeaderByNumber(ctx, nil)
+	if err != nil {
+		return HeadInfo{}, fmt.Errorf("HeaderByNumber(latest): %w", err)
+	}
+	if header.Number == nil {
+		return HeadInfo{}, fmt.Errorf("HeaderByNumber returned nil block number")
+	}
+	return HeadInfo{
+		Number:    header.Number.Uint64(),
+		Timestamp: int64(header.Time),
+	}, nil
+}
+
+// FilterJobCompleted iterates JobCompleted events emitted by `worker` in
+// [fromBlock, toBlock] (both inclusive). The worker filter uses the indexed
+// event topic so filtering happens on the node side.
+func (c *ChainClient) FilterJobCompleted(
+	ctx context.Context,
+	worker common.Address,
+	fromBlock, toBlock uint64,
+) ([]JobCompletedEvent, error) {
+	if err := c.requireJobRegistry(); err != nil {
+		return nil, err
+	}
+	if toBlock < fromBlock {
+		return nil, fmt.Errorf("FilterJobCompleted: toBlock %d < fromBlock %d", toBlock, fromBlock)
+	}
+	endBlock := toBlock
+	opts := &bind.FilterOpts{
+		Context: ctx,
+		Start:   fromBlock,
+		End:     &endBlock,
+	}
+	iter, err := c.jobRegistry.FilterJobCompleted(opts, nil, []common.Address{worker})
+	if err != nil {
+		return nil, fmt.Errorf("filter JobCompleted [%d..%d] for %s: %w", fromBlock, toBlock, worker.Hex(), err)
+	}
+	defer iter.Close()
+
+	var events []JobCompletedEvent
+	for iter.Next() {
+		ev := iter.Event
+		if ev == nil || ev.JobId == nil {
+			continue
+		}
+		events = append(events, JobCompletedEvent{
+			JobID:       ev.JobId.Uint64(),
+			Worker:      ev.Worker,
+			BlockNumber: ev.Raw.BlockNumber,
+		})
+	}
+	if err := iter.Error(); err != nil {
+		return nil, fmt.Errorf("iterate JobCompleted [%d..%d]: %w", fromBlock, toBlock, err)
+	}
+	return events, nil
 }

@@ -34,7 +34,7 @@ func newTestMonitor(t *testing.T, mr *miniredis.Miniredis, ollamaURL string) (*M
 
 	logger := slog.New(slog.NewTextHandler(io.Discard, &slog.HandlerOptions{Level: slog.LevelError}))
 	counter := &atomic.Int32{}
-	m := NewMonitor(redisClient, cfg, testWorkerAddr, []string{"0xmodel1"}, counter, 0, logger)
+	m := NewMonitor(redisClient, cfg, testWorkerAddr, []string{"0xmodel1"}, counter, 0, logger, nil)
 	return m, redisClient
 }
 
@@ -259,7 +259,7 @@ func TestMonitor_emit_DynamicJobCounts(t *testing.T) {
 		OllamaURL: ollamaSrv.URL,
 	}
 	logger := slog.New(slog.NewTextHandler(io.Discard, &slog.HandlerOptions{Level: slog.LevelError}))
-	m := NewMonitor(redisClient, cfg, testWorkerAddr, []string{"0xmodel1"}, counter, 5, logger)
+	m := NewMonitor(redisClient, cfg, testWorkerAddr, []string{"0xmodel1"}, counter, 5, logger, nil)
 
 	ctx := t.Context()
 	require.NoError(t, m.emit(ctx))

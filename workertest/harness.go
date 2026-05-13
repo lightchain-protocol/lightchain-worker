@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"github.com/ethereum/go-ethereum/accounts"
+	"github.com/ethereum/go-ethereum/accounts/abi"
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/crypto"
 	"github.com/hibiken/asynq"
@@ -27,6 +28,7 @@ import (
 	pkgtypes "github.com/lightchain/pkg/types"
 	workerchain "github.com/lightchain/worker/internal/chain"
 	"github.com/lightchain/worker/internal/keystore"
+	"github.com/lightchain/worker/internal/metrics"
 	"github.com/lightchain/worker/internal/ollama"
 	"github.com/lightchain/worker/internal/pipeline"
 )
@@ -34,11 +36,11 @@ import (
 // ChainClient is the worker pipeline's chain-facing dependency surface.
 type ChainClient interface {
 	AcknowledgeJob(ctx context.Context, jobID uint64) error
-	CompleteJob(ctx context.Context, jobID uint64, responseBlobHashes [][32]byte, responseCiphertextHash [32]byte) error
+	CompleteJob(ctx context.Context, jobID uint64, responseBlobHash [32]byte, responseCiphertextHash [32]byte) error
 	HasJobAcknowledged(ctx context.Context, jobID uint64) (bool, error)
 	HasJobCompleted(ctx context.Context, jobID uint64) (bool, error)
 	GetSessionEncWorkerKey(ctx context.Context, sessionID uint64) ([]byte, error)
-	GetJobBlobHashes(ctx context.Context, jobID uint64) (promptHashes []common.Hash, responseHashes []common.Hash, submitBlock uint64, completionBlock uint64, err error)
+	GetJobBlobInfo(ctx context.Context, jobID uint64) (promptHash common.Hash, responseHash common.Hash, submitBlock uint64, completionBlock uint64, err error)
 }
 
 // BlobFetcher is the worker pipeline's blob-fetch dependency surface.
@@ -76,6 +78,11 @@ type Options struct {
 	SessionStorePath       string
 	SessionStorePassphrase string
 	Logger                 *slog.Logger
+	// ChainID and JobRegistryAddr are required for the worker's
+	// disputeResponseMismatch-compatible response signing. Tests that do not
+	// exercise the Redis publish path may leave them zero.
+	ChainID         *big.Int
+	JobRegistryAddr common.Address
 }
 
 // RealChainClientOptions configures a real worker chain client for E2E tests.
@@ -99,6 +106,7 @@ type Harness struct {
 	sessionStorePath string
 	asynqServer      *asynq.Server
 	asynqMux         *asynq.ServeMux
+	asynqInspector   *asynq.Inspector
 	sessionStore     *keystore.SessionKeyStore
 	readyCh          chan struct{}
 	readyOnce        sync.Once
@@ -162,6 +170,10 @@ func New(t testing.TB, opts Options) *Harness {
 	queueName := workerQueueName(workerAddr)
 
 	jobCounter := &atomic.Int32{}
+	// Real CheckpointStore backed by the same Redis the test provides —
+	// using miniredis in handler tests gives us actual SET NX semantics
+	// instead of a mock.
+	checkpoints := pipeline.NewCheckpointStore(opts.RedisClient, 2*time.Hour, 10*time.Minute, 256*1024)
 	handler := pipeline.NewJobHandler(
 		opts.ChainClient,
 		opts.BlobFetcher,
@@ -174,12 +186,23 @@ func New(t testing.TB, opts Options) *Harness {
 		jobCounter,
 		opts.Logger,
 		pipeline.HandlerConfig{
-			AckTxTimeout:  opts.AckTxTimeout,
-			ModelIDToName: opts.ModelIDToName,
+			AckTxTimeout:        opts.AckTxTimeout,
+			RedisPublishTimeout: 5 * time.Second,
+			ModelIDToName:       opts.ModelIDToName,
+			ChainID:             opts.ChainID,
+			JobRegistryAddr:     opts.JobRegistryAddr,
 		},
+		nil, // publisher — fallback wires RedisResponsePublisher from RedisClient
+		checkpoints,
+		// Each harness instance gets its own metrics registry — keeps
+		// integration tests isolated from each other and from any global
+		// state. Allowlist drawn from the test's configured ModelIDToName
+		// values so NormalizeModel returns the actual tag, not "unknown".
+		metrics.New(modelTagsFromMap(opts.ModelIDToName)),
+		metrics.DeliveryAsynq,
 	)
 
-	asynqServer := asynq.NewServer(asynq.RedisClientOpt{
+	redisConnOpt := asynq.RedisClientOpt{
 		Network:      redisOpts.Network,
 		Addr:         redisOpts.Addr,
 		Username:     redisOpts.Username,
@@ -190,10 +213,12 @@ func New(t testing.TB, opts Options) *Harness {
 		WriteTimeout: redisOpts.WriteTimeout,
 		PoolSize:     redisOpts.PoolSize,
 		TLSConfig:    redisOpts.TLSConfig,
-	}, asynq.Config{
+	}
+	asynqServer := asynq.NewServer(redisConnOpt, asynq.Config{
 		Concurrency: opts.MaxConcurrentJobs,
 		Queues:      map[string]int{queueName: 1},
 	})
+	asynqInspector := asynq.NewInspector(redisConnOpt)
 
 	mux := asynq.NewServeMux()
 	mux.HandleFunc(pipeline.TaskTypeJobInference, handler.HandleTask)
@@ -204,6 +229,7 @@ func New(t testing.TB, opts Options) *Harness {
 		sessionStorePath: opts.SessionStorePath,
 		asynqServer:      asynqServer,
 		asynqMux:         mux,
+		asynqInspector:   asynqInspector,
 		sessionStore:     sessionStore,
 		readyCh:          make(chan struct{}),
 	}
@@ -251,12 +277,34 @@ func (h *Harness) Close() error {
 			cancel()
 		}
 		h.asynqServer.Shutdown()
+		_ = h.asynqInspector.Close()
 		h.closeErr = h.sessionStore.ZeroAll()
 	})
 	return h.closeErr
 }
 
+// RunAllRetryTasks moves all tasks that are waiting to be retried into the
+// active queue immediately, bypassing the retry backoff delay. Useful in
+// tests where waiting for Asynq's default 15-44 second backoff is impractical.
+func (h *Harness) RunAllRetryTasks() (int, error) {
+	return h.asynqInspector.RunAllRetryTasks(h.queueName)
+}
+
 // WorkerAddress returns the worker's signing address.
+// modelTagsFromMap returns the unique set of Ollama tag values from a
+// modelID-to-tag mapping. Used to seed metrics.NormalizeModel's allowlist.
+func modelTagsFromMap(m map[string]string) []string {
+	seen := make(map[string]struct{}, len(m))
+	for _, tag := range m {
+		seen[tag] = struct{}{}
+	}
+	out := make([]string, 0, len(seen))
+	for tag := range seen {
+		out = append(out, tag)
+	}
+	return out
+}
+
 func (h *Harness) WorkerAddress() common.Address {
 	return h.workerAddress
 }
@@ -272,8 +320,13 @@ func (h *Harness) SessionStorePath() string {
 }
 
 // RecoverResponseSigner recovers the signer from a Redis response payload signature.
-func RecoverResponseSigner(resp ResponsePayload) (common.Address, error) {
-	digest := responseDigest(resp.Payload, uint64(resp.JobID))
+// The digest matches JobRegistry.disputeResponseMismatch verification so the returned
+// signature is directly usable as on-chain mismatch evidence.
+func RecoverResponseSigner(chainID *big.Int, jobRegistryAddr common.Address, resp ResponsePayload) (common.Address, error) {
+	digest, err := responseDigest(chainID, jobRegistryAddr, uint64(resp.JobID), uint64(resp.SessionID), resp.Payload)
+	if err != nil {
+		return common.Address{}, err
+	}
 	sig, err := hex.DecodeString(strings.TrimPrefix(resp.Signature, "0x"))
 	if err != nil {
 		return common.Address{}, fmt.Errorf("decode response signature: %w", err)
@@ -289,12 +342,48 @@ func workerQueueName(addr common.Address) string {
 	return fmt.Sprintf("worker:%s", strings.ToLower(addr.Hex()))
 }
 
-func responseDigest(ciphertext []byte, jobID uint64) []byte {
-	jobIDBytes := common.LeftPadBytes(new(big.Int).SetUint64(jobID).Bytes(), 32)
-	payload := make([]byte, 0, len(ciphertext)+len(jobIDBytes))
-	payload = append(payload, ciphertext...)
-	payload = append(payload, jobIDBytes...)
-	return crypto.Keccak256(payload)
+// responseDigestSigArgs mirrors pipeline.responseMismatchSigArgs in the
+// worker package — kept here so workertest does not depend on internal/pipeline
+// implementation details.
+var responseDigestSigArgs abi.Arguments
+
+func init() {
+	uint256Ty, err := abi.NewType("uint256", "", nil)
+	if err != nil {
+		panic(fmt.Sprintf("workertest: abi.NewType(uint256): %v", err))
+	}
+	addressTy, err := abi.NewType("address", "", nil)
+	if err != nil {
+		panic(fmt.Sprintf("workertest: abi.NewType(address): %v", err))
+	}
+	bytesTy, err := abi.NewType("bytes", "", nil)
+	if err != nil {
+		panic(fmt.Sprintf("workertest: abi.NewType(bytes): %v", err))
+	}
+	responseDigestSigArgs = abi.Arguments{
+		{Type: uint256Ty}, // block.chainid
+		{Type: addressTy}, // address(jobRegistry)
+		{Type: uint256Ty}, // jobId
+		{Type: uint256Ty}, // sessionId
+		{Type: bytesTy},   // ciphertext
+	}
+}
+
+func responseDigest(chainID *big.Int, jobRegistryAddr common.Address, jobID, sessionID uint64, ciphertext []byte) ([]byte, error) {
+	if chainID == nil {
+		return nil, fmt.Errorf("responseDigest: chainID is nil")
+	}
+	encoded, err := responseDigestSigArgs.Pack(
+		new(big.Int).Set(chainID),
+		jobRegistryAddr,
+		new(big.Int).SetUint64(jobID),
+		new(big.Int).SetUint64(sessionID),
+		ciphertext,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("pack mismatch payload: %w", err)
+	}
+	return crypto.Keccak256(encoded), nil
 }
 
 // NewRealChainClient creates the worker's real chain client behind the public
@@ -320,6 +409,8 @@ func NewRealChainClient(t testing.TB, opts RealChainClientOptions) ChainClient {
 		opts.JobRegistryAddress,
 		opts.SigningKey,
 		opts.GasPriceMultiplierBps,
+		workerchain.NewSubpoolCoordinator(nil, 0),
+		workerchain.NewStuckNonceTracker(),
 	)
 	if err != nil {
 		t.Fatalf("workertest: create real chain client: %v", err)

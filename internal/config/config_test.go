@@ -20,9 +20,10 @@ var allEnvKeys = []string{
 	"REDIS_URL", "REDIS_PASSWORD",
 	"HEARTBEAT_INTERVAL", "OLLAMA_URL", "OLLAMA_TIMEOUT",
 	"BEACON_API_URL", "SESSION_KEY_FILE",
-	"MAX_CONCURRENT_JOBS", "ACK_TX_TIMEOUT", "BLOB_FETCH_TIMEOUT",
-	"BLOB_FETCH_RETRIES", "RECEIPT_POLL_INTERVAL",
+	"MAX_CONCURRENT_JOBS", "ACK_TX_TIMEOUT", "BLOB_TX_TIMEOUT", "BLOB_FETCH_TIMEOUT",
+	"BLOB_FETCH_RETRIES", "RECEIPT_POLL_INTERVAL", "REDIS_PUBLISH_TIMEOUT",
 	"SHUTDOWN_TIMEOUT",
+	"LIGHTCHAIN_DRAIN_TTL", "LIGHTCHAIN_DRAIN_SLACK",
 	"LOG_LEVEL", "LOG_FORMAT",
 }
 
@@ -61,6 +62,7 @@ func TestLoad_ValidConfig(t *testing.T) {
 	assert.Equal(t, "http://localhost:3500", cfg.BeaconAPIURL)
 	assert.Equal(t, 2, cfg.MaxConcurrentJobs)
 	assert.Equal(t, 15*time.Second, cfg.AckTxTimeout)
+	assert.Equal(t, 90*time.Second, cfg.BlobTxTimeout)
 	assert.Equal(t, 10*time.Second, cfg.BlobFetchTimeout)
 	assert.Equal(t, 3, cfg.BlobFetchRetries)
 	assert.Equal(t, 120*time.Second, cfg.OllamaTimeout)
@@ -69,6 +71,116 @@ func TestLoad_ValidConfig(t *testing.T) {
 	assert.NotNil(t, cfg.MaxGasPrice)
 	// 100 gwei default
 	assert.Equal(t, "100000000000", cfg.MaxGasPrice.String())
+	// Stuck-nonce recovery defaults
+	assert.Equal(t, 5, cfg.StuckNonceThreshold)
+	assert.Equal(t, 3, cfg.StuckNonceMaxBumps)
+	assert.True(t, cfg.StuckNonceAutoReplace, "auto-replace must default to true")
+}
+
+func TestLoad_StuckNonceOverrides(t *testing.T) {
+	validEnv(t)
+	t.Setenv("WORKER_KEYSTORE_PATH", "/tmp/keystore.json")
+	t.Setenv("WORKER_KEYSTORE_PASSWORD", "secret")
+	t.Setenv("WORKER_STUCK_NONCE_THRESHOLD", "8")
+	t.Setenv("WORKER_STUCK_NONCE_MAX_BUMPS", "1")
+	t.Setenv("WORKER_STUCK_NONCE_AUTOREPLACE", "false")
+
+	cfg, err := Load()
+	require.NoError(t, err)
+	assert.Equal(t, 8, cfg.StuckNonceThreshold)
+	assert.Equal(t, 1, cfg.StuckNonceMaxBumps)
+	assert.False(t, cfg.StuckNonceAutoReplace)
+}
+
+func TestLoad_DrainTTLOverride_zeroIsUnset(t *testing.T) {
+	validEnv(t)
+	t.Setenv("WORKER_KEYSTORE_PATH", "/tmp/keystore.json")
+	t.Setenv("WORKER_KEYSTORE_PASSWORD", "secret")
+
+	cfg, err := Load()
+	require.NoError(t, err)
+	assert.Equal(t, time.Duration(0), cfg.DrainTTLOverride,
+		"unset LIGHTCHAIN_DRAIN_TTL should leave override at zero")
+}
+
+func TestLoad_DrainTTLOverride_acceptsPositiveDuration(t *testing.T) {
+	validEnv(t)
+	t.Setenv("WORKER_KEYSTORE_PATH", "/tmp/keystore.json")
+	t.Setenv("WORKER_KEYSTORE_PASSWORD", "secret")
+	t.Setenv("LIGHTCHAIN_DRAIN_TTL", "30m")
+
+	cfg, err := Load()
+	require.NoError(t, err)
+	assert.Equal(t, 30*time.Minute, cfg.DrainTTLOverride)
+}
+
+func TestLoad_DrainTTLOverride_rejectsNegativeDuration(t *testing.T) {
+	validEnv(t)
+	t.Setenv("WORKER_KEYSTORE_PATH", "/tmp/keystore.json")
+	t.Setenv("WORKER_KEYSTORE_PASSWORD", "secret")
+	t.Setenv("LIGHTCHAIN_DRAIN_TTL", "-1h")
+
+	_, err := Load()
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "LIGHTCHAIN_DRAIN_TTL")
+	assert.Contains(t, err.Error(), "must be >= 0")
+}
+
+func TestLoad_DrainSlack_defaultsTo2h(t *testing.T) {
+	validEnv(t)
+	t.Setenv("WORKER_KEYSTORE_PATH", "/tmp/keystore.json")
+	t.Setenv("WORKER_KEYSTORE_PASSWORD", "secret")
+
+	cfg, err := Load()
+	require.NoError(t, err)
+	assert.Equal(t, 2*time.Hour, cfg.DrainSlack,
+		"unset LIGHTCHAIN_DRAIN_SLACK should default to 2h")
+}
+
+func TestLoad_DrainSlack_acceptsShortDuration(t *testing.T) {
+	validEnv(t)
+	t.Setenv("WORKER_KEYSTORE_PATH", "/tmp/keystore.json")
+	t.Setenv("WORKER_KEYSTORE_PASSWORD", "secret")
+	t.Setenv("LIGHTCHAIN_DRAIN_SLACK", "10s")
+
+	cfg, err := Load()
+	require.NoError(t, err)
+	assert.Equal(t, 10*time.Second, cfg.DrainSlack)
+}
+
+func TestLoad_DrainSlack_acceptsZero(t *testing.T) {
+	validEnv(t)
+	t.Setenv("WORKER_KEYSTORE_PATH", "/tmp/keystore.json")
+	t.Setenv("WORKER_KEYSTORE_PASSWORD", "secret")
+	t.Setenv("LIGHTCHAIN_DRAIN_SLACK", "0s")
+
+	cfg, err := Load()
+	require.NoError(t, err)
+	assert.Equal(t, time.Duration(0), cfg.DrainSlack,
+		"zero is valid (drain TTL == dispute window with no slack)")
+}
+
+func TestLoad_DrainSlack_rejectsNegativeDuration(t *testing.T) {
+	validEnv(t)
+	t.Setenv("WORKER_KEYSTORE_PATH", "/tmp/keystore.json")
+	t.Setenv("WORKER_KEYSTORE_PASSWORD", "secret")
+	t.Setenv("LIGHTCHAIN_DRAIN_SLACK", "-5m")
+
+	_, err := Load()
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "LIGHTCHAIN_DRAIN_SLACK")
+	assert.Contains(t, err.Error(), "must be >= 0")
+}
+
+func TestLoad_StuckNonceInvalidBoolean(t *testing.T) {
+	validEnv(t)
+	t.Setenv("WORKER_KEYSTORE_PATH", "/tmp/keystore.json")
+	t.Setenv("WORKER_KEYSTORE_PASSWORD", "secret")
+	t.Setenv("WORKER_STUCK_NONCE_AUTOREPLACE", "maybe")
+
+	_, err := Load()
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "WORKER_STUCK_NONCE_AUTOREPLACE")
 }
 
 func TestLoad_MissingChainID(t *testing.T) {
@@ -342,6 +454,7 @@ func TestLoad_JobExecutionDefaults(t *testing.T) {
 	assert.Equal(t, 2, cfg.MaxConcurrentJobs)
 	assert.Equal(t, 3, cfg.BlobFetchRetries)
 	assert.Equal(t, 15*time.Second, cfg.AckTxTimeout)
+	assert.Equal(t, 90*time.Second, cfg.BlobTxTimeout)
 	assert.Equal(t, 10*time.Second, cfg.BlobFetchTimeout)
 	assert.Equal(t, 120*time.Second, cfg.OllamaTimeout)
 	assert.Equal(t, 2*time.Second, cfg.ReceiptPollInterval)
@@ -354,6 +467,7 @@ func TestLoad_JobExecutionOverrides(t *testing.T) {
 	t.Setenv("MAX_CONCURRENT_JOBS", "8")
 	t.Setenv("BLOB_FETCH_RETRIES", "5")
 	t.Setenv("ACK_TX_TIMEOUT", "30s")
+	t.Setenv("BLOB_TX_TIMEOUT", "180s")
 	t.Setenv("BLOB_FETCH_TIMEOUT", "20s")
 	t.Setenv("OLLAMA_TIMEOUT", "60s")
 	t.Setenv("BEACON_API_URL", "http://beacon:3500")
@@ -367,6 +481,7 @@ func TestLoad_JobExecutionOverrides(t *testing.T) {
 	assert.Equal(t, 8, cfg.MaxConcurrentJobs)
 	assert.Equal(t, 5, cfg.BlobFetchRetries)
 	assert.Equal(t, 30*time.Second, cfg.AckTxTimeout)
+	assert.Equal(t, 180*time.Second, cfg.BlobTxTimeout)
 	assert.Equal(t, 20*time.Second, cfg.BlobFetchTimeout)
 	assert.Equal(t, 60*time.Second, cfg.OllamaTimeout)
 	assert.Equal(t, "http://beacon:3500", cfg.BeaconAPIURL)

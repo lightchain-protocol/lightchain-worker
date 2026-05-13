@@ -16,6 +16,7 @@ import (
 
 	"github.com/lightchain/worker/internal/chain"
 	"github.com/lightchain/worker/internal/registration"
+	"github.com/lightchain/worker/internal/release"
 )
 
 // ECDHKeyLoader loads or generates an ECDH key pair from an encrypted keystore file.
@@ -34,6 +35,19 @@ type Handler struct {
 	LoadECDHKey ECDHKeyLoader
 	Out         io.Writer // captures stdout in tests
 	Logger      *slog.Logger
+
+	// Settlement is required only by the balance/withdraw/release
+	// subcommands. The same ChainClient that satisfies Client also
+	// satisfies SettlementClient, but the field is kept separate so test
+	// doubles can be smaller.
+	Settlement chain.SettlementClient
+	// ReleaseStore is required only by the `release` subcommand. Opened
+	// with the same StoreIdentity the sidecar uses; the underlying flock
+	// serializes against a concurrently-running sidecar.
+	ReleaseStore release.Store
+	// ReleaseConfig configures the on-demand release cycle and reconciler
+	// run invoked by `worker-cli release`.
+	ReleaseConfig release.Config
 }
 
 // Keygen loads or generates the ECDH encryption key and prints the public key hex.
