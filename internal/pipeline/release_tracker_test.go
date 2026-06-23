@@ -102,7 +102,7 @@ func runFullPipelineWithTracker(t *testing.T, tracker ReleaseTracker) (handlerEr
 			RedisPublishTimeout: 5 * time.Second,
 			ModelIDToName:       map[string]string{expectedModelID: "llama3-8b"},
 		},
-		nil, nil, testMetrics(t), metrics.DeliveryAsynq,
+		nil, nil, testMetrics(t), metrics.DeliveryAsynq, nil,
 	)
 	handler.SetReleaseTracker(tracker)
 

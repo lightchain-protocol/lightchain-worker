@@ -200,6 +200,7 @@ func New(t testing.TB, opts Options) *Harness {
 		// values so NormalizeModel returns the actual tag, not "unknown".
 		metrics.New(modelTagsFromMap(opts.ModelIDToName)),
 		metrics.DeliveryAsynq,
+		nil, // searcher — web search disabled in test harness
 	)
 
 	redisConnOpt := asynq.RedisClientOpt{

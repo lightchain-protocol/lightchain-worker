@@ -36,6 +36,7 @@ import (
 	"github.com/lightchain/worker/internal/pipeline"
 	"github.com/lightchain/worker/internal/registration"
 	"github.com/lightchain/worker/internal/release"
+	"github.com/lightchain/worker/internal/search"
 )
 
 // startupHeartbeatTimeout is the maximum time allowed for the initial heartbeat
@@ -406,6 +407,11 @@ func New(cfg *config.Config) (*Service, error) {
 	}
 
 	// Job pipeline handler
+	var searcher search.Searcher
+	if cfg.SearchEnabled {
+		searcher = search.NewTavilyClient(cfg.TavilyURL, cfg.TavilyAPIKey, cfg.SearchTimeout)
+	}
+
 	handler := pipeline.NewJobHandler(
 		chainClient,
 		blobFetcher,
@@ -424,11 +430,14 @@ func New(cfg *config.Config) (*Service, error) {
 			ModelIDToName:       modelIDToName,
 			ChainID:             big.NewInt(cfg.ChainID),
 			JobRegistryAddr:     cfg.JobRegistryAddress,
+			SearchMaxResults:    cfg.SearchMaxResults,
+			SearchTimeout:       cfg.SearchTimeout,
 		},
 		nil, // publisher — fallback wires RedisResponsePublisher from redisClient
 		checkpoints,
 		metricsCollector,
 		metrics.DeliveryAsynq,
+		searcher,
 	)
 	handler.SetReleaseTracker(releaseTracker)
 
@@ -465,16 +474,19 @@ func New(cfg *config.Config) (*Service, error) {
 			jobCounter,
 			logger,
 			pipeline.HandlerConfig{
-				AckTxTimeout:    cfg.AckTxTimeout,
-				BlobTxTimeout:   cfg.BlobTxTimeout,
-				ModelIDToName:   modelIDToName,
-				ChainID:         big.NewInt(cfg.ChainID),
-				JobRegistryAddr: cfg.JobRegistryAddress,
+				AckTxTimeout:     cfg.AckTxTimeout,
+				BlobTxTimeout:    cfg.BlobTxTimeout,
+				ModelIDToName:    modelIDToName,
+				ChainID:          big.NewInt(cfg.ChainID),
+				JobRegistryAddr:  cfg.JobRegistryAddress,
+				SearchMaxResults: cfg.SearchMaxResults,
+				SearchTimeout:    cfg.SearchTimeout,
 			},
 			gwPublisher,
 			checkpoints,
 			metricsCollector,
 			metrics.DeliveryGateway,
+			searcher,
 		)
 		gwHandler.SetReleaseTracker(releaseTracker)
 
@@ -661,6 +673,17 @@ func (p *gatewayResponsePublisher) PublishResponse(
 			p.metrics.RedisPublishFailures.Inc()
 		}
 	}
+}
+
+func (p *gatewayResponsePublisher) PublishMetadata(
+	_ context.Context,
+	jobID, _ uint64,
+	_ string,
+	_ []byte,
+) {
+	// v1 no-op: gateway mode routes metadata via the relay's Redis pub/sub path,
+	// not HTTP. Citations are best-effort; missing them does not break job delivery.
+	p.logger.Debug("gateway: metadata publish skipped (v1 no-op)", "jobID", jobID)
 }
 
 // Run starts the heartbeat goroutine and Asynq server (or gateway poll loop),

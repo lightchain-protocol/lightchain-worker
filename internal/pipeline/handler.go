@@ -27,6 +27,7 @@ import (
 
 	"github.com/lightchain/worker/internal/metrics"
 	"github.com/lightchain/worker/internal/ollama"
+	"github.com/lightchain/worker/internal/search"
 )
 
 // SessionKeyGetter retrieves and stores session keys.
@@ -78,6 +79,8 @@ type HandlerConfig struct {
 	ModelIDToName       map[string]string
 	ChainID             *big.Int
 	JobRegistryAddr     common.Address
+	SearchMaxResults    int
+	SearchTimeout       time.Duration
 }
 
 // ResponsePublisher publishes encrypted responses for real-time delivery.
@@ -85,6 +88,7 @@ type HandlerConfig struct {
 // gateway-based publisher (POST to worker-gateway).
 type ResponsePublisher interface {
 	PublishResponse(ctx context.Context, jobID, sessionID uint64, correlationID string, signature string, ciphertext []byte)
+	PublishMetadata(ctx context.Context, jobID, sessionID uint64, correlationID string, payload []byte)
 }
 
 // ReleaseTracker records that a job has just been completed and is now
@@ -103,6 +107,7 @@ type JobHandler struct {
 	blobSubmitter     BlobSubmitter
 	keyStore          SessionKeyGetter
 	ollamaClient      InferenceClient
+	searcher          search.Searcher // nil ⇒ web search disabled
 	redisClient       *redis.Client
 	responsePublisher ResponsePublisher
 	signingKey        *ecdsa.PrivateKey
@@ -164,6 +169,7 @@ func NewJobHandler(
 	checkpoints *CheckpointStore,
 	metricsCollector *metrics.Metrics,
 	delivery string,
+	searcher search.Searcher,
 ) *JobHandler {
 	modelIDToName := make(map[string]string, len(cfg.ModelIDToName))
 	for k, v := range cfg.ModelIDToName {
@@ -185,6 +191,7 @@ func NewJobHandler(
 		blobSubmitter:     blobSubmitter,
 		keyStore:          keyStore,
 		ollamaClient:      ollamaClient,
+		searcher:          searcher,
 		redisClient:       redisClient,
 		responsePublisher: publisher,
 		signingKey:        signingKey,
@@ -271,6 +278,42 @@ func (p *RedisResponsePublisher) PublishResponse(
 		if p.metrics != nil {
 			p.metrics.RedisPublishFailures.Inc()
 		}
+	}
+}
+
+// PublishMetadata fans out an encrypted metadata frame (e.g. web-search
+// sources). Non-fatal — citations are best-effort UX, not the authoritative
+// response. No signature: the relay only signature-checks complete frames.
+func (p *RedisResponsePublisher) PublishMetadata(
+	ctx context.Context,
+	jobID, sessionID uint64,
+	correlationID string,
+	payload []byte,
+) {
+	msg := pkgtypes.PubSubMessage{
+		Type:          pkgtypes.MessageTypeMetadata,
+		JobID:         pkgtypes.JobID(jobID),
+		SessionID:     pkgtypes.SessionID(sessionID),
+		Sequence:      0,
+		TotalChunks:   1,
+		Payload:       payload,
+		CorrelationID: correlationID,
+		Timestamp:     time.Now().Unix(),
+	}
+	data, err := json.Marshal(msg)
+	if err != nil {
+		p.logger.Warn("failed to marshal metadata frame", "jobID", jobID, "error", err)
+		return
+	}
+	pubCtx := ctx
+	if p.publishTimeout > 0 {
+		var cancel context.CancelFunc
+		pubCtx, cancel = context.WithTimeout(ctx, p.publishTimeout)
+		defer cancel()
+	}
+	channel := fmt.Sprintf("session:%d:responses", sessionID)
+	if err := p.client.Publish(pubCtx, channel, data).Err(); err != nil {
+		p.logger.Warn("failed to publish metadata frame", "jobID", jobID, "channel", channel, "error", err)
 	}
 }
 
@@ -680,6 +723,37 @@ func (h *JobHandler) runInferencePipeline(
 		"durationMs", d.Milliseconds(),
 	)
 
+	// Stage 4.5: optional web-search augmentation (one-shot Tavily). Fail-open:
+	// any search failure proceeds with the original prompt and emits no sources.
+	promptText := string(prompt)
+	if p.SearchEnabled && h.searcher != nil {
+		searchCtx := ctx
+		if h.cfg.SearchTimeout > 0 {
+			var cancel context.CancelFunc
+			searchCtx, cancel = context.WithTimeout(ctx, h.cfg.SearchTimeout)
+			defer cancel()
+		}
+		maxResults := h.cfg.SearchMaxResults
+		if maxResults <= 0 {
+			maxResults = 5
+		}
+		sources, sErr := h.searcher.Search(searchCtx, promptText, maxResults)
+		if sErr != nil {
+			logger.Warn("stage 4.5: web search failed, proceeding without context",
+				"stage", "search", "error", sErr)
+		} else if len(sources) > 0 {
+			promptText = buildSearchAugmentedPrompt(promptText, sources)
+			// Emit citations as an encrypted metadata frame (best-effort).
+			metaPayload, encErr := pkgcrypto.Encrypt(sessionKey, sourcesMetadataJSON(sources))
+			if encErr != nil {
+				logger.Warn("stage 4.5: encrypt sources failed", "stage", "search", "error", encErr)
+			} else if h.responsePublisher != nil {
+				h.responsePublisher.PublishMetadata(ctx, p.JobID, p.SessionID, p.CorrelationID, metaPayload)
+			}
+			logger.Info("stage 4.5 complete", "stage", "search", "sources", len(sources))
+		}
+	}
+
 	// Stage 5: AI inference (with conversation history if prior jobs exist)
 	modelName, err := h.resolveModelName(p.ModelID)
 	if err != nil {
@@ -708,14 +782,14 @@ func (h *JobHandler) runInferencePipeline(
 		"historyTurns", len(history),
 	)
 	if len(history) > 0 {
-		messages := append(history, ollama.ChatMessage{Role: "user", Content: string(prompt)})
+		messages := append(history, ollama.ChatMessage{Role: "user", Content: promptText})
 		response, err = h.ollamaClient.Chat(ctx, modelName, messages)
 		if err != nil {
 			rec.End(metrics.OutcomeError, metrics.CacheMiss)
 			return nil, fmt.Errorf("stage 5 (chat inference): %w", err)
 		}
 	} else {
-		response, err = h.ollamaClient.Generate(ctx, modelName, string(prompt))
+		response, err = h.ollamaClient.Generate(ctx, modelName, promptText)
 		if err != nil {
 			rec.End(metrics.OutcomeError, metrics.CacheMiss)
 			return nil, fmt.Errorf("stage 5 (inference): %w", err)
@@ -1125,6 +1199,45 @@ func (h *JobHandler) resolveModelName(modelID string) (string, error) {
 	}
 
 	return modelID, nil
+}
+
+// buildSearchAugmentedPrompt prepends a fixed-format context block built from
+// web-search results to the user's prompt. The format is intentionally stable:
+// dispute re-execution (v2) reproduces the prompt byte-for-byte from the
+// captured sources, so DO NOT change this template without versioning it.
+func buildSearchAugmentedPrompt(prompt string, sources []search.Source) string {
+	if len(sources) == 0 {
+		return prompt
+	}
+	var b strings.Builder
+	b.WriteString("Use the following web search results to help answer the question. ")
+	b.WriteString("Cite sources inline using their [number].\n\n")
+	for _, s := range sources {
+		fmt.Fprintf(&b, "[%d] %s\n%s\n%s\n\n", s.Position, s.Title, s.URL, s.Snippet)
+	}
+	b.WriteString("Question: ")
+	b.WriteString(prompt)
+	return b.String()
+}
+
+// sourcesMetadataJSON renders the citation payload in the exact shape the
+// frontend's parseWebSearchSources expects.
+func sourcesMetadataJSON(sources []search.Source) []byte {
+	type wire struct {
+		Position int    `json:"position"`
+		Title    string `json:"title"`
+		URL      string `json:"url"`
+		Snippet  string `json:"snippet"`
+	}
+	out := struct {
+		Type    string `json:"type"`
+		Sources []wire `json:"sources"`
+	}{Type: "webSearchSources"}
+	for _, s := range sources {
+		out.Sources = append(out.Sources, wire{s.Position, s.Title, s.URL, s.Snippet})
+	}
+	data, _ := json.Marshal(out)
+	return data
 }
 
 func normalizeModelLookupKey(modelID string) string {
