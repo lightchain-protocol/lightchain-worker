@@ -24,4 +24,5 @@ type JobPayload struct {
 	Timestamp      int64          `json:"timestamp"`
 	CorrelationID  string         `json:"correlationId"`
 	PriorJobIDs    []uint64       `json:"priorJobIds,omitempty"`
+	SearchEnabled  bool           `json:"searchEnabled,omitempty"`
 }
