@@ -96,6 +96,24 @@ func TestVerifyModels_AllPresent(t *testing.T) {
 	require.NoError(t, err)
 }
 
+func TestVerifyModels_LatestSuffix(t *testing.T) {
+	t.Parallel()
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		resp := TagsResponse{
+			Models: []ModelInfo{
+				{Name: "llama3-8b:latest"},
+			},
+		}
+		json.NewEncoder(w).Encode(resp)
+	}))
+	defer srv.Close()
+
+	client := NewOllamaClient(srv.URL, 5*time.Second)
+	err := client.VerifyModels(context.Background(), []string{"llama3-8b"})
+	require.NoError(t, err)
+}
+
 func TestVerifyModels_SomeMissing(t *testing.T) {
 	t.Parallel()
 

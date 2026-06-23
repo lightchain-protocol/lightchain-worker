@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strings"
 	"time"
 )
 
@@ -188,6 +189,10 @@ func (c *OllamaClient) VerifyModels(ctx context.Context, models []string) error 
 	loaded := make(map[string]bool, len(tagsResp.Models))
 	for _, m := range tagsResp.Models {
 		loaded[m.Name] = true
+		// Also register without the ":latest" tag so "llama3-8b" matches "llama3-8b:latest".
+		if base, ok := strings.CutSuffix(m.Name, ":latest"); ok {
+			loaded[base] = true
+		}
 	}
 
 	var missing []string
