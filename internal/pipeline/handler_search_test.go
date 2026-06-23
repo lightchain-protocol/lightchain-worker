@@ -1,7 +1,6 @@
 package pipeline
 
 import (
-	"context"
 	"encoding/json"
 	"strings"
 	"testing"
@@ -40,14 +39,4 @@ func TestSourcesMetadataPayload_ShapeMatchesFrontend(t *testing.T) {
 	assert.Equal(t, "webSearchSources", decoded.Type)
 	require.Len(t, decoded.Sources, 1)
 	assert.Equal(t, "https://a", decoded.Sources[0].URL)
-}
-
-// fakeSearcher is a test double for search.Searcher.
-type fakeSearcher struct {
-	results []search.Source
-	err     error
-}
-
-func (f *fakeSearcher) Search(_ context.Context, _ string, _ int) ([]search.Source, error) {
-	return f.results, f.err
 }
