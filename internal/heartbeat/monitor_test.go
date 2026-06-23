@@ -34,7 +34,7 @@ func newTestMonitor(t *testing.T, mr *miniredis.Miniredis, ollamaURL string) (*M
 
 	logger := slog.New(slog.NewTextHandler(io.Discard, &slog.HandlerOptions{Level: slog.LevelError}))
 	counter := &atomic.Int32{}
-	m := NewMonitor(redisClient, cfg, testWorkerAddr, []string{"0xmodel1"}, counter, 0, logger, nil)
+	m := NewMonitor(redisClient, cfg, testWorkerAddr, []string{"0xmodel1"}, nil, counter, 0, logger, nil)
 	return m, redisClient
 }
 
@@ -240,6 +240,24 @@ func TestEmitOnce_RedisUnreachable(t *testing.T) {
 	require.Error(t, err, "EmitOnce must return error when Redis is stopped")
 }
 
+func TestEmit_WritesCapabilities(t *testing.T) {
+	t.Parallel()
+	mr := miniredis.RunT(t)
+	rdb := redis.NewClient(&redis.Options{Addr: mr.Addr()})
+	t.Cleanup(func() { _ = rdb.Close() })
+
+	logger := slog.New(slog.NewTextHandler(io.Discard, &slog.HandlerOptions{Level: slog.LevelError}))
+	counter := &atomic.Int32{}
+	m := NewMonitor(rdb, MonitorConfig{Interval: time.Second}, testWorkerAddr,
+		[]string{"0xmodel"}, []string{"search"}, counter, 4, logger, nil)
+	require.NoError(t, m.EmitOnce(t.Context()))
+
+	key := pkgtypes.HeartbeatRedisKey(testWorkerAddr)
+	got, err := rdb.HGet(t.Context(), key, pkgtypes.HBFieldCapabilities).Result()
+	require.NoError(t, err)
+	assert.JSONEq(t, `["search"]`, got)
+}
+
 func TestMonitor_emit_DynamicJobCounts(t *testing.T) {
 	t.Parallel()
 	mr := miniredis.RunT(t)
@@ -259,7 +277,7 @@ func TestMonitor_emit_DynamicJobCounts(t *testing.T) {
 		OllamaURL: ollamaSrv.URL,
 	}
 	logger := slog.New(slog.NewTextHandler(io.Discard, &slog.HandlerOptions{Level: slog.LevelError}))
-	m := NewMonitor(redisClient, cfg, testWorkerAddr, []string{"0xmodel1"}, counter, 5, logger, nil)
+	m := NewMonitor(redisClient, cfg, testWorkerAddr, []string{"0xmodel1"}, nil, counter, 5, logger, nil)
 
 	ctx := t.Context()
 	require.NoError(t, m.emit(ctx))

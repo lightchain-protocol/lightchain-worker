@@ -541,8 +541,13 @@ func New(cfg *config.Config) (*Service, error) {
 		Interval:  cfg.HeartbeatInterval,
 		OllamaURL: cfg.OllamaURL,
 	}
+	capabilities := []string{}
+	if cfg.SearchEnabled && cfg.TavilyAPIKey != "" {
+		capabilities = append(capabilities, "search")
+	}
+
 	addrHex := checksumHexNoPrefix(workerAddr)
-	monitor := heartbeat.NewMonitor(redisClient, monitorCfg, addrHex, modelHexStrings, jobCounter, cfg.MaxConcurrentJobs, logger, metricsCollector)
+	monitor := heartbeat.NewMonitor(redisClient, monitorCfg, addrHex, modelHexStrings, capabilities, jobCounter, cfg.MaxConcurrentJobs, logger, metricsCollector)
 
 	// Gate startup on a real heartbeat write
 	startCtx, startCancel := context.WithTimeout(context.Background(), startupHeartbeatTimeout)

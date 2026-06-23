@@ -48,11 +48,12 @@ type MonitorConfig struct {
 
 // Monitor publishes periodic heartbeat payloads to Redis.
 type Monitor struct {
-	redisClient *redis.Client
-	cfg         MonitorConfig
-	workerAddr  string   // EIP-55 checksummed hex, no 0x prefix
-	modelIDs    []string // 0x-prefixed lowercase hex bytes32
-	startedAt   time.Time
+	redisClient  *redis.Client
+	cfg          MonitorConfig
+	workerAddr   string   // EIP-55 checksummed hex, no 0x prefix
+	modelIDs     []string // 0x-prefixed lowercase hex bytes32
+	capabilities []string // advertised capability tokens, e.g. ["search"]
+	startedAt    time.Time
 	httpClient  *http.Client
 	logger      *slog.Logger
 	jobCounter  *atomic.Int32
@@ -78,23 +79,25 @@ func NewMonitor(
 	cfg MonitorConfig,
 	workerAddr string,
 	modelIDs []string,
+	capabilities []string,
 	jobCounter *atomic.Int32,
 	maxJobs int,
 	logger *slog.Logger,
 	metricsCollector *metrics.Metrics,
 ) *Monitor {
 	return &Monitor{
-		redisClient: redisClient,
-		cfg:         cfg,
-		workerAddr:  workerAddr,
-		modelIDs:    modelIDs,
-		startedAt:   time.Now(),
-		httpClient:  &http.Client{Timeout: 2 * time.Second},
-		logger:      logger,
-		jobCounter:  jobCounter,
-		maxJobs:     maxJobs,
-		metrics:     metricsCollector,
-		done:        make(chan struct{}),
+		redisClient:  redisClient,
+		cfg:          cfg,
+		workerAddr:   workerAddr,
+		modelIDs:     modelIDs,
+		capabilities: capabilities,
+		startedAt:    time.Now(),
+		httpClient:   &http.Client{Timeout: 2 * time.Second},
+		logger:       logger,
+		jobCounter:   jobCounter,
+		maxJobs:      maxJobs,
+		metrics:      metricsCollector,
+		done:         make(chan struct{}),
 	}
 }
 
@@ -162,6 +165,15 @@ func (m *Monitor) emit(ctx context.Context) error {
 		return fmt.Errorf("marshal model IDs: %w", err)
 	}
 
+	caps := m.capabilities
+	if caps == nil {
+		caps = []string{}
+	}
+	capsJSON, err := json.Marshal(caps)
+	if err != nil {
+		return fmt.Errorf("marshal capabilities: %w", err)
+	}
+
 	ttl := 3 * m.cfg.Interval
 	key := pkgtypes.HeartbeatRedisKey(m.workerAddr)
 
@@ -176,6 +188,7 @@ func (m *Monitor) emit(ctx context.Context) error {
 		pkgtypes.HBFieldModels:        string(modelsJSON),
 		pkgtypes.HBFieldOllamaStatus:  ollamaStatus,
 		pkgtypes.HBFieldUptime:        int64(time.Since(m.startedAt).Seconds()),
+		pkgtypes.HBFieldCapabilities:  string(capsJSON),
 	})
 	pipe.PExpire(ctx, key, ttl)
 
