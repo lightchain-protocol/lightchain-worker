@@ -686,6 +686,18 @@ func (p *gatewayResponsePublisher) PublishMetadata(
 	p.logger.Debug("gateway: metadata publish skipped (v1 no-op)", "jobID", jobID)
 }
 
+func (p *gatewayResponsePublisher) PublishChunk(
+	_ context.Context,
+	jobID, _ uint64,
+	_ string,
+	seq uint32,
+	_ []byte,
+) {
+	// v1 no-op: gateway mode does not forward chunk frames over HTTP.
+	// Streaming is best-effort UX; missing chunks do not break job delivery.
+	p.logger.Debug("gateway: chunk publish skipped (v1 no-op)", "jobID", jobID, "seq", seq)
+}
+
 // Run starts the heartbeat goroutine and Asynq server (or gateway poll loop),
 // waits for SIGINT/SIGTERM, then gracefully shuts down.
 func (s *Service) Run(ctx context.Context) error {

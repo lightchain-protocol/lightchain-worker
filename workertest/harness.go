@@ -61,6 +61,8 @@ type ChatMessage = ollama.ChatMessage
 type InferenceClient interface {
 	Generate(ctx context.Context, model, prompt string) (string, error)
 	Chat(ctx context.Context, model string, messages []ChatMessage) (string, error)
+	GenerateStream(ctx context.Context, model, prompt string, onDelta func(string)) (string, error)
+	ChatStream(ctx context.Context, model string, messages []ChatMessage, onDelta func(string)) (string, error)
 }
 
 // Options configures the in-process worker harness.

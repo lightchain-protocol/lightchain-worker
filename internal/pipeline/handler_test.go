@@ -138,6 +138,22 @@ func (m *mockOllama) Chat(ctx context.Context, model string, messages []ollama.C
 	return m.generateFn(ctx, model, messages[len(messages)-1].Content)
 }
 
+func (m *mockOllama) GenerateStream(ctx context.Context, model, prompt string, onDelta func(string)) (string, error) {
+	resp, err := m.Generate(ctx, model, prompt)
+	if err == nil && resp != "" {
+		onDelta(resp)
+	}
+	return resp, err
+}
+
+func (m *mockOllama) ChatStream(ctx context.Context, model string, messages []ollama.ChatMessage, onDelta func(string)) (string, error) {
+	resp, err := m.Chat(ctx, model, messages)
+	if err == nil && resp != "" {
+		onDelta(resp)
+	}
+	return resp, err
+}
+
 // --- Helpers ---
 
 func testSigningKey(t *testing.T) *ecdsa.PrivateKey {

@@ -3,6 +3,7 @@ package ollama
 import (
 	"context"
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -73,6 +74,58 @@ func TestGenerate_ContextCancelled(t *testing.T) {
 
 	_, err := client.Generate(ctx, "llama3-8b", "hello")
 	require.Error(t, err)
+}
+
+func TestGenerateStream(t *testing.T) {
+	t.Parallel()
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		assert.Equal(t, http.MethodPost, r.Method)
+		assert.Equal(t, "/api/generate", r.URL.Path)
+
+		var req GenerateRequest
+		require.NoError(t, json.NewDecoder(r.Body).Decode(&req))
+		assert.True(t, req.Stream)
+
+		w.Header().Set("Content-Type", "application/x-ndjson")
+		io.WriteString(w, `{"response":"Hel","done":false}`+"\n")
+		io.WriteString(w, `{"response":"lo","done":false}`+"\n")
+		io.WriteString(w, `{"response":"","done":true}`+"\n")
+	}))
+	defer srv.Close()
+
+	c := NewOllamaClient(srv.URL, 5*time.Second)
+	var deltas []string
+	full, err := c.GenerateStream(context.Background(), "llama3-8b", "hi", func(d string) { deltas = append(deltas, d) })
+	require.NoError(t, err)
+	assert.Equal(t, []string{"Hel", "lo"}, deltas)
+	assert.Equal(t, "Hello", full)
+}
+
+func TestChatStream(t *testing.T) {
+	t.Parallel()
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		assert.Equal(t, http.MethodPost, r.Method)
+		assert.Equal(t, "/api/chat", r.URL.Path)
+
+		var req ChatRequest
+		require.NoError(t, json.NewDecoder(r.Body).Decode(&req))
+		assert.True(t, req.Stream)
+
+		w.Header().Set("Content-Type", "application/x-ndjson")
+		io.WriteString(w, `{"message":{"role":"assistant","content":"Hel"},"done":false}`+"\n")
+		io.WriteString(w, `{"message":{"role":"assistant","content":"lo"},"done":false}`+"\n")
+		io.WriteString(w, `{"message":{"role":"assistant","content":""},"done":true}`+"\n")
+	}))
+	defer srv.Close()
+
+	c := NewOllamaClient(srv.URL, 5*time.Second)
+	var deltas []string
+	full, err := c.ChatStream(context.Background(), "llama3-8b", []ChatMessage{{Role: "user", Content: "hi"}}, func(d string) { deltas = append(deltas, d) })
+	require.NoError(t, err)
+	assert.Equal(t, []string{"Hel", "lo"}, deltas)
+	assert.Equal(t, "Hello", full)
 }
 
 func TestVerifyModels_AllPresent(t *testing.T) {

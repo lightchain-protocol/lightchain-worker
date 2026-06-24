@@ -40,6 +40,8 @@ type SessionKeyGetter interface {
 type InferenceClient interface {
 	Generate(ctx context.Context, model, prompt string) (string, error)
 	Chat(ctx context.Context, model string, messages []ollama.ChatMessage) (string, error)
+	GenerateStream(ctx context.Context, model, prompt string, onDelta func(string)) (string, error)
+	ChatStream(ctx context.Context, model string, messages []ollama.ChatMessage, onDelta func(string)) (string, error)
 }
 
 // JobExecutionClient submits job lifecycle transactions on-chain.
@@ -89,6 +91,7 @@ type HandlerConfig struct {
 type ResponsePublisher interface {
 	PublishResponse(ctx context.Context, jobID, sessionID uint64, correlationID string, signature string, ciphertext []byte)
 	PublishMetadata(ctx context.Context, jobID, sessionID uint64, correlationID string, payload []byte)
+	PublishChunk(ctx context.Context, jobID, sessionID uint64, correlationID string, sequence uint32, payload []byte)
 }
 
 // ReleaseTracker records that a job has just been completed and is now
@@ -314,6 +317,42 @@ func (p *RedisResponsePublisher) PublishMetadata(
 	channel := fmt.Sprintf("session:%d:responses", sessionID)
 	if err := p.client.Publish(pubCtx, channel, data).Err(); err != nil {
 		p.logger.Warn("failed to publish metadata frame", "jobID", jobID, "channel", channel, "error", err)
+	}
+}
+
+// PublishChunk fans out an encrypted streaming chunk frame (best-effort UX).
+// Non-fatal — chunk delivery failures are logged and skipped.
+func (p *RedisResponsePublisher) PublishChunk(
+	ctx context.Context,
+	jobID, sessionID uint64,
+	correlationID string,
+	sequence uint32,
+	payload []byte,
+) {
+	msg := pkgtypes.PubSubMessage{
+		Type:          pkgtypes.MessageTypeChunk,
+		JobID:         pkgtypes.JobID(jobID),
+		SessionID:     pkgtypes.SessionID(sessionID),
+		Sequence:      sequence,
+		TotalChunks:   0,
+		Payload:       payload,
+		CorrelationID: correlationID,
+		Timestamp:     time.Now().Unix(),
+	}
+	data, err := json.Marshal(msg)
+	if err != nil {
+		p.logger.Warn("failed to marshal chunk frame", "jobID", jobID, "seq", sequence, "error", err)
+		return
+	}
+	pubCtx := ctx
+	if p.publishTimeout > 0 {
+		var cancel context.CancelFunc
+		pubCtx, cancel = context.WithTimeout(ctx, p.publishTimeout)
+		defer cancel()
+	}
+	channel := fmt.Sprintf("session:%d:responses", sessionID)
+	if err := p.client.Publish(pubCtx, channel, data).Err(); err != nil {
+		p.logger.Warn("failed to publish chunk frame", "jobID", jobID, "seq", sequence, "channel", channel, "error", err)
 	}
 }
 
@@ -778,20 +817,47 @@ func (h *JobHandler) runInferencePipeline(
 		"promptBytes", len(prompt),
 		"historyTurns", len(history),
 	)
+
+	// Streaming chunk batching: flush when buffer reaches 24 bytes or at stream end.
+	// seq is monotonically increasing from 1. Failures are non-fatal (best-effort UX).
+	var seq uint32
+	var chunkBuf strings.Builder
+	flushChunk := func() {
+		if chunkBuf.Len() == 0 {
+			return
+		}
+		seq++
+		if h.responsePublisher != nil {
+			if enc, encErr := pkgcrypto.Encrypt(sessionKey, []byte(chunkBuf.String())); encErr == nil {
+				h.responsePublisher.PublishChunk(ctx, p.JobID, p.SessionID, p.CorrelationID, seq, enc)
+			} else {
+				logger.Warn("chunk encrypt failed, skipping chunk", "seq", seq, "error", encErr)
+			}
+		}
+		chunkBuf.Reset()
+	}
+	onDelta := func(d string) {
+		chunkBuf.WriteString(d)
+		if chunkBuf.Len() >= 24 {
+			flushChunk()
+		}
+	}
+
 	if len(history) > 0 {
 		messages := append(history, ollama.ChatMessage{Role: "user", Content: promptText})
-		response, err = h.ollamaClient.Chat(ctx, modelName, messages)
+		response, err = h.ollamaClient.ChatStream(ctx, modelName, messages, onDelta)
 		if err != nil {
 			rec.End(metrics.OutcomeError, metrics.CacheMiss)
 			return nil, fmt.Errorf("stage 5 (chat inference): %w", err)
 		}
 	} else {
-		response, err = h.ollamaClient.Generate(ctx, modelName, promptText)
+		response, err = h.ollamaClient.GenerateStream(ctx, modelName, promptText, onDelta)
 		if err != nil {
 			rec.End(metrics.OutcomeError, metrics.CacheMiss)
 			return nil, fmt.Errorf("stage 5 (inference): %w", err)
 		}
 	}
+	flushChunk() // flush any remaining buffered delta
 	d = rec.End(metrics.OutcomeOK, metrics.CacheMiss)
 	logger.Info("stage 5 complete",
 		"stage", "inference",
@@ -818,7 +884,7 @@ func (h *JobHandler) runInferencePipeline(
 	// beneath the response (best-effort, non-fatal).
 	if len(searchSources) > 0 && h.responsePublisher != nil {
 		if metaPayload, encErr := pkgcrypto.Encrypt(sessionKey, sourcesMetadataJSON(searchSources)); encErr != nil {
-			logger.Warn("stage 4.5: encrypt sources failed", "stage", "search", "error", encErr)
+			logger.Warn("post-inference: encrypt sources failed", "stage", "search", "error", encErr)
 		} else {
 			h.responsePublisher.PublishMetadata(ctx, p.JobID, p.SessionID, p.CorrelationID, metaPayload)
 		}

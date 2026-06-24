@@ -23,13 +23,15 @@ import (
 
 // recordingPublisher implements ResponsePublisher and records the wall-clock
 // time at which PublishMetadata is called. This lets ordering tests assert
-// that metadata is published after inference completes.
+// that metadata is published after inference completes. It also records chunk
+// sequences for TestStage5_StreamsChunks.
 type recordingPublisher struct {
 	mu             sync.Mutex
 	metadataCalled bool
 	metadataAt     time.Time
 	responseCalled bool
 	responseAt     time.Time
+	chunkSeqs      []uint32
 }
 
 func (r *recordingPublisher) PublishMetadata(_ context.Context, _, _ uint64, _ string, _ []byte) {
@@ -44,6 +46,12 @@ func (r *recordingPublisher) PublishResponse(_ context.Context, _, _ uint64, _ s
 	defer r.mu.Unlock()
 	r.responseCalled = true
 	r.responseAt = time.Now()
+}
+
+func (r *recordingPublisher) PublishChunk(_ context.Context, _, _ uint64, _ string, seq uint32, _ []byte) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.chunkSeqs = append(r.chunkSeqs, seq)
 }
 
 // trackingOllama wraps mockOllama and records when Generate/Chat complete.
@@ -69,6 +77,22 @@ func (t *trackingOllama) Chat(ctx context.Context, model string, messages []olla
 	return resp, err
 }
 
+func (t *trackingOllama) GenerateStream(ctx context.Context, model, prompt string, onDelta func(string)) (string, error) {
+	resp, err := t.inner.GenerateStream(ctx, model, prompt, onDelta)
+	t.mu.Lock()
+	t.completedAt = time.Now()
+	t.mu.Unlock()
+	return resp, err
+}
+
+func (t *trackingOllama) ChatStream(ctx context.Context, model string, messages []ollama.ChatMessage, onDelta func(string)) (string, error) {
+	resp, err := t.inner.ChatStream(ctx, model, messages, onDelta)
+	t.mu.Lock()
+	t.completedAt = time.Now()
+	t.mu.Unlock()
+	return resp, err
+}
+
 // fakeSearcher satisfies search.Searcher and returns a fixed set of sources.
 type fakeSearcher struct {
 	sources []search.Source
@@ -77,6 +101,33 @@ type fakeSearcher struct {
 
 func (f *fakeSearcher) Search(_ context.Context, _ string, _ int) ([]search.Source, error) {
 	return f.sources, f.err
+}
+
+// fakeStreamInference implements InferenceClient with configurable per-delta output
+// so TestStage5_StreamsChunks can control exactly which deltas are emitted.
+type fakeStreamInference struct {
+	deltas []string
+}
+
+func (f *fakeStreamInference) Generate(_ context.Context, _, _ string) (string, error) {
+	return strings.Join(f.deltas, ""), nil
+}
+
+func (f *fakeStreamInference) Chat(_ context.Context, _ string, _ []ollama.ChatMessage) (string, error) {
+	return strings.Join(f.deltas, ""), nil
+}
+
+func (f *fakeStreamInference) GenerateStream(_ context.Context, _, _ string, onDelta func(string)) (string, error) {
+	var full strings.Builder
+	for _, d := range f.deltas {
+		onDelta(d)
+		full.WriteString(d)
+	}
+	return full.String(), nil
+}
+
+func (f *fakeStreamInference) ChatStream(_ context.Context, _ string, _ []ollama.ChatMessage, onDelta func(string)) (string, error) {
+	return f.GenerateStream(context.Background(), "", "", onDelta)
 }
 
 func twoSources() []search.Source {
@@ -195,4 +246,81 @@ func TestSourcesMetadataPayload_ShapeMatchesFrontend(t *testing.T) {
 	assert.Equal(t, "webSearchSources", decoded.Type)
 	require.Len(t, decoded.Sources, 1)
 	assert.Equal(t, "https://a", decoded.Sources[0].URL)
+}
+
+// TestStage5_StreamsChunks asserts that stage 5 publishes chunk frames in monotonically
+// increasing sequence order and that the returned ciphertext decrypts to the full text.
+func TestStage5_StreamsChunks(t *testing.T) {
+	t.Parallel()
+
+	sessionKey := testSessionKey(t)
+	ecdhKey := testECDHKey(t)
+
+	// deltas chosen so two flushes happen: first at >=24 bytes, then a final flush.
+	// "Hello, streaming world!" = 23 chars; adding " Done." pushes it over 24 on second delta.
+	deltas := []string{"Hello, streaming world!", " Done."}
+	gen := &fakeStreamInference{deltas: deltas}
+	rec := &recordingPublisher{}
+
+	chain := &mockChainClient{
+		ackJobFn:          func(_ context.Context, _ uint64) error { return nil },
+		completeJobFn:     func(_ context.Context, _ uint64, _ [32]byte, _ [32]byte) error { return nil },
+		getEncWorkerKeyFn: func(_ context.Context, _ uint64) ([]byte, error) { return encryptSessionKeyForWorker(t, sessionKey, ecdhKey), nil },
+	}
+	fetcher := &mockBlobFetcher{fetchFn: func(_ context.Context, _ common.Hash, _ uint64) ([]byte, error) {
+		return encryptBlob(t, sessionKey, "test prompt"), nil
+	}}
+	submitter := &mockBlobSubmitter{submitFn: func(_ context.Context, _ []byte) ([][32]byte, error) {
+		return [][32]byte{{0x01}}, nil
+	}}
+
+	counter := &atomic.Int32{}
+	logger := slog.New(slog.NewTextHandler(io.Discard, &slog.HandlerOptions{Level: slog.LevelError}))
+
+	handler := NewJobHandler(
+		chain, fetcher, submitter, newMockKeyStore(), gen,
+		nil,
+		testSigningKey(t), ecdhKey, counter, logger,
+		HandlerConfig{
+			AckTxTimeout:  5 * time.Second,
+			BlobTxTimeout: 60 * time.Second,
+		},
+		rec,
+		nil,
+		testMetrics(t),
+		metrics.DeliveryAsynq,
+		nil,
+	)
+
+	payload := testPayload(t)
+	ks := newMockKeyStore()
+	ks.keys[payload.SessionID] = sessionKey
+	handler.keyStore = ks
+
+	blobData, err := pkgcrypto.Encrypt(sessionKey, []byte("test prompt"))
+	require.NoError(t, err)
+
+	ciphertext, err := handler.runInferencePipeline(
+		context.Background(),
+		logger,
+		payload,
+		blobData,
+		"llama3-8b",
+		metrics.DeliveryAsynq,
+	)
+	require.NoError(t, err)
+
+	// Chunk seqs must be monotonically increasing from 1.
+	rec.mu.Lock()
+	seqs := rec.chunkSeqs
+	rec.mu.Unlock()
+	require.NotEmpty(t, seqs, "at least one chunk must be published")
+	for i, s := range seqs {
+		assert.Equal(t, uint32(i+1), s, "chunk seq must be monotonically increasing from 1")
+	}
+
+	// Full response ciphertext must decrypt to the concatenated deltas.
+	plaintext, decErr := pkgcrypto.Decrypt(sessionKey, ciphertext)
+	require.NoError(t, decErr)
+	assert.Equal(t, strings.Join(deltas, ""), string(plaintext))
 }
