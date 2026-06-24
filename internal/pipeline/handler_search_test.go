@@ -16,6 +16,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	pkgcrypto "github.com/lightchain/pkg/crypto"
+	"github.com/lightchain/pkg/searchaug"
 	"github.com/lightchain/worker/internal/metrics"
 	"github.com/lightchain/worker/internal/ollama"
 	"github.com/lightchain/worker/internal/search"
@@ -217,27 +218,8 @@ func TestStage45_MetadataEmittedAfterInference(t *testing.T) {
 	)
 }
 
-func TestBuildSearchAugmentedPrompt_FixedFormat(t *testing.T) {
-	sources := []search.Source{
-		{Position: 1, Title: "T1", URL: "https://a", Snippet: "s1"},
-		{Position: 2, Title: "T2", URL: "https://b", Snippet: "s2"},
-	}
-	out := buildSearchAugmentedPrompt("original question", sources)
-	assert.True(t, strings.Contains(out, "original question"))
-	assert.True(t, strings.Contains(out, "https://a"))
-	assert.True(t, strings.Contains(out, "[1]"))
-	// The instruction must steer the model away from prefacing its answer with
-	// "Based on the provided web search results…" — it should answer naturally.
-	assert.True(t, strings.Contains(out, "Do NOT mention this context"),
-		"prompt must instruct the model not to mention the search context")
-	assert.False(t, strings.Contains(out, "Use the following web search results"),
-		"old preface-inducing phrasing must be gone")
-	// Deterministic: same inputs → identical output (v2 re-execution depends on this).
-	assert.Equal(t, out, buildSearchAugmentedPrompt("original question", sources))
-}
-
 func TestSourcesMetadataPayload_ShapeMatchesFrontend(t *testing.T) {
-	sources := []search.Source{{Position: 1, Title: "T1", URL: "https://a", Snippet: "s1"}}
+	sources := []searchaug.Source{{Position: 1, Title: "T1", URL: "https://a", Snippet: "s1"}}
 	payload := sourcesMetadataJSON(sources)
 	var decoded struct {
 		Type    string `json:"type"`
@@ -328,7 +310,156 @@ func TestStage5_StreamsChunks(t *testing.T) {
 	assert.Equal(t, []uint32{1, 2}, seqs, "expected exactly two monotonic chunk seqs: threshold flush then final-remainder flush")
 
 	// Full response ciphertext must decrypt to the concatenated deltas.
+	// Note: non-search job → EncodeResponse returns raw answer bytes → ciphertext
+	// decrypts back to the plain text (legacy format unchanged).
 	plaintext, decErr := pkgcrypto.Decrypt(sessionKey, ciphertext)
 	require.NoError(t, decErr)
 	assert.Equal(t, strings.Join(deltas, ""), string(plaintext))
+}
+
+// TestStage6_EmitsEnvelopeForSearchJob asserts that when web search returns
+// sources, stage 6 encrypts a v2 JSON envelope (not raw answer bytes) so the
+// disputer can replay the search context deterministically.
+func TestStage6_EmitsEnvelopeForSearchJob(t *testing.T) {
+	t.Parallel()
+
+	sessionKey := testSessionKey(t)
+	ecdhKey := testECDHKey(t)
+
+	gen := &mockOllama{generateFn: func(_ context.Context, _, _ string) (string, error) {
+		return "the answer", nil
+	}}
+	rec := &recordingPublisher{}
+
+	chain := &mockChainClient{
+		ackJobFn:          func(_ context.Context, _ uint64) error { return nil },
+		completeJobFn:     func(_ context.Context, _ uint64, _ [32]byte, _ [32]byte) error { return nil },
+		getEncWorkerKeyFn: func(_ context.Context, _ uint64) ([]byte, error) { return encryptSessionKeyForWorker(t, sessionKey, ecdhKey), nil },
+	}
+	fetcher := &mockBlobFetcher{fetchFn: func(_ context.Context, _ common.Hash, _ uint64) ([]byte, error) {
+		return encryptBlob(t, sessionKey, "what year is it?"), nil
+	}}
+	submitter := &mockBlobSubmitter{submitFn: func(_ context.Context, _ []byte) ([][32]byte, error) {
+		return [][32]byte{{0x01}}, nil
+	}}
+
+	counter := &atomic.Int32{}
+	logger := slog.New(slog.NewTextHandler(io.Discard, &slog.HandlerOptions{Level: slog.LevelError}))
+
+	handler := NewJobHandler(
+		chain, fetcher, submitter, newMockKeyStore(), gen,
+		nil,
+		testSigningKey(t), ecdhKey, counter, logger,
+		HandlerConfig{
+			AckTxTimeout:     5 * time.Second,
+			BlobTxTimeout:    60 * time.Second,
+			SearchMaxResults: 3,
+		},
+		rec,
+		nil,
+		testMetrics(t),
+		metrics.DeliveryAsynq,
+		&fakeSearcher{sources: twoSources()},
+	)
+
+	payload := testPayload(t)
+	payload.SearchEnabled = true
+	ks := newMockKeyStore()
+	ks.keys[payload.SessionID] = sessionKey
+	handler.keyStore = ks
+
+	blobData, err := pkgcrypto.Encrypt(sessionKey, []byte("what year is it?"))
+	require.NoError(t, err)
+
+	ct, err := handler.runInferencePipeline(
+		context.Background(),
+		logger,
+		payload,
+		blobData,
+		"llama3-8b",
+		metrics.DeliveryAsynq,
+	)
+	require.NoError(t, err)
+
+	// Decrypt the ciphertext and decode the v2 envelope.
+	plaintext, decErr := pkgcrypto.Decrypt(sessionKey, ct)
+	require.NoError(t, decErr)
+	env := searchaug.DecodeResponse(plaintext)
+
+	assert.Equal(t, searchaug.ResponseEnvelopeVersion, env.V)
+	assert.Equal(t, "the answer", env.Answer)
+	assert.Len(t, env.SearchContext, 2)
+}
+
+// TestStage6_RawAnswerForNonSearchJob asserts that when no web search is
+// performed, stage 6 encrypts the raw answer bytes (legacy format) — the
+// v2 envelope is NOT emitted.
+func TestStage6_RawAnswerForNonSearchJob(t *testing.T) {
+	t.Parallel()
+
+	sessionKey := testSessionKey(t)
+	ecdhKey := testECDHKey(t)
+
+	gen := &mockOllama{generateFn: func(_ context.Context, _, _ string) (string, error) {
+		return "plain", nil
+	}}
+	rec := &recordingPublisher{}
+
+	chain := &mockChainClient{
+		ackJobFn:          func(_ context.Context, _ uint64) error { return nil },
+		completeJobFn:     func(_ context.Context, _ uint64, _ [32]byte, _ [32]byte) error { return nil },
+		getEncWorkerKeyFn: func(_ context.Context, _ uint64) ([]byte, error) { return encryptSessionKeyForWorker(t, sessionKey, ecdhKey), nil },
+	}
+	fetcher := &mockBlobFetcher{fetchFn: func(_ context.Context, _ common.Hash, _ uint64) ([]byte, error) {
+		return encryptBlob(t, sessionKey, "hello"), nil
+	}}
+	submitter := &mockBlobSubmitter{submitFn: func(_ context.Context, _ []byte) ([][32]byte, error) {
+		return [][32]byte{{0x01}}, nil
+	}}
+
+	counter := &atomic.Int32{}
+	logger := slog.New(slog.NewTextHandler(io.Discard, &slog.HandlerOptions{Level: slog.LevelError}))
+
+	handler := NewJobHandler(
+		chain, fetcher, submitter, newMockKeyStore(), gen,
+		nil,
+		testSigningKey(t), ecdhKey, counter, logger,
+		HandlerConfig{
+			AckTxTimeout:  5 * time.Second,
+			BlobTxTimeout: 60 * time.Second,
+		},
+		rec,
+		nil,
+		testMetrics(t),
+		metrics.DeliveryAsynq,
+		nil, // no searcher → SearchEnabled is ignored, searchSources stays nil
+	)
+
+	payload := testPayload(t)
+	// SearchEnabled = false (default), no searcher wired
+	ks := newMockKeyStore()
+	ks.keys[payload.SessionID] = sessionKey
+	handler.keyStore = ks
+
+	blobData, err := pkgcrypto.Encrypt(sessionKey, []byte("hello"))
+	require.NoError(t, err)
+
+	ct, err := handler.runInferencePipeline(
+		context.Background(),
+		logger,
+		payload,
+		blobData,
+		"llama3-8b",
+		metrics.DeliveryAsynq,
+	)
+	require.NoError(t, err)
+
+	// Decrypt and decode; for non-search jobs EncodeResponse returns raw bytes
+	// so DecodeResponse falls back to treating the bytes as a raw answer.
+	plaintext, decErr := pkgcrypto.Decrypt(sessionKey, ct)
+	require.NoError(t, decErr)
+	env := searchaug.DecodeResponse(plaintext)
+
+	assert.Equal(t, "plain", env.Answer)
+	assert.Nil(t, env.SearchContext, "non-search job must not emit a SearchContext")
 }

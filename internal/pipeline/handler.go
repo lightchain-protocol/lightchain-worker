@@ -23,6 +23,7 @@ import (
 	"golang.org/x/sync/singleflight"
 
 	pkgcrypto "github.com/lightchain/pkg/crypto"
+	"github.com/lightchain/pkg/searchaug"
 	pkgtypes "github.com/lightchain/pkg/types"
 
 	"github.com/lightchain/worker/internal/metrics"
@@ -767,7 +768,7 @@ func (h *JobHandler) runInferencePipeline(
 	// Sources are stashed here and published AFTER inference (see end of function)
 	// so the UI renders "Sources" beneath the answer, not above it.
 	promptText := string(prompt)
-	var searchSources []search.Source
+	var searchSources []searchaug.Source
 	if p.SearchEnabled && h.searcher != nil {
 		searchCtx := ctx
 		if h.cfg.SearchTimeout > 0 {
@@ -784,8 +785,9 @@ func (h *JobHandler) runInferencePipeline(
 			logger.Warn("stage 4.5: web search failed, proceeding without context",
 				"stage", "search", "error", sErr)
 		} else if len(sources) > 0 {
-			promptText = buildSearchAugmentedPrompt(promptText, sources)
-			searchSources = sources // stash; publish after inference
+			augSources := toSearchaugSources(sources)
+			promptText = searchaug.BuildAugmentedPrompt(searchaug.CurrentTemplateVersion, promptText, augSources)
+			searchSources = augSources // stash; publish after inference
 			logger.Info("stage 4.5 complete", "stage", "search", "sources", len(sources))
 		}
 	}
@@ -866,9 +868,18 @@ func (h *JobHandler) runInferencePipeline(
 		"durationMs", d.Milliseconds(),
 	)
 
-	// Stage 6: Encrypt response
+	// Stage 6: Encode and encrypt response. For search jobs the response is
+	// wrapped in a v2 JSON envelope that captures the search context so the
+	// disputer can reproduce the exact augmented prompt on replay. For plain
+	// (non-search) jobs EncodeResponse returns raw answer bytes — byte-identical
+	// to the legacy format.
 	rec = h.metrics.StartStage(metrics.StageEncrypt, model, delivery)
-	ciphertext, err := pkgcrypto.Encrypt(sessionKey, []byte(response))
+	respBytes, encErr := searchaug.EncodeResponse(response, searchSources)
+	if encErr != nil {
+		rec.End(metrics.OutcomeError, metrics.CacheMiss)
+		return nil, fmt.Errorf("stage 6 (encode response): %w", encErr)
+	}
+	ciphertext, err := pkgcrypto.Encrypt(sessionKey, respBytes)
 	if err != nil {
 		rec.End(metrics.OutcomeError, metrics.CacheMiss)
 		return nil, fmt.Errorf("stage 6 (encrypt response): %w", err)
@@ -1274,28 +1285,26 @@ func (h *JobHandler) resolveModelName(modelID string) (string, error) {
 	return modelID, nil
 }
 
-// buildSearchAugmentedPrompt prepends a fixed-format context block built from
-// web-search results to the user's prompt. The format is intentionally stable:
-// dispute re-execution (v2) reproduces the prompt byte-for-byte from the
-// captured sources, so DO NOT change this template without versioning it.
-func buildSearchAugmentedPrompt(prompt string, sources []search.Source) string {
-	if len(sources) == 0 {
-		return prompt
+// toSearchaugSources converts search.Source (the Tavily/search-package type)
+// to searchaug.Source (the shared pkg type). Fields are identical; this
+// converter avoids a dependency between the two packages.
+func toSearchaugSources(sources []search.Source) []searchaug.Source {
+	out := make([]searchaug.Source, len(sources))
+	for i, s := range sources {
+		out[i] = searchaug.Source{
+			Position: s.Position,
+			Title:    s.Title,
+			URL:      s.URL,
+			Snippet:  s.Snippet,
+		}
 	}
-	var b strings.Builder
-	b.WriteString("You have access to the following background context. Answer the question directly and naturally, as if from your own knowledge. ")
-	b.WriteString("Do NOT mention this context, web searches, or \"search results\", and do NOT preface your answer by referring to them. Cite sources inline as [number] where relevant.\n\n")
-	for _, s := range sources {
-		fmt.Fprintf(&b, "[%d] %s\n%s\n%s\n\n", s.Position, s.Title, s.URL, s.Snippet)
-	}
-	b.WriteString("Question: ")
-	b.WriteString(prompt)
-	return b.String()
+	return out
 }
 
 // sourcesMetadataJSON renders the citation payload in the exact shape the
-// frontend's parseWebSearchSources expects.
-func sourcesMetadataJSON(sources []search.Source) []byte {
+// frontend's parseWebSearchSources expects. Accepts []searchaug.Source so it
+// can be called after the search.Source → searchaug.Source conversion.
+func sourcesMetadataJSON(sources []searchaug.Source) []byte {
 	type wire struct {
 		Position int    `json:"position"`
 		Title    string `json:"title"`
