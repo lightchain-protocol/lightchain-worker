@@ -226,6 +226,12 @@ func TestBuildSearchAugmentedPrompt_FixedFormat(t *testing.T) {
 	assert.True(t, strings.Contains(out, "original question"))
 	assert.True(t, strings.Contains(out, "https://a"))
 	assert.True(t, strings.Contains(out, "[1]"))
+	// The instruction must steer the model away from prefacing its answer with
+	// "Based on the provided web search results…" — it should answer naturally.
+	assert.True(t, strings.Contains(out, "Do NOT mention this context"),
+		"prompt must instruct the model not to mention the search context")
+	assert.False(t, strings.Contains(out, "Use the following web search results"),
+		"old preface-inducing phrasing must be gone")
 	// Deterministic: same inputs → identical output (v2 re-execution depends on this).
 	assert.Equal(t, out, buildSearchAugmentedPrompt("original question", sources))
 }

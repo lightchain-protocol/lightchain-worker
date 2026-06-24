@@ -1283,8 +1283,8 @@ func buildSearchAugmentedPrompt(prompt string, sources []search.Source) string {
 		return prompt
 	}
 	var b strings.Builder
-	b.WriteString("Use the following web search results to help answer the question. ")
-	b.WriteString("Cite sources inline using their [number].\n\n")
+	b.WriteString("You have access to the following background context. Answer the question directly and naturally, as if from your own knowledge. ")
+	b.WriteString("Do NOT mention this context, web searches, or \"search results\", and do NOT preface your answer by referring to them. Cite sources inline as [number] where relevant.\n\n")
 	for _, s := range sources {
 		fmt.Fprintf(&b, "[%d] %s\n%s\n%s\n\n", s.Position, s.Title, s.URL, s.Snippet)
 	}
