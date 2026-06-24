@@ -3,6 +3,7 @@ package pipeline
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"log/slog"
 	"strings"
@@ -462,4 +463,93 @@ func TestStage6_RawAnswerForNonSearchJob(t *testing.T) {
 
 	assert.Equal(t, "plain", env.Answer)
 	assert.Nil(t, env.SearchContext, "non-search job must not emit a SearchContext")
+}
+
+// TestBuildConversationHistory_DecodesV2EnvelopeToAnswer asserts that when a
+// prior job's response blob is a v2 search envelope, buildConversationHistory
+// assembles an assistant message whose Content is the decoded answer — NOT the
+// raw envelope JSON. For legacy/non-search blobs DecodeResponse falls back to
+// treating the bytes as a raw answer, so behavior for those is unchanged.
+func TestBuildConversationHistory_DecodesV2EnvelopeToAnswer(t *testing.T) {
+	t.Parallel()
+
+	sessionKey := testSessionKey(t)
+	ecdhKey := testECDHKey(t)
+
+	const priorAnswer = "prior answer from search"
+	priorSources := []searchaug.Source{
+		{Position: 1, Title: "T1", URL: "https://example.com", Snippet: "snip"},
+	}
+
+	// Build a v2 envelope and encrypt it as the worker would store it.
+	envelope, err := searchaug.EncodeResponse(priorAnswer, priorSources)
+	require.NoError(t, err)
+	encEnvelope, err := pkgcrypto.Encrypt(sessionKey, envelope)
+	require.NoError(t, err)
+
+	// Build a plain prompt blob for the same prior job.
+	encPrompt := encryptBlob(t, sessionKey, "prior user question")
+
+	// Sentinel hashes to distinguish prompt from response fetches.
+	promptHash := common.HexToHash("0x0101010101010101010101010101010101010101010101010101010101010101")
+	responseHash := common.HexToHash("0x0202020202020202020202020202020202020202020202020202020202020202")
+
+	chain := &mockChainClient{
+		ackJobFn:      func(_ context.Context, _ uint64) error { return nil },
+		completeJobFn: func(_ context.Context, _ uint64, _ [32]byte, _ [32]byte) error { return nil },
+		getEncWorkerKeyFn: func(_ context.Context, _ uint64) ([]byte, error) {
+			return encryptSessionKeyForWorker(t, sessionKey, ecdhKey), nil
+		},
+		getJobBlobInfoFn: func(_ context.Context, _ uint64) (common.Hash, common.Hash, uint64, uint64, error) {
+			return promptHash, responseHash, 10, 11, nil
+		},
+	}
+
+	fetcher := &mockBlobFetcher{fetchFn: func(_ context.Context, hash common.Hash, _ uint64) ([]byte, error) {
+		switch hash {
+		case promptHash:
+			return encPrompt, nil
+		case responseHash:
+			return encEnvelope, nil
+		default:
+			return nil, fmt.Errorf("unexpected hash %s", hash)
+		}
+	}}
+	submitter := &mockBlobSubmitter{submitFn: func(_ context.Context, _ []byte) ([][32]byte, error) {
+		return [][32]byte{{0x03}}, nil
+	}}
+
+	counter := &atomic.Int32{}
+	logger := slog.New(slog.NewTextHandler(io.Discard, &slog.HandlerOptions{Level: slog.LevelError}))
+
+	handler := NewJobHandler(
+		chain, fetcher, submitter, newMockKeyStore(), &mockOllama{generateFn: func(_ context.Context, _, _ string) (string, error) {
+			return "", nil
+		}},
+		nil,
+		testSigningKey(t), ecdhKey, counter, logger,
+		HandlerConfig{
+			AckTxTimeout:  5 * time.Second,
+			BlobTxTimeout: 60 * time.Second,
+		},
+		&recordingPublisher{},
+		nil,
+		testMetrics(t),
+		metrics.DeliveryAsynq,
+		nil,
+	)
+
+	msgs, err := handler.buildConversationHistory(context.Background(), []uint64{99}, sessionKey)
+	require.NoError(t, err)
+	require.Len(t, msgs, 2, "expected one user + one assistant message")
+
+	userMsg := msgs[0]
+	assert.Equal(t, "user", userMsg.Role)
+	assert.Equal(t, "prior user question", userMsg.Content)
+
+	assistantMsg := msgs[1]
+	assert.Equal(t, "assistant", assistantMsg.Role)
+	// Must be the decoded answer, not the raw envelope JSON.
+	assert.Equal(t, priorAnswer, assistantMsg.Content,
+		"assistant Content must be the decoded answer, not the raw v2 envelope JSON")
 }

@@ -1262,7 +1262,7 @@ func (h *JobHandler) buildConversationHistory(
 			if err != nil {
 				return nil, fmt.Errorf("decrypt response for job %d: %w", jobID, err)
 			}
-			messages = append(messages, ollama.ChatMessage{Role: "assistant", Content: string(responseText)})
+			messages = append(messages, ollama.ChatMessage{Role: "assistant", Content: searchaug.DecodeResponse(responseText).Answer})
 		}
 	}
 

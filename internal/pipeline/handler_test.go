@@ -53,6 +53,7 @@ type mockChainClient struct {
 	hasJobAcknowledgedFn func(ctx context.Context, jobID uint64) (bool, error)
 	hasJobCompletedFn    func(ctx context.Context, jobID uint64) (bool, error)
 	getEncWorkerKeyFn    func(ctx context.Context, sessionID uint64) ([]byte, error)
+	getJobBlobInfoFn     func(ctx context.Context, jobID uint64) (common.Hash, common.Hash, uint64, uint64, error)
 }
 
 func (m *mockChainClient) AcknowledgeJob(ctx context.Context, jobID uint64) error {
@@ -76,7 +77,10 @@ func (m *mockChainClient) HasJobCompleted(ctx context.Context, jobID uint64) (bo
 func (m *mockChainClient) GetSessionEncWorkerKey(ctx context.Context, sessionID uint64) ([]byte, error) {
 	return m.getEncWorkerKeyFn(ctx, sessionID)
 }
-func (m *mockChainClient) GetJobBlobInfo(_ context.Context, _ uint64) (common.Hash, common.Hash, uint64, uint64, error) {
+func (m *mockChainClient) GetJobBlobInfo(ctx context.Context, jobID uint64) (common.Hash, common.Hash, uint64, uint64, error) {
+	if m.getJobBlobInfoFn != nil {
+		return m.getJobBlobInfoFn(ctx, jobID)
+	}
 	return common.Hash{}, common.Hash{}, 0, 0, nil
 }
 
