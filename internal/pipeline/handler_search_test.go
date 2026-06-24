@@ -1,14 +1,170 @@
 package pipeline
 
 import (
+	"context"
 	"encoding/json"
+	"io"
+	"log/slog"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 
+	"github.com/ethereum/go-ethereum/common"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	pkgcrypto "github.com/lightchain/pkg/crypto"
+	"github.com/lightchain/worker/internal/metrics"
+	"github.com/lightchain/worker/internal/ollama"
 	"github.com/lightchain/worker/internal/search"
 )
+
+// recordingPublisher implements ResponsePublisher and records the wall-clock
+// time at which PublishMetadata is called. This lets ordering tests assert
+// that metadata is published after inference completes.
+type recordingPublisher struct {
+	mu             sync.Mutex
+	metadataCalled bool
+	metadataAt     time.Time
+	responseCalled bool
+	responseAt     time.Time
+}
+
+func (r *recordingPublisher) PublishMetadata(_ context.Context, _, _ uint64, _ string, _ []byte) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.metadataCalled = true
+	r.metadataAt = time.Now()
+}
+
+func (r *recordingPublisher) PublishResponse(_ context.Context, _, _ uint64, _ string, _ string, _ []byte) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.responseCalled = true
+	r.responseAt = time.Now()
+}
+
+// trackingOllama wraps mockOllama and records when Generate/Chat complete.
+type trackingOllama struct {
+	inner      *mockOllama
+	mu         sync.Mutex
+	completedAt time.Time
+}
+
+func (t *trackingOllama) Generate(ctx context.Context, model, prompt string) (string, error) {
+	resp, err := t.inner.Generate(ctx, model, prompt)
+	t.mu.Lock()
+	t.completedAt = time.Now()
+	t.mu.Unlock()
+	return resp, err
+}
+
+func (t *trackingOllama) Chat(ctx context.Context, model string, messages []ollama.ChatMessage) (string, error) {
+	resp, err := t.inner.Chat(ctx, model, messages)
+	t.mu.Lock()
+	t.completedAt = time.Now()
+	t.mu.Unlock()
+	return resp, err
+}
+
+// fakeSearcher satisfies search.Searcher and returns a fixed set of sources.
+type fakeSearcher struct {
+	sources []search.Source
+	err     error
+}
+
+func (f *fakeSearcher) Search(_ context.Context, _ string, _ int) ([]search.Source, error) {
+	return f.sources, f.err
+}
+
+func twoSources() []search.Source {
+	return []search.Source{
+		{Position: 1, Title: "Result One", URL: "https://example.com/1", Snippet: "first snippet"},
+		{Position: 2, Title: "Result Two", URL: "https://example.com/2", Snippet: "second snippet"},
+	}
+}
+
+// TestStage45_MetadataEmittedAfterInference asserts that the web-search
+// citation frame (PublishMetadata) is sent AFTER inference completes, not
+// before. This is the ordering the UI requires so Sources appear beneath
+// the answer.
+func TestStage45_MetadataEmittedAfterInference(t *testing.T) {
+	t.Parallel()
+
+	sessionKey := testSessionKey(t)
+	ecdhKey := testECDHKey(t)
+	encSessionKey := encryptSessionKeyForWorker(t, sessionKey, ecdhKey)
+	promptCiphertext := encryptBlob(t, sessionKey, "What is the capital of France?")
+
+	chain := &mockChainClient{
+		ackJobFn:          func(_ context.Context, _ uint64) error { return nil },
+		completeJobFn:     func(_ context.Context, _ uint64, _ [32]byte, _ [32]byte) error { return nil },
+		getEncWorkerKeyFn: func(_ context.Context, _ uint64) ([]byte, error) { return encSessionKey, nil },
+	}
+	fetcher := &mockBlobFetcher{fetchFn: func(_ context.Context, _ common.Hash, _ uint64) ([]byte, error) {
+		return promptCiphertext, nil
+	}}
+	submitter := &mockBlobSubmitter{submitFn: func(_ context.Context, _ []byte) ([][32]byte, error) {
+		return [][32]byte{{0x01}}, nil
+	}}
+
+	inner := &mockOllama{generateFn: func(_ context.Context, _, _ string) (string, error) {
+		return "Paris", nil
+	}}
+	tracker := &trackingOllama{inner: inner}
+	rec := &recordingPublisher{}
+
+	counter := &atomic.Int32{}
+	logger := slog.New(slog.NewTextHandler(io.Discard, &slog.HandlerOptions{Level: slog.LevelError}))
+
+	handler := NewJobHandler(
+		chain, fetcher, submitter, newMockKeyStore(), tracker,
+		nil, // no real Redis — publisher injected directly
+		testSigningKey(t), ecdhKey, counter, logger,
+		HandlerConfig{
+			AckTxTimeout:     5 * time.Second,
+			BlobTxTimeout:    60 * time.Second,
+			SearchMaxResults: 3,
+		},
+		rec,   // injected recording publisher
+		nil,   // no checkpoints
+		testMetrics(t),
+		metrics.DeliveryAsynq,
+		&fakeSearcher{sources: twoSources()},
+	)
+
+	payload := testPayload(t)
+	payload.SearchEnabled = true
+
+	// Encrypt the session key into the keystore so stage 3 succeeds without chain
+	ks := newMockKeyStore()
+	ks.keys[payload.SessionID] = sessionKey
+	handler.keyStore = ks
+
+	blobData, err := pkgcrypto.Encrypt(sessionKey, []byte("What is the capital of France?"))
+	require.NoError(t, err)
+
+	_, err = handler.runInferencePipeline(
+		context.Background(),
+		logger,
+		payload,
+		blobData,
+		"llama3-8b",
+		metrics.DeliveryAsynq,
+	)
+	require.NoError(t, err)
+
+	require.True(t, rec.metadataCalled, "sources must be published")
+	require.False(t, tracker.completedAt.IsZero(), "inference must have been called")
+
+	assert.True(t,
+		!rec.metadataAt.Before(tracker.completedAt),
+		"PublishMetadata (at %v) must not happen before inference completed (at %v)",
+		rec.metadataAt, tracker.completedAt,
+	)
+}
 
 func TestBuildSearchAugmentedPrompt_FixedFormat(t *testing.T) {
 	sources := []search.Source{

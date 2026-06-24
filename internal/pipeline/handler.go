@@ -725,7 +725,10 @@ func (h *JobHandler) runInferencePipeline(
 
 	// Stage 4.5: optional web-search augmentation (one-shot Tavily). Fail-open:
 	// any search failure proceeds with the original prompt and emits no sources.
+	// Sources are stashed here and published AFTER inference (see end of function)
+	// so the UI renders "Sources" beneath the answer, not above it.
 	promptText := string(prompt)
+	var searchSources []search.Source
 	if p.SearchEnabled && h.searcher != nil {
 		searchCtx := ctx
 		if h.cfg.SearchTimeout > 0 {
@@ -743,13 +746,7 @@ func (h *JobHandler) runInferencePipeline(
 				"stage", "search", "error", sErr)
 		} else if len(sources) > 0 {
 			promptText = buildSearchAugmentedPrompt(promptText, sources)
-			// Emit citations as an encrypted metadata frame (best-effort).
-			metaPayload, encErr := pkgcrypto.Encrypt(sessionKey, sourcesMetadataJSON(sources))
-			if encErr != nil {
-				logger.Warn("stage 4.5: encrypt sources failed", "stage", "search", "error", encErr)
-			} else if h.responsePublisher != nil {
-				h.responsePublisher.PublishMetadata(ctx, p.JobID, p.SessionID, p.CorrelationID, metaPayload)
-			}
+			searchSources = sources // stash; publish after inference
 			logger.Info("stage 4.5 complete", "stage", "search", "sources", len(sources))
 		}
 	}
@@ -816,6 +813,16 @@ func (h *JobHandler) runInferencePipeline(
 		"ciphertextBytes", len(ciphertext),
 		"durationMs", d.Milliseconds(),
 	)
+
+	// Emit citations AFTER the answer is ready so the UI renders Sources
+	// beneath the response (best-effort, non-fatal).
+	if len(searchSources) > 0 && h.responsePublisher != nil {
+		if metaPayload, encErr := pkgcrypto.Encrypt(sessionKey, sourcesMetadataJSON(searchSources)); encErr != nil {
+			logger.Warn("stage 4.5: encrypt sources failed", "stage", "search", "error", encErr)
+		} else {
+			h.responsePublisher.PublishMetadata(ctx, p.JobID, p.SessionID, p.CorrelationID, metaPayload)
+		}
+	}
 
 	return ciphertext, nil
 }

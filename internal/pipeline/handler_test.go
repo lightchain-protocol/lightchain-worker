@@ -228,6 +228,7 @@ func newTestHandlerWithConfig(
 		nil, // checkpoints — disabled in most handler tests; see TestHandleTask_Checkpoint* for coverage
 		testMetrics(t),
 		metrics.DeliveryAsynq,
+		nil,
 	)
 }
 
@@ -307,6 +308,7 @@ func TestHandleTask_FullPipelineSuccess(t *testing.T) {
 		nil, // checkpoints disabled for this test
 		testMetrics(t),
 		metrics.DeliveryAsynq,
+		nil,
 	)
 
 	payload := testPayload(t)
@@ -419,7 +421,7 @@ func TestHandleTask_SessionKeyCacheHit(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(io.Discard, &slog.HandlerOptions{Level: slog.LevelError}))
 	handler := NewJobHandler(chain, fetcher, submitter, ks, ollama, rc,
 		testSigningKey(t), ecdhKey, counter, logger,
-		HandlerConfig{AckTxTimeout: 5 * time.Second, BlobTxTimeout: 60 * time.Second, RedisPublishTimeout: 5 * time.Second}, nil, nil, testMetrics(t), metrics.DeliveryAsynq)
+		HandlerConfig{AckTxTimeout: 5 * time.Second, BlobTxTimeout: 60 * time.Second, RedisPublishTimeout: 5 * time.Second}, nil, nil, testMetrics(t), metrics.DeliveryAsynq, nil)
 
 	payload := testPayload(t)
 	data, _ := json.Marshal(payload)
@@ -465,7 +467,7 @@ func TestHandleTask_SessionKeyCacheMiss_FetchAndStore(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(io.Discard, &slog.HandlerOptions{Level: slog.LevelError}))
 	handler := NewJobHandler(chain, fetcher, submitter, ks, ollama, rc,
 		testSigningKey(t), ecdhKey, counter, logger,
-		HandlerConfig{AckTxTimeout: 5 * time.Second, BlobTxTimeout: 60 * time.Second, RedisPublishTimeout: 5 * time.Second}, nil, nil, testMetrics(t), metrics.DeliveryAsynq)
+		HandlerConfig{AckTxTimeout: 5 * time.Second, BlobTxTimeout: 60 * time.Second, RedisPublishTimeout: 5 * time.Second}, nil, nil, testMetrics(t), metrics.DeliveryAsynq, nil)
 
 	payload := testPayload(t)
 	data, _ := json.Marshal(payload)
@@ -533,7 +535,7 @@ func TestHandleTask_SessionKeyRotated_Refreshes(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(io.Discard, &slog.HandlerOptions{Level: slog.LevelError}))
 	handler := NewJobHandler(chain, fetcher, submitter, ks, ollama, rc,
 		testSigningKey(t), ecdhKey, counter, logger,
-		HandlerConfig{AckTxTimeout: 5 * time.Second, BlobTxTimeout: 60 * time.Second, RedisPublishTimeout: 5 * time.Second}, nil, nil, testMetrics(t), metrics.DeliveryAsynq)
+		HandlerConfig{AckTxTimeout: 5 * time.Second, BlobTxTimeout: 60 * time.Second, RedisPublishTimeout: 5 * time.Second}, nil, nil, testMetrics(t), metrics.DeliveryAsynq, nil)
 
 	payload := testPayload(t)
 	data, _ := json.Marshal(payload)
@@ -597,7 +599,7 @@ func TestGetOrDeriveSessionKey_CoalescesConcurrentMisses(t *testing.T) {
 		chain, &mockBlobFetcher{}, &mockBlobSubmitter{}, ks, &mockOllama{}, rc,
 		testSigningKey(t), ecdhKey, counter, logger,
 		HandlerConfig{AckTxTimeout: 5 * time.Second, BlobTxTimeout: 60 * time.Second, RedisPublishTimeout: 5 * time.Second},
-		nil, nil, testMetrics(t), metrics.DeliveryAsynq,
+		nil, nil, testMetrics(t), metrics.DeliveryAsynq, nil,
 	)
 
 	var wg sync.WaitGroup
@@ -657,7 +659,7 @@ func TestHandleTask_CompleteJobFailure(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(io.Discard, &slog.HandlerOptions{Level: slog.LevelError}))
 	handler := NewJobHandler(chain, fetcher, submitter, ks, ollama, rc,
 		testSigningKey(t), ecdhKey, counter, logger,
-		HandlerConfig{AckTxTimeout: 5 * time.Second, BlobTxTimeout: 60 * time.Second, RedisPublishTimeout: 5 * time.Second}, nil, nil, testMetrics(t), metrics.DeliveryAsynq)
+		HandlerConfig{AckTxTimeout: 5 * time.Second, BlobTxTimeout: 60 * time.Second, RedisPublishTimeout: 5 * time.Second}, nil, nil, testMetrics(t), metrics.DeliveryAsynq, nil)
 
 	payload := testPayload(t)
 	data, _ := json.Marshal(payload)
@@ -692,7 +694,7 @@ func TestHandleTask_JobCounterIncrementDecrement(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(io.Discard, &slog.HandlerOptions{Level: slog.LevelError}))
 	handler := NewJobHandler(chain, fetcher, submitter, newMockKeyStore(), ollama, rc,
 		testSigningKey(t), testECDHKey(t), counter, logger,
-		HandlerConfig{AckTxTimeout: 5 * time.Second, BlobTxTimeout: 60 * time.Second, RedisPublishTimeout: 5 * time.Second}, nil, nil, testMetrics(t), metrics.DeliveryAsynq)
+		HandlerConfig{AckTxTimeout: 5 * time.Second, BlobTxTimeout: 60 * time.Second, RedisPublishTimeout: 5 * time.Second}, nil, nil, testMetrics(t), metrics.DeliveryAsynq, nil)
 
 	payload := testPayload(t)
 	data, _ := json.Marshal(payload)
@@ -738,7 +740,7 @@ func TestHandleTask_RedisPublishFailure_NonFatal(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(io.Discard, &slog.HandlerOptions{Level: slog.LevelError}))
 	handler := NewJobHandler(chain, fetcher, submitter, ks, ollama, rc,
 		testSigningKey(t), ecdhKey, counter, logger,
-		HandlerConfig{AckTxTimeout: 5 * time.Second, BlobTxTimeout: 60 * time.Second, RedisPublishTimeout: 5 * time.Second}, nil, nil, testMetrics(t), metrics.DeliveryAsynq)
+		HandlerConfig{AckTxTimeout: 5 * time.Second, BlobTxTimeout: 60 * time.Second, RedisPublishTimeout: 5 * time.Second}, nil, nil, testMetrics(t), metrics.DeliveryAsynq, nil)
 
 	payload := testPayload(t)
 	data, _ := json.Marshal(payload)
@@ -1002,6 +1004,7 @@ func TestHandleTask_CheckpointHit_SkipsInference(t *testing.T) {
 		store,
 		testMetrics(t),
 		metrics.DeliveryAsynq,
+		nil,
 	)
 
 	payload := testPayload(t)
@@ -1076,6 +1079,7 @@ func TestHandleTask_CheckpointRaceLoserUsesCanonical(t *testing.T) {
 		store,
 		testMetrics(t),
 		metrics.DeliveryAsynq,
+		nil,
 	)
 
 	payload := testPayload(t)
@@ -1160,6 +1164,7 @@ func TestHandleTask_CheckpointTombstonedAfterCompletion(t *testing.T) {
 		store,
 		testMetrics(t),
 		metrics.DeliveryAsynq,
+		nil,
 	)
 
 	payload := testPayload(t)
@@ -1222,6 +1227,7 @@ func TestHandleTask_CheckpointRetained_WhenStage8bFails(t *testing.T) {
 		store,
 		testMetrics(t),
 		metrics.DeliveryAsynq,
+		nil,
 	)
 
 	payload := testPayload(t)
