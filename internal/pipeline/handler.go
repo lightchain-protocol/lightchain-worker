@@ -612,6 +612,11 @@ func (h *JobHandler) processJob(ctx context.Context, p JobPayload) (err error) {
 		)
 	} else {
 		rec = h.metrics.StartStage(metrics.StageRedisPublish, model, delivery)
+		// completePayload and ciphertext intentionally differ for v2 search jobs:
+		// the relay complete frame carries the PLAIN answer (consumer contract),
+		// while ciphertext stays the {answer,searchContext} envelope used by the
+		// blob + on-chain responseCiphertextHash (the disputer reads it). Do NOT
+		// unify these — see relayCompleteCiphertext.
 		completePayload := ciphertext
 		if sk, skErr := h.getOrDeriveSessionKey(ctx, logger, p.SessionID); skErr == nil {
 			completePayload = h.relayCompleteCiphertext(sk, ciphertext)
