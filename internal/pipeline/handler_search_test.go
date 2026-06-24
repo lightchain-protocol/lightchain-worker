@@ -256,9 +256,12 @@ func TestStage5_StreamsChunks(t *testing.T) {
 	sessionKey := testSessionKey(t)
 	ecdhKey := testECDHKey(t)
 
-	// deltas chosen so two flushes happen: first at >=24 bytes, then a final flush.
-	// "Hello, streaming world!" = 23 chars; adding " Done." pushes it over 24 on second delta.
-	deltas := []string{"Hello, streaming world!", " Done."}
+	// deltas chosen so exactly two flushes happen:
+	//   delta 1: "Hello, streaming world!!" = 24 bytes → buffer reaches threshold (>=24) → mid-stream flush (seq=1)
+	//   delta 2: "Done" = 4 bytes → buffer = 4, below threshold, not flushed mid-stream
+	//   after loop: flushChunk() fires on the remaining 4-byte remainder → final flush (seq=2)
+	// This exercises both the threshold flush path AND the final-remainder flush path.
+	deltas := []string{"Hello, streaming world!!", "Done"}
 	gen := &fakeStreamInference{deltas: deltas}
 	rec := &recordingPublisher{}
 
@@ -310,14 +313,13 @@ func TestStage5_StreamsChunks(t *testing.T) {
 	)
 	require.NoError(t, err)
 
-	// Chunk seqs must be monotonically increasing from 1.
+	// Must produce exactly two chunk frames: seq=1 from the mid-stream threshold flush
+	// (buffer reached 24 bytes after delta 1) and seq=2 from the final-remainder flush
+	// (the leftover 4 bytes of delta 2 flushed after GenerateStream returns).
 	rec.mu.Lock()
 	seqs := rec.chunkSeqs
 	rec.mu.Unlock()
-	require.NotEmpty(t, seqs, "at least one chunk must be published")
-	for i, s := range seqs {
-		assert.Equal(t, uint32(i+1), s, "chunk seq must be monotonically increasing from 1")
-	}
+	assert.Equal(t, []uint32{1, 2}, seqs, "expected exactly two monotonic chunk seqs: threshold flush then final-remainder flush")
 
 	// Full response ciphertext must decrypt to the concatenated deltas.
 	plaintext, decErr := pkgcrypto.Decrypt(sessionKey, ciphertext)
