@@ -553,3 +553,53 @@ func TestBuildConversationHistory_DecodesV2EnvelopeToAnswer(t *testing.T) {
 	assert.Equal(t, priorAnswer, assistantMsg.Content,
 		"assistant Content must be the decoded answer, not the raw v2 envelope JSON")
 }
+
+// TestRelayCompleteCiphertext verifies that relayCompleteCiphertext strips the
+// v2 search envelope before the relay complete frame so the frontend receives
+// the plain answer, not the JSON blob.
+func TestRelayCompleteCiphertext(t *testing.T) {
+	t.Parallel()
+
+	// Minimal JobHandler — relayCompleteCiphertext only uses pkgcrypto + searchaug,
+	// no other dependencies.
+	h := &JobHandler{}
+
+	t.Run("v2 envelope: complete frame decrypts to plain answer", func(t *testing.T) {
+		t.Parallel()
+
+		sk := testSessionKey(t)
+
+		// Build a v2 blob ciphertext as stage 6 would produce it.
+		envBytes, err := searchaug.EncodeResponse("the answer", toSearchaugSources(twoSources()))
+		require.NoError(t, err)
+		blobCt, err := pkgcrypto.Encrypt(sk, envBytes)
+		require.NoError(t, err)
+
+		out := h.relayCompleteCiphertext(sk, blobCt)
+
+		// The relay frame must decrypt to the plain answer — NOT the envelope JSON.
+		plain, decErr := pkgcrypto.Decrypt(sk, out)
+		require.NoError(t, decErr)
+		assert.Equal(t, "the answer", string(plain),
+			"relay complete frame must carry the plain answer, not the v2 envelope JSON")
+	})
+
+	t.Run("legacy/plain: complete frame passes through unchanged (decrypts to plain answer)", func(t *testing.T) {
+		t.Parallel()
+
+		sk := testSessionKey(t)
+
+		// Non-search job: EncodeResponse with nil sources returns raw answer bytes.
+		rawBytes, err := searchaug.EncodeResponse("plain answer", nil)
+		require.NoError(t, err)
+		blobCt, err := pkgcrypto.Encrypt(sk, rawBytes)
+		require.NoError(t, err)
+
+		out := h.relayCompleteCiphertext(sk, blobCt)
+
+		plain, decErr := pkgcrypto.Decrypt(sk, out)
+		require.NoError(t, decErr)
+		assert.Equal(t, "plain answer", string(plain),
+			"relay complete frame for non-search job must decrypt to the plain answer")
+	})
+}
