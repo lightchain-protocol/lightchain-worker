@@ -5,6 +5,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -256,6 +257,23 @@ func TestEmit_WritesCapabilities(t *testing.T) {
 	got, err := rdb.HGet(t.Context(), key, pkgtypes.HBFieldCapabilities).Result()
 	require.NoError(t, err)
 	assert.JSONEq(t, `["search"]`, got)
+}
+
+func TestEmitWritesProtocolVersion(t *testing.T) {
+	t.Parallel()
+	mr := miniredis.RunT(t)
+	rdb := redis.NewClient(&redis.Options{Addr: mr.Addr()})
+	t.Cleanup(func() { _ = rdb.Close() })
+
+	logger := slog.New(slog.NewTextHandler(io.Discard, &slog.HandlerOptions{Level: slog.LevelError}))
+	counter := &atomic.Int32{}
+	m := NewMonitor(rdb, MonitorConfig{Interval: time.Second}, testWorkerAddr,
+		[]string{"0xmodel"}, nil, counter, 0, logger, nil)
+	require.NoError(t, m.EmitOnce(t.Context()))
+
+	got, err := rdb.HGet(t.Context(), pkgtypes.HeartbeatRedisKey(m.workerAddr), pkgtypes.HBFieldProtocolVersion).Result()
+	require.NoError(t, err)
+	require.Equal(t, strconv.Itoa(pkgtypes.WorkerProtocolVersion), got)
 }
 
 func TestMonitor_emit_DynamicJobCounts(t *testing.T) {

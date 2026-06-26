@@ -54,10 +54,10 @@ type Monitor struct {
 	modelIDs     []string // 0x-prefixed lowercase hex bytes32
 	capabilities []string // advertised capability tokens, e.g. ["search"]
 	startedAt    time.Time
-	httpClient  *http.Client
-	logger      *slog.Logger
-	jobCounter  *atomic.Int32
-	maxJobs     int
+	httpClient   *http.Client
+	logger       *slog.Logger
+	jobCounter   *atomic.Int32
+	maxJobs      int
 	// metrics is optional — when nil the monitor still writes to Redis but
 	// does not update OllamaUp / HeartbeatLastEmit. Production constructs
 	// always pass non-nil; some tests pass nil to keep them focused.
@@ -179,16 +179,17 @@ func (m *Monitor) emit(ctx context.Context) error {
 
 	pipe := m.redisClient.TxPipeline()
 	pipe.HSet(ctx, key, map[string]interface{}{
-		pkgtypes.HBFieldLastHeartbeat: time.Now().Unix(),
-		pkgtypes.HBFieldActiveJobs:    activeJobs,
-		pkgtypes.HBFieldMaxJobs:       m.maxJobs,
-		pkgtypes.HBFieldLatencyMs:     0,
-		pkgtypes.HBFieldGPUUtil:       strconv.FormatFloat(0, 'f', -1, 64),
-		pkgtypes.HBFieldStatus:        pkgtypes.HeartbeatStatusActive,
-		pkgtypes.HBFieldModels:        string(modelsJSON),
-		pkgtypes.HBFieldOllamaStatus:  ollamaStatus,
-		pkgtypes.HBFieldUptime:        int64(time.Since(m.startedAt).Seconds()),
-		pkgtypes.HBFieldCapabilities:  string(capsJSON),
+		pkgtypes.HBFieldLastHeartbeat:   time.Now().Unix(),
+		pkgtypes.HBFieldActiveJobs:      activeJobs,
+		pkgtypes.HBFieldMaxJobs:         m.maxJobs,
+		pkgtypes.HBFieldLatencyMs:       0,
+		pkgtypes.HBFieldGPUUtil:         strconv.FormatFloat(0, 'f', -1, 64),
+		pkgtypes.HBFieldStatus:          pkgtypes.HeartbeatStatusActive,
+		pkgtypes.HBFieldModels:          string(modelsJSON),
+		pkgtypes.HBFieldOllamaStatus:    ollamaStatus,
+		pkgtypes.HBFieldUptime:          int64(time.Since(m.startedAt).Seconds()),
+		pkgtypes.HBFieldCapabilities:    string(capsJSON),
+		pkgtypes.HBFieldProtocolVersion: pkgtypes.WorkerProtocolVersion,
 	})
 	pipe.PExpire(ctx, key, ttl)
 
