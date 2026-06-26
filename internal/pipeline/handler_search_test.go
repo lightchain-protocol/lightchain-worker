@@ -43,7 +43,7 @@ func (r *recordingPublisher) PublishMetadata(_ context.Context, _, _ uint64, _ s
 	r.metadataAt = time.Now()
 }
 
-func (r *recordingPublisher) PublishResponse(_ context.Context, _, _ uint64, _ string, _ string, _ []byte) {
+func (r *recordingPublisher) PublishResponse(_ context.Context, _, _ uint64, _, _ string, _ []byte) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.responseCalled = true
@@ -58,8 +58,8 @@ func (r *recordingPublisher) PublishChunk(_ context.Context, _, _ uint64, _ stri
 
 // trackingOllama wraps mockOllama and records when Generate/Chat complete.
 type trackingOllama struct {
-	inner      *mockOllama
-	mu         sync.Mutex
+	inner       *mockOllama
+	mu          sync.Mutex
 	completedAt time.Time
 }
 
@@ -149,11 +149,14 @@ func TestStage45_MetadataEmittedAfterInference(t *testing.T) {
 	sessionKey := testSessionKey(t)
 	ecdhKey := testECDHKey(t)
 	encSessionKey := encryptSessionKeyForWorker(t, sessionKey, ecdhKey)
-	promptCiphertext := encryptBlob(t, sessionKey, "What is the capital of France?")
+	// Search flag now comes from the blob envelope; the fetcher must return the
+	// same envelope the direct blobData carries so both paths exercise search.
+	promptCiphertext, err := pkgcrypto.Encrypt(sessionKey, searchaug.EncodePrompt("What is the capital of France?", true))
+	require.NoError(t, err)
 
 	chain := &mockChainClient{
 		ackJobFn:          func(_ context.Context, _ uint64) error { return nil },
-		completeJobFn:     func(_ context.Context, _ uint64, _ [32]byte, _ [32]byte) error { return nil },
+		completeJobFn:     func(_ context.Context, _ uint64, _, _ [32]byte) error { return nil },
 		getEncWorkerKeyFn: func(_ context.Context, _ uint64) ([]byte, error) { return encSessionKey, nil },
 	}
 	fetcher := &mockBlobFetcher{fetchFn: func(_ context.Context, _ common.Hash, _ uint64) ([]byte, error) {
@@ -181,22 +184,22 @@ func TestStage45_MetadataEmittedAfterInference(t *testing.T) {
 			BlobTxTimeout:    60 * time.Second,
 			SearchMaxResults: 3,
 		},
-		rec,   // injected recording publisher
-		nil,   // no checkpoints
+		rec, // injected recording publisher
+		nil, // no checkpoints
 		testMetrics(t),
 		metrics.DeliveryAsynq,
 		&fakeSearcher{sources: twoSources()},
 	)
 
 	payload := testPayload(t)
-	payload.SearchEnabled = true
 
 	// Encrypt the session key into the keystore so stage 3 succeeds without chain
 	ks := newMockKeyStore()
 	ks.keys[payload.SessionID] = sessionKey
 	handler.keyStore = ks
 
-	blobData, err := pkgcrypto.Encrypt(sessionKey, []byte("What is the capital of France?"))
+	// Search flag now comes from the blob envelope, not the payload field.
+	blobData, err := pkgcrypto.Encrypt(sessionKey, searchaug.EncodePrompt("What is the capital of France?", true))
 	require.NoError(t, err)
 
 	_, err = handler.runInferencePipeline(
@@ -212,7 +215,8 @@ func TestStage45_MetadataEmittedAfterInference(t *testing.T) {
 	require.True(t, rec.metadataCalled, "sources must be published")
 	require.False(t, tracker.completedAt.IsZero(), "inference must have been called")
 
-	assert.True(t,
+	assert.True(
+		t,
 		!rec.metadataAt.Before(tracker.completedAt),
 		"PublishMetadata (at %v) must not happen before inference completed (at %v)",
 		rec.metadataAt, tracker.completedAt,
@@ -255,9 +259,11 @@ func TestStage5_StreamsChunks(t *testing.T) {
 	rec := &recordingPublisher{}
 
 	chain := &mockChainClient{
-		ackJobFn:          func(_ context.Context, _ uint64) error { return nil },
-		completeJobFn:     func(_ context.Context, _ uint64, _ [32]byte, _ [32]byte) error { return nil },
-		getEncWorkerKeyFn: func(_ context.Context, _ uint64) ([]byte, error) { return encryptSessionKeyForWorker(t, sessionKey, ecdhKey), nil },
+		ackJobFn:      func(_ context.Context, _ uint64) error { return nil },
+		completeJobFn: func(_ context.Context, _ uint64, _, _ [32]byte) error { return nil },
+		getEncWorkerKeyFn: func(_ context.Context, _ uint64) ([]byte, error) {
+			return encryptSessionKeyForWorker(t, sessionKey, ecdhKey), nil
+		},
 	}
 	fetcher := &mockBlobFetcher{fetchFn: func(_ context.Context, _ common.Hash, _ uint64) ([]byte, error) {
 		return encryptBlob(t, sessionKey, "test prompt"), nil
@@ -333,12 +339,16 @@ func TestStage6_EmitsEnvelopeForSearchJob(t *testing.T) {
 	rec := &recordingPublisher{}
 
 	chain := &mockChainClient{
-		ackJobFn:          func(_ context.Context, _ uint64) error { return nil },
-		completeJobFn:     func(_ context.Context, _ uint64, _ [32]byte, _ [32]byte) error { return nil },
-		getEncWorkerKeyFn: func(_ context.Context, _ uint64) ([]byte, error) { return encryptSessionKeyForWorker(t, sessionKey, ecdhKey), nil },
+		ackJobFn:      func(_ context.Context, _ uint64) error { return nil },
+		completeJobFn: func(_ context.Context, _ uint64, _, _ [32]byte) error { return nil },
+		getEncWorkerKeyFn: func(_ context.Context, _ uint64) ([]byte, error) {
+			return encryptSessionKeyForWorker(t, sessionKey, ecdhKey), nil
+		},
 	}
+	// Fetcher returns the same search envelope the direct blobData carries so
+	// both paths exercise the search-enabled branch.
 	fetcher := &mockBlobFetcher{fetchFn: func(_ context.Context, _ common.Hash, _ uint64) ([]byte, error) {
-		return encryptBlob(t, sessionKey, "what year is it?"), nil
+		return pkgcrypto.Encrypt(sessionKey, searchaug.EncodePrompt("what year is it?", true))
 	}}
 	submitter := &mockBlobSubmitter{submitFn: func(_ context.Context, _ []byte) ([][32]byte, error) {
 		return [][32]byte{{0x01}}, nil
@@ -364,12 +374,12 @@ func TestStage6_EmitsEnvelopeForSearchJob(t *testing.T) {
 	)
 
 	payload := testPayload(t)
-	payload.SearchEnabled = true
 	ks := newMockKeyStore()
 	ks.keys[payload.SessionID] = sessionKey
 	handler.keyStore = ks
 
-	blobData, err := pkgcrypto.Encrypt(sessionKey, []byte("what year is it?"))
+	// Search flag now comes from the blob envelope, not the payload field.
+	blobData, err := pkgcrypto.Encrypt(sessionKey, searchaug.EncodePrompt("what year is it?", true))
 	require.NoError(t, err)
 
 	ct, err := handler.runInferencePipeline(
@@ -407,9 +417,11 @@ func TestStage6_RawAnswerForNonSearchJob(t *testing.T) {
 	rec := &recordingPublisher{}
 
 	chain := &mockChainClient{
-		ackJobFn:          func(_ context.Context, _ uint64) error { return nil },
-		completeJobFn:     func(_ context.Context, _ uint64, _ [32]byte, _ [32]byte) error { return nil },
-		getEncWorkerKeyFn: func(_ context.Context, _ uint64) ([]byte, error) { return encryptSessionKeyForWorker(t, sessionKey, ecdhKey), nil },
+		ackJobFn:      func(_ context.Context, _ uint64) error { return nil },
+		completeJobFn: func(_ context.Context, _ uint64, _, _ [32]byte) error { return nil },
+		getEncWorkerKeyFn: func(_ context.Context, _ uint64) ([]byte, error) {
+			return encryptSessionKeyForWorker(t, sessionKey, ecdhKey), nil
+		},
 	}
 	fetcher := &mockBlobFetcher{fetchFn: func(_ context.Context, _ common.Hash, _ uint64) ([]byte, error) {
 		return encryptBlob(t, sessionKey, "hello"), nil
@@ -496,7 +508,7 @@ func TestBuildConversationHistory_DecodesV2EnvelopeToAnswer(t *testing.T) {
 
 	chain := &mockChainClient{
 		ackJobFn:      func(_ context.Context, _ uint64) error { return nil },
-		completeJobFn: func(_ context.Context, _ uint64, _ [32]byte, _ [32]byte) error { return nil },
+		completeJobFn: func(_ context.Context, _ uint64, _, _ [32]byte) error { return nil },
 		getEncWorkerKeyFn: func(_ context.Context, _ uint64) ([]byte, error) {
 			return encryptSessionKeyForWorker(t, sessionKey, ecdhKey), nil
 		},
@@ -552,6 +564,27 @@ func TestBuildConversationHistory_DecodesV2EnvelopeToAnswer(t *testing.T) {
 	// Must be the decoded answer, not the raw envelope JSON.
 	assert.Equal(t, priorAnswer, assistantMsg.Content,
 		"assistant Content must be the decoded answer, not the raw v2 envelope JSON")
+}
+
+// TestDecodePromptDrivesSearch verifies the searchaug.DecodePrompt contract
+// that the handler now depends on: a search envelope enables search and unwraps
+// the text, while raw bytes return (text, false, nil).
+func TestDecodePromptDrivesSearch(t *testing.T) {
+	// search envelope → searcher invoked, prompt unwrapped
+	p, s, err := searchaug.DecodePrompt(searchaug.EncodePrompt("find news", true))
+	if err != nil || p != "find news" || !s {
+		t.Fatalf("got (%q,%v,%v)", p, s, err)
+	}
+	// raw text → no search
+	p2, s2, _ := searchaug.DecodePrompt([]byte("plain"))
+	if p2 != "plain" || s2 {
+		t.Fatalf("raw text must not enable search, got (%q,%v)", p2, s2)
+	}
+	// 0x00-sentinel but invalid JSON → hard error (the handler returns a wrapped
+	// stage-4 failure rather than feeding NUL+garbage to the model).
+	if _, _, decErr := searchaug.DecodePrompt([]byte{0x00, '{', 'x'}); decErr == nil {
+		t.Fatalf("malformed envelope must return a non-nil error")
+	}
 }
 
 // TestRelayCompleteCiphertext verifies that relayCompleteCiphertext strips the
