@@ -490,6 +490,31 @@ func TestLoad_JobExecutionOverrides(t *testing.T) {
 	assert.Equal(t, 5*time.Second, cfg.ReceiptPollInterval)
 }
 
+func TestLoad_SearchDefaults(t *testing.T) {
+	validEnv(t)
+	t.Setenv("WORKER_KEYSTORE_PATH", "/tmp/k")
+	t.Setenv("WORKER_KEYSTORE_PASSWORD", "p")
+	// SEARCH_* unset → search disabled, sane defaults.
+	cfg, err := Load()
+	require.NoError(t, err)
+	assert.False(t, cfg.SearchEnabled)
+	assert.Equal(t, "https://api.tavily.com", cfg.TavilyURL)
+	assert.Equal(t, 10*time.Second, cfg.SearchTimeout)
+	assert.Equal(t, 5, cfg.SearchMaxResults)
+}
+
+func TestLoad_SearchEnabled(t *testing.T) {
+	validEnv(t)
+	t.Setenv("WORKER_KEYSTORE_PATH", "/tmp/k")
+	t.Setenv("WORKER_KEYSTORE_PASSWORD", "p")
+	t.Setenv("SEARCH_ENABLED", "true")
+	t.Setenv("TAVILY_API_KEY", "tvly-xxx")
+	cfg, err := Load()
+	require.NoError(t, err)
+	assert.True(t, cfg.SearchEnabled)
+	assert.Equal(t, "tvly-xxx", cfg.TavilyAPIKey)
+}
+
 func TestValidate_JobRegistryZeroAddress(t *testing.T) {
 	validEnv(t)
 	t.Setenv("WORKER_KEYSTORE_PATH", "/tmp/keystore.json")

@@ -2,6 +2,7 @@
 package ollama
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
@@ -12,11 +13,28 @@ import (
 	"time"
 )
 
+// deterministicSeed is the fixed random seed sent to Ollama alongside temperature=0.
+// Both the worker (original execution) and the disputer (re-execution) use the same
+// seed so that greedy decoding is maximally reproducible across both services.
+const deterministicSeed = 42
+
+// Options controls Ollama model sampling behaviour.
+// Temperature 0 selects the highest-probability token at every step (greedy decoding),
+// making inference deterministic. Seed pins any residual nondeterminism.
+// NOTE: Temperature has NO omitempty tag — the zero value must be serialised as
+// "temperature":0, not omitted (an omitted field lets Ollama fall back to its default
+// of 0.8, which reintroduces randomness).
+type Options struct {
+	Temperature float64 `json:"temperature"`
+	Seed        int     `json:"seed"`
+}
+
 // GenerateRequest is the JSON body sent to POST /api/generate.
 type GenerateRequest struct {
-	Model  string `json:"model"`
-	Prompt string `json:"prompt"`
-	Stream bool   `json:"stream"`
+	Model   string  `json:"model"`
+	Prompt  string  `json:"prompt"`
+	Stream  bool    `json:"stream"`
+	Options Options `json:"options"`
 }
 
 // GenerateResponse is the JSON body returned from POST /api/generate (stream=false).
@@ -37,6 +55,7 @@ type ChatRequest struct {
 	Model    string        `json:"model"`
 	Messages []ChatMessage `json:"messages"`
 	Stream   bool          `json:"stream"`
+	Options  Options       `json:"options"`
 }
 
 // ChatResponse is the JSON body returned from POST /api/chat (stream=false).
@@ -76,9 +95,10 @@ func NewOllamaClient(baseURL string, timeout time.Duration) *OllamaClient {
 // Uses stream=false mode for batch inference (DD-W-1).
 func (c *OllamaClient) Generate(ctx context.Context, model, prompt string) (string, error) {
 	reqBody := GenerateRequest{
-		Model:  model,
-		Prompt: prompt,
-		Stream: false,
+		Model:   model,
+		Prompt:  prompt,
+		Stream:  false,
+		Options: Options{Temperature: 0, Seed: deterministicSeed},
 	}
 
 	data, err := json.Marshal(reqBody)
@@ -122,6 +142,7 @@ func (c *OllamaClient) Chat(ctx context.Context, model string, messages []ChatMe
 		Model:    model,
 		Messages: messages,
 		Stream:   false,
+		Options:  Options{Temperature: 0, Seed: deterministicSeed},
 	}
 
 	data, err := json.Marshal(reqBody)
@@ -156,6 +177,122 @@ func (c *OllamaClient) Chat(ctx context.Context, model string, messages []ChatMe
 	}
 
 	return chatResp.Message.Content, nil
+}
+
+// GenerateStream sends a prompt to the Ollama server with stream=true, calling
+// onDelta for each non-empty token chunk. Returns the full accumulated response.
+func (c *OllamaClient) GenerateStream(ctx context.Context, model, prompt string, onDelta func(string)) (string, error) {
+	reqBody := GenerateRequest{
+		Model:   model,
+		Prompt:  prompt,
+		Stream:  true,
+		Options: Options{Temperature: 0, Seed: deterministicSeed},
+	}
+
+	data, err := json.Marshal(reqBody)
+	if err != nil {
+		return "", fmt.Errorf("marshal generate stream request: %w", err)
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+"/api/generate", bytes.NewReader(data))
+	if err != nil {
+		return "", fmt.Errorf("create generate stream request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("ollama generate stream request: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return "", fmt.Errorf("ollama generate stream returned status %d: %s", resp.StatusCode, string(body))
+	}
+
+	var full strings.Builder
+	scanner := bufio.NewScanner(resp.Body)
+	for scanner.Scan() {
+		line := scanner.Bytes()
+		if len(line) == 0 {
+			continue
+		}
+		var chunk GenerateResponse
+		if err := json.Unmarshal(line, &chunk); err != nil {
+			return "", fmt.Errorf("unmarshal generate stream chunk: %w", err)
+		}
+		if chunk.Response != "" {
+			onDelta(chunk.Response)
+			full.WriteString(chunk.Response)
+		}
+		if chunk.Done {
+			break
+		}
+	}
+	if err := scanner.Err(); err != nil {
+		return "", fmt.Errorf("read generate stream: %w", err)
+	}
+
+	return full.String(), nil
+}
+
+// ChatStream sends a multi-turn conversation to the Ollama server with stream=true,
+// calling onDelta for each non-empty token chunk. Returns the full accumulated response.
+func (c *OllamaClient) ChatStream(ctx context.Context, model string, messages []ChatMessage, onDelta func(string)) (string, error) {
+	reqBody := ChatRequest{
+		Model:    model,
+		Messages: messages,
+		Stream:   true,
+		Options:  Options{Temperature: 0, Seed: deterministicSeed},
+	}
+
+	data, err := json.Marshal(reqBody)
+	if err != nil {
+		return "", fmt.Errorf("marshal chat stream request: %w", err)
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+"/api/chat", bytes.NewReader(data))
+	if err != nil {
+		return "", fmt.Errorf("create chat stream request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("ollama chat stream request: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return "", fmt.Errorf("ollama chat stream returned status %d: %s", resp.StatusCode, string(body))
+	}
+
+	var full strings.Builder
+	scanner := bufio.NewScanner(resp.Body)
+	for scanner.Scan() {
+		line := scanner.Bytes()
+		if len(line) == 0 {
+			continue
+		}
+		var chunk ChatResponse
+		if err := json.Unmarshal(line, &chunk); err != nil {
+			return "", fmt.Errorf("unmarshal chat stream chunk: %w", err)
+		}
+		if chunk.Message.Content != "" {
+			onDelta(chunk.Message.Content)
+			full.WriteString(chunk.Message.Content)
+		}
+		if chunk.Done {
+			break
+		}
+	}
+	if err := scanner.Err(); err != nil {
+		return "", fmt.Errorf("read chat stream: %w", err)
+	}
+
+	return full.String(), nil
 }
 
 // VerifyModels checks that all required models are loaded on the Ollama server.

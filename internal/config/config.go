@@ -48,6 +48,15 @@ type Config struct {
 	OllamaURL     string
 	OllamaTimeout time.Duration
 
+	// Web search (Tavily). SearchEnabled gates advertisement of the "search"
+	// capability and the per-job search stage. When false the worker behaves
+	// exactly as before.
+	SearchEnabled    bool
+	TavilyAPIKey     string
+	TavilyURL        string
+	SearchTimeout    time.Duration
+	SearchMaxResults int
+
 	// Beacon API (CL node)
 	BeaconAPIURL string
 
@@ -166,6 +175,8 @@ func Load() (*Config, error) {
 		RedisURL:               envOrDefault("REDIS_URL", "redis://localhost:6379"),
 		RedisPassword:          os.Getenv("REDIS_PASSWORD"),
 		OllamaURL:              envOrDefault("OLLAMA_URL", "http://localhost:11434"),
+		TavilyAPIKey:           os.Getenv("TAVILY_API_KEY"),
+		TavilyURL:              envOrDefault("TAVILY_URL", "https://api.tavily.com"),
 		BeaconAPIURL:           envOrDefault("BEACON_API_URL", "http://localhost:3500"),
 		SessionKeyFile:         envOrDefault("SESSION_KEY_FILE", "data/session-keys.enc"),
 		WorkerGatewayURL:       os.Getenv("WORKER_GATEWAY_URL"),
@@ -275,6 +286,9 @@ func Load() (*Config, error) {
 		errs = append(errs, fmt.Sprintf("LIGHTCHAIN_DRAIN_SLACK: must be >= 0, got %s", cfg.DrainSlack))
 	}
 	cfg.OllamaTimeout = parseDuration("OLLAMA_TIMEOUT", "120s", &errs)
+	cfg.SearchEnabled = parseBool("SEARCH_ENABLED", false, &errs)
+	cfg.SearchTimeout = parseDuration("SEARCH_TIMEOUT", "10s", &errs)
+	cfg.SearchMaxResults = parseInt("SEARCH_MAX_RESULTS", 5, &errs)
 	cfg.AckTxTimeout = parseDuration("ACK_TX_TIMEOUT", "15s", &errs)
 	// BlobTxTimeout bounds stage 8 (submit_blob): slot wait + SendTransaction
 	// + WaitMined. Default 90s = ~15 blocks at 6s block time, generous buffer
@@ -366,6 +380,17 @@ func (c *Config) Validate() []string {
 	}
 	if c.OllamaTimeout <= 0 {
 		errs = append(errs, "OLLAMA_TIMEOUT must be positive")
+	}
+	if c.SearchEnabled {
+		if c.TavilyAPIKey == "" {
+			errs = append(errs, "TAVILY_API_KEY is required when SEARCH_ENABLED=true")
+		}
+		if c.SearchTimeout <= 0 {
+			errs = append(errs, "SEARCH_TIMEOUT must be positive")
+		}
+		if c.SearchMaxResults <= 0 {
+			errs = append(errs, "SEARCH_MAX_RESULTS must be positive")
+		}
 	}
 	if c.AckTxTimeout <= 0 {
 		errs = append(errs, "ACK_TX_TIMEOUT must be positive")
