@@ -40,6 +40,7 @@ type ChainClient struct {
 	aiConfig        *bindings.AIConfig
 	jobRegistry     *bindings.JobRegistry
 	jobRegistryAddr common.Address
+	sessionManager  *bindings.SessionManager
 	signingKey      *ecdsa.PrivateKey
 	workerAddr      common.Address
 	chainID         *big.Int
@@ -81,6 +82,7 @@ func NewChainClient(
 	registryAddr common.Address,
 	aiConfigAddr common.Address,
 	jobRegistryAddr common.Address,
+	sessionManagerAddr common.Address,
 	signingKey *ecdsa.PrivateKey,
 	gasMulBps int,
 	coordinator *SubpoolCoordinator,
@@ -122,6 +124,15 @@ func NewChainClient(
 		}
 	}
 
+	var sessMgr *bindings.SessionManager
+	if sessionManagerAddr != (common.Address{}) {
+		sessMgr, err = bindings.NewSessionManager(sessionManagerAddr, client)
+		if err != nil {
+			client.Close()
+			return nil, fmt.Errorf("bind SessionManager at %s: %w", sessionManagerAddr.Hex(), err)
+		}
+	}
+
 	workerAddr := crypto.PubkeyToAddress(signingKey.PublicKey)
 	nonceMgr := NewNonceManager(client, workerAddr)
 
@@ -132,6 +143,7 @@ func NewChainClient(
 		aiConfig:        aiCfg,
 		jobRegistry:     jobReg,
 		jobRegistryAddr: jobRegistryAddr,
+		sessionManager:  sessMgr,
 		signingKey:      signingKey,
 		workerAddr:      workerAddr,
 		chainID:         big.NewInt(chainID),
@@ -378,6 +390,37 @@ func (c *ChainClient) requireJobRegistry() error {
 		return fmt.Errorf("jobRegistry not configured: zero jobRegistryAddr was provided to NewChainClient")
 	}
 	return nil
+}
+
+// requireSessionManager returns an error if the sessionManager binding is nil.
+// All sortition-facing methods must call this before dereferencing c.sessionManager.
+func (c *ChainClient) requireSessionManager() error {
+	if c.sessionManager == nil {
+		return fmt.Errorf("session manager binding not configured")
+	}
+	return nil
+}
+
+// ClaimSession sends a claimSession tx for the given request id (sortition claim).
+func (c *ChainClient) ClaimSession(ctx context.Context, reqID uint64) error {
+	if err := c.requireSessionManager(); err != nil {
+		return err
+	}
+	return c.submitPreparedTx(ctx, "ClaimSession", nil, func(opts *bind.TransactOpts) (*types.Transaction, error) {
+		return c.sessionManager.ClaimSession(opts, new(big.Int).SetUint64(reqID))
+	})
+}
+
+// EligibleNow returns whether `worker` currently clears the sortition threshold for the request.
+func (c *ChainClient) EligibleNow(ctx context.Context, reqID uint64, worker common.Address) (bool, error) {
+	if err := c.requireSessionManager(); err != nil {
+		return false, err
+	}
+	ok, err := c.sessionManager.EligibleNow(&bind.CallOpts{Context: ctx}, new(big.Int).SetUint64(reqID), worker)
+	if err != nil {
+		return false, fmt.Errorf("eligibleNow req %d worker %s: %w", reqID, worker.Hex(), err)
+	}
+	return ok, nil
 }
 
 // AcknowledgeJob submits an acknowledgeJob transaction for the given job ID.

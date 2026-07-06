@@ -221,6 +221,7 @@ func New(cfg *config.Config) (*Service, error) {
 		cfg.WorkerRegistryAddress,
 		cfg.AIConfigAddress,
 		cfg.JobRegistryAddress,
+		cfg.SessionManagerAddress,
 		signingKey,
 		cfg.GasPriceMultiplierBps,
 		coordinator,

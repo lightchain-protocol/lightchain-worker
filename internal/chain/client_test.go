@@ -432,3 +432,23 @@ func (e mockRPCError) Error() string {
 func (e mockRPCError) ErrorCode() int {
 	return e.code
 }
+
+// TestChainClient_ClaimSession_NoBindingErrors verifies that a ChainClient
+// without a SessionManager binding returns an error rather than panicking.
+func TestChainClient_ClaimSession_NoBindingErrors(t *testing.T) {
+	t.Parallel()
+	c := &ChainClient{}
+	err := c.ClaimSession(context.Background(), 1)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "session manager binding not configured")
+}
+
+// TestChainClient_EligibleNow_NoBindingErrors verifies that a ChainClient
+// without a SessionManager binding returns an error rather than panicking.
+func TestChainClient_EligibleNow_NoBindingErrors(t *testing.T) {
+	t.Parallel()
+	c := &ChainClient{}
+	_, err := c.EligibleNow(context.Background(), 1, common.Address{})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "session manager binding not configured")
+}

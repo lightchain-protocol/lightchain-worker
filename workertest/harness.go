@@ -410,6 +410,7 @@ func NewRealChainClient(t testing.TB, opts RealChainClientOptions) ChainClient {
 		opts.WorkerRegistryAddress,
 		opts.AIConfigAddress,
 		opts.JobRegistryAddress,
+		common.Address{}, // sessionManagerAddr: not used in test harness
 		opts.SigningKey,
 		opts.GasPriceMultiplierBps,
 		workerchain.NewSubpoolCoordinator(nil, 0),

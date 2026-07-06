@@ -400,6 +400,7 @@ func tryDialChain(cfg *config.RegistrationConfig, signingKey *ecdsa.PrivateKey, 
 		cfg.WorkerRegistryAddress,
 		cfg.AIConfigAddress,
 		cfg.JobRegistryAddress,
+		common.Address{}, // sessionManagerAddr: CLI does not use sortition
 		signingKey,
 		cfg.GasPriceMultiplierBps,
 		chain.NewSubpoolCoordinator(logger, 0),
@@ -581,6 +582,7 @@ func dialChain(cfg *config.RegistrationConfig, signingKey *ecdsa.PrivateKey, log
 		cfg.WorkerRegistryAddress,
 		cfg.AIConfigAddress,
 		cfg.JobRegistryAddress,
+		common.Address{}, // sessionManagerAddr: CLI does not use sortition
 		signingKey,
 		cfg.GasPriceMultiplierBps,
 		// CLI is single-threaded — no concurrent broadcasts possible, so
