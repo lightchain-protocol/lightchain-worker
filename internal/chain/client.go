@@ -748,3 +748,122 @@ func (c *ChainClient) FilterJobCompleted(
 	}
 	return events, nil
 }
+
+// SessionRequestedEvent is the decoded view of the on-chain SessionRequested
+// log. ReqID and ModelID use Go-idiomatic casing even though the abigen struct
+// uses ReqId/ModelId.
+type SessionRequestedEvent struct {
+	ReqID        uint64
+	User         common.Address
+	ModelID      [32]byte
+	RequestBlock uint64
+	BlockNumber  uint64
+}
+
+// JobSubmittedEvent is the decoded view of the on-chain JobSubmitted log.
+type JobSubmittedEvent struct {
+	JobID       uint64
+	SessionID   uint64
+	Worker      common.Address
+	BlockNumber uint64
+}
+
+// SessionInfo is a trimmed view of IJobRegistrySession returned by GetSession.
+type SessionInfo struct {
+	User    common.Address
+	ModelID [32]byte
+	Worker  common.Address
+	Status  uint8
+}
+
+// FilterSessionRequested returns all SessionRequested events emitted by the
+// SessionManager contract in [fromBlock, toBlock] (both inclusive). No indexed
+// filter is applied — the caller is expected to further filter by reqId/user/modelId
+// as needed.
+func (c *ChainClient) FilterSessionRequested(ctx context.Context, fromBlock, toBlock uint64) ([]SessionRequestedEvent, error) {
+	if err := c.requireSessionManager(); err != nil {
+		return nil, err
+	}
+	if toBlock < fromBlock {
+		return nil, fmt.Errorf("FilterSessionRequested: toBlock %d < fromBlock %d", toBlock, fromBlock)
+	}
+	end := toBlock
+	opts := &bind.FilterOpts{Context: ctx, Start: fromBlock, End: &end}
+	iter, err := c.sessionManager.FilterSessionRequested(opts, nil, nil, nil)
+	if err != nil {
+		return nil, fmt.Errorf("filter SessionRequested [%d,%d]: %w", fromBlock, toBlock, err)
+	}
+	defer iter.Close()
+	var out []SessionRequestedEvent
+	for iter.Next() {
+		ev := iter.Event
+		if ev == nil || ev.ReqId == nil {
+			continue
+		}
+		out = append(out, SessionRequestedEvent{
+			ReqID:        ev.ReqId.Uint64(),
+			User:         ev.User,
+			ModelID:      ev.ModelId,
+			RequestBlock: ev.RequestBlock.Uint64(),
+			BlockNumber:  ev.Raw.BlockNumber,
+		})
+	}
+	if err := iter.Error(); err != nil {
+		return nil, fmt.Errorf("iterate SessionRequested [%d,%d]: %w", fromBlock, toBlock, err)
+	}
+	return out, nil
+}
+
+// FilterJobSubmitted returns all JobSubmitted events in [fromBlock, toBlock]
+// (both inclusive). No indexed filter is applied — callers that need only jobs
+// for a specific worker must filter the returned slice themselves.
+func (c *ChainClient) FilterJobSubmitted(ctx context.Context, fromBlock, toBlock uint64) ([]JobSubmittedEvent, error) {
+	if err := c.requireJobRegistry(); err != nil {
+		return nil, err
+	}
+	if toBlock < fromBlock {
+		return nil, fmt.Errorf("FilterJobSubmitted: toBlock %d < fromBlock %d", toBlock, fromBlock)
+	}
+	end := toBlock
+	opts := &bind.FilterOpts{Context: ctx, Start: fromBlock, End: &end}
+	iter, err := c.jobRegistry.FilterJobSubmitted(opts, nil, nil)
+	if err != nil {
+		return nil, fmt.Errorf("filter JobSubmitted [%d,%d]: %w", fromBlock, toBlock, err)
+	}
+	defer iter.Close()
+	var out []JobSubmittedEvent
+	for iter.Next() {
+		ev := iter.Event
+		if ev == nil || ev.JobId == nil {
+			continue
+		}
+		out = append(out, JobSubmittedEvent{
+			JobID:       ev.JobId.Uint64(),
+			SessionID:   ev.SessionId.Uint64(),
+			Worker:      ev.Worker,
+			BlockNumber: ev.Raw.BlockNumber,
+		})
+	}
+	if err := iter.Error(); err != nil {
+		return nil, fmt.Errorf("iterate JobSubmitted [%d,%d]: %w", fromBlock, toBlock, err)
+	}
+	return out, nil
+}
+
+// GetSessionInfo fetches session metadata for the given session ID from the
+// JobRegistry. Only the fields needed by the sortition watcher are returned.
+func (c *ChainClient) GetSessionInfo(ctx context.Context, sessionID uint64) (SessionInfo, error) {
+	if err := c.requireJobRegistry(); err != nil {
+		return SessionInfo{}, err
+	}
+	s, err := c.jobRegistry.GetSession(&bind.CallOpts{Context: ctx}, new(big.Int).SetUint64(sessionID))
+	if err != nil {
+		return SessionInfo{}, fmt.Errorf("GetSession %d: %w", sessionID, err)
+	}
+	return SessionInfo{
+		User:    s.User,
+		ModelID: s.ModelId,
+		Worker:  s.Worker,
+		Status:  s.Status,
+	}, nil
+}

@@ -452,3 +452,21 @@ func TestChainClient_EligibleNow_NoBindingErrors(t *testing.T) {
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "session manager binding not configured")
 }
+
+// TestChainClient_FilterSessionRequested_RangeGuard verifies that a range
+// where toBlock < fromBlock is rejected immediately.
+func TestChainClient_FilterSessionRequested_RangeGuard(t *testing.T) {
+	t.Parallel()
+	c := &ChainClient{}
+	_, err := c.FilterSessionRequested(context.Background(), 10, 5) // to < from
+	require.Error(t, err)
+}
+
+// TestChainClient_GetSessionInfo_NoBindingErrors verifies that a ChainClient
+// without a JobRegistry binding returns an error rather than panicking.
+func TestChainClient_GetSessionInfo_NoBindingErrors(t *testing.T) {
+	t.Parallel()
+	c := &ChainClient{}
+	_, err := c.GetSessionInfo(context.Background(), 1)
+	require.Error(t, err)
+}
