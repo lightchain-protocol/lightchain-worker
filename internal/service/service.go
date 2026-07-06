@@ -566,19 +566,24 @@ func New(cfg *config.Config) (*Service, error) {
 
 	// --- Direct Redis mode (default) ---
 
-	// Asynq server — listens on worker-specific queue
-	// Queue name must match dispatcher's workerQueueName(): "worker:{lowercase_hex_with_0x}"
-	queueName := fmt.Sprintf("worker:%s", strings.ToLower(workerAddr.Hex()))
-	asynqSrv := asynq.NewServer(
-		asynqRedisClientOptFromRedisOptions(redisOpts),
-		asynq.Config{
-			Concurrency: cfg.MaxConcurrentJobs,
-			Queues:      map[string]int{queueName: 1},
-		},
-	)
-
-	mux := asynq.NewServeMux()
-	mux.HandleFunc(pipeline.TaskTypeJobInference, handler.HandleTask)
+	// Asynq server — listens on worker-specific queue. Not constructed in
+	// sortition mode; asynqSrv stays nil so the shutdown nil-guard holds.
+	var asynqSrv *asynq.Server
+	var mux *asynq.ServeMux
+	var queueName string
+	if !cfg.SortitionEnabled {
+		// Queue name must match dispatcher's workerQueueName(): "worker:{lowercase_hex_with_0x}"
+		queueName = fmt.Sprintf("worker:%s", strings.ToLower(workerAddr.Hex()))
+		asynqSrv = asynq.NewServer(
+			asynqRedisClientOptFromRedisOptions(redisOpts),
+			asynq.Config{
+				Concurrency: cfg.MaxConcurrentJobs,
+				Queues:      map[string]int{queueName: 1},
+			},
+		)
+		mux = asynq.NewServeMux()
+		mux.HandleFunc(pipeline.TaskTypeJobInference, handler.HandleTask)
+	}
 
 	// Heartbeat monitor — shared job counter for dynamic ActiveJobs/MaxJobs
 	monitorCfg := heartbeat.MonitorConfig{
@@ -639,8 +644,8 @@ func New(cfg *config.Config) (*Service, error) {
 	// Construct the chain-watcher pair when SortitionEnabled. Both watchers share
 	// a single CursorStore (dir-backed), the shared jobCounter, and the pipeline
 	// handler as their job sink. Gateway/direct paths above are skipped when
-	// SortitionEnabled is true, so asynq and gwClient remain nil and Run will
-	// dispatch to runSortitionMode instead.
+	// SortitionEnabled is true; asynqSrv is nil (gated above) and gwClient is
+	// nil, so Run dispatches to runSortitionMode instead.
 	var sessionWatcher *sortition.SessionWatcher
 	var jobWatcher *sortition.JobWatcher
 	if cfg.SortitionEnabled {
@@ -1075,7 +1080,7 @@ func (s *Service) shutdown(ctx context.Context) error {
 		}
 	}
 
-	// Stop Asynq server — waits for in-flight jobs (nil in gateway mode)
+	// Stop Asynq server — waits for in-flight jobs (nil in gateway and sortition modes)
 	if s.asynqServer != nil {
 		s.asynqServer.Shutdown()
 	}
