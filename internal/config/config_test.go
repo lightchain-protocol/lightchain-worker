@@ -5,6 +5,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/ethereum/go-ethereum/common"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -25,6 +26,10 @@ var allEnvKeys = []string{
 	"SHUTDOWN_TIMEOUT",
 	"LIGHTCHAIN_DRAIN_TTL", "LIGHTCHAIN_DRAIN_SLACK",
 	"LOG_LEVEL", "LOG_FORMAT",
+	// Sortition mode (Phase 3)
+	"SORTITION_ENABLED", "SESSION_MANAGER_ADDRESS",
+	"SORTITION_STATE_DIR", "SORTITION_CHUNK_SIZE",
+	"SORTITION_POLL_INTERVAL", "SORTITION_CONFIRMATIONS",
 }
 
 // clearEnv ensures all config-related env vars are unset before each test.
@@ -531,4 +536,77 @@ func TestValidate_JobRegistryZeroAddress(t *testing.T) {
 		combined += e + " "
 	}
 	assert.Contains(t, combined, "JOB_REGISTRY_ADDRESS must be a non-zero address")
+}
+
+// loadValidConfig sets the minimal required env, overlays extras, calls Load(), and
+// returns the result. Fails the test if Load() returns an error.
+func loadValidConfig(t *testing.T, extra map[string]string) *Config {
+	t.Helper()
+	validEnv(t)
+	t.Setenv("WORKER_KEYSTORE_PATH", "/tmp/keystore.json")
+	t.Setenv("WORKER_KEYSTORE_PASSWORD", "secret")
+	for k, v := range extra {
+		t.Setenv(k, v)
+	}
+	cfg, err := Load()
+	require.NoError(t, err)
+	return cfg
+}
+
+// requireConfigError sets the minimal required env, overlays extras, calls Load(),
+// and asserts a Load-time error containing wantSubstr.
+func requireConfigError(t *testing.T, extra map[string]string, wantSubstr string) {
+	t.Helper()
+	validEnv(t)
+	t.Setenv("WORKER_KEYSTORE_PATH", "/tmp/keystore.json")
+	t.Setenv("WORKER_KEYSTORE_PASSWORD", "secret")
+	for k, v := range extra {
+		t.Setenv(k, v)
+	}
+	_, err := Load()
+	// If Load() passes, check Validate() for cross-field errors
+	if err == nil {
+		cfg, loadErr := Load()
+		require.NoError(t, loadErr)
+		errs := cfg.Validate()
+		combined := ""
+		for _, e := range errs {
+			combined += e + " "
+		}
+		require.Contains(t, combined, wantSubstr,
+			"expected config error containing %q but Validate() returned: %v", wantSubstr, errs)
+		return
+	}
+	require.Error(t, err)
+	require.Contains(t, err.Error(), wantSubstr)
+}
+
+func TestConfig_SortitionDefaults(t *testing.T) {
+	cfg := loadValidConfig(t, map[string]string{})
+	require.False(t, cfg.SortitionEnabled)
+	require.Equal(t, common.Address{}, cfg.SessionManagerAddress)
+	require.Equal(t, "data/sortition-state", cfg.SortitionStateDir)
+	require.Equal(t, uint64(5000), cfg.SortitionChunkSize)
+	require.Equal(t, 4*time.Second, cfg.SortitionPollInterval)
+	require.Equal(t, uint64(0), cfg.SortitionConfirmations)
+}
+
+func TestConfig_SortitionEnabled_RequiresSessionManager(t *testing.T) {
+	// Enabling sortition without SESSION_MANAGER_ADDRESS must be a config error.
+	requireConfigError(t, map[string]string{
+		"SORTITION_ENABLED": "true",
+	}, "SESSION_MANAGER_ADDRESS")
+}
+
+func TestConfig_SortitionEnabled_Parses(t *testing.T) {
+	cfg := loadValidConfig(t, map[string]string{
+		"SORTITION_ENABLED":       "true",
+		"SESSION_MANAGER_ADDRESS": "0x000000000000000000000000000000000000dEaD",
+		"SORTITION_POLL_INTERVAL": "2s",
+		"SORTITION_CHUNK_SIZE":    "1000",
+	})
+	require.True(t, cfg.SortitionEnabled)
+	require.Equal(t, common.HexToAddress("0x000000000000000000000000000000000000dEaD"), cfg.SessionManagerAddress)
+	require.Equal(t, 2*time.Second, cfg.SortitionPollInterval)
+	require.Equal(t, uint64(1000), cfg.SortitionChunkSize)
 }

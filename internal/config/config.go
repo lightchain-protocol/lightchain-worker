@@ -159,6 +159,14 @@ type Config struct {
 	ReleaseDisputeWindowOverride time.Duration
 	ReleaseDisputeWindowCacheTTL time.Duration
 
+	// Sortition mode (Phase 3 — worker self-claims sessions, no dispatcher).
+	SortitionEnabled      bool
+	SessionManagerAddress common.Address
+	SortitionStateDir     string
+	SortitionChunkSize    uint64
+	SortitionPollInterval time.Duration
+	SortitionConfirmations uint64
+
 	// Logging
 	LogLevel  string
 	LogFormat string
@@ -332,6 +340,22 @@ func Load() (*Config, error) {
 	cfg.ReleaseDisputeWindowOverride = parseDuration("RELEASE_DISPUTE_WINDOW_OVERRIDE", "0s", &errs)
 	cfg.ReleaseDisputeWindowCacheTTL = parseDuration("RELEASE_DISPUTE_WINDOW_CACHE_TTL", "15m", &errs)
 
+	// Sortition mode (Phase 3 — worker self-claims sessions, no dispatcher).
+	cfg.SortitionEnabled = parseBool("SORTITION_ENABLED", false, &errs)
+	smStr := os.Getenv("SESSION_MANAGER_ADDRESS")
+	switch {
+	case smStr == "":
+		// optional unless sortition enabled (checked in Validate)
+	case !common.IsHexAddress(smStr):
+		errs = append(errs, fmt.Sprintf("SESSION_MANAGER_ADDRESS: invalid hex address %q", smStr))
+	default:
+		cfg.SessionManagerAddress = common.HexToAddress(smStr)
+	}
+	cfg.SortitionStateDir = envOrDefault("SORTITION_STATE_DIR", "data/sortition-state")
+	cfg.SortitionChunkSize = parseUint64("SORTITION_CHUNK_SIZE", 5000, &errs)
+	cfg.SortitionPollInterval = parseDuration("SORTITION_POLL_INTERVAL", "4s", &errs)
+	cfg.SortitionConfirmations = parseUint64("SORTITION_CONFIRMATIONS", 0, &errs)
+
 	if len(errs) > 0 {
 		return nil, fmt.Errorf("config load errors:\n  - %s", strings.Join(errs, "\n  - "))
 	}
@@ -467,6 +491,11 @@ func (c *Config) Validate() []string {
 		if c.ReleaseDisputeWindowCacheTTL < 0 {
 			errs = append(errs, "RELEASE_DISPUTE_WINDOW_CACHE_TTL must be ≥ 0")
 		}
+	}
+
+	// Sortition mode cross-field validation.
+	if c.SortitionEnabled && c.SessionManagerAddress == (common.Address{}) {
+		errs = append(errs, "SESSION_MANAGER_ADDRESS is required when SORTITION_ENABLED=true")
 	}
 
 	return errs
