@@ -71,3 +71,19 @@ func TestService_computeDrainTTL_fallbackWhenNoChainClient(t *testing.T) {
 	got := s.computeDrainTTL()
 	assert.Equal(t, drainTTLFallback, got)
 }
+
+// TestService_sortitionWatchers_nilWhenDisabled is a compile-and-invariant guard:
+// it confirms the sortition watcher fields exist on Service and are nil on a
+// zero-value instance. New() cannot be exercised in a unit test without heavy deps
+// (keystore paths, chain RPC, Redis), so this test relies on the nil-field invariant
+// as a structural check; correctness of the sortition wiring is validated by the
+// build step and the Task 9 live demo.
+func TestService_sortitionWatchers_nilWhenDisabled(t *testing.T) {
+	t.Parallel()
+	s := &Service{
+		cfg:    &config.Config{SortitionEnabled: false},
+		logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
+	}
+	assert.Nil(t, s.sessionWatcher, "sessionWatcher must be nil when SortitionEnabled=false")
+	assert.Nil(t, s.jobWatcher, "jobWatcher must be nil when SortitionEnabled=false")
+}

@@ -4,6 +4,7 @@ package service
 
 import (
 	"context"
+	"crypto/ecdh"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -23,6 +24,7 @@ import (
 	"github.com/hibiken/asynq"
 	"github.com/redis/go-redis/v9"
 
+	pkgcrypto "github.com/lightchain/pkg/crypto"
 	pkgtypes "github.com/lightchain/pkg/types"
 
 	"github.com/lightchain/worker/internal/blob"
@@ -37,6 +39,7 @@ import (
 	"github.com/lightchain/worker/internal/registration"
 	"github.com/lightchain/worker/internal/release"
 	"github.com/lightchain/worker/internal/search"
+	"github.com/lightchain/worker/internal/sortition"
 )
 
 // startupHeartbeatTimeout is the maximum time allowed for the initial heartbeat
@@ -98,6 +101,23 @@ type Service struct {
 	releaseTracker    *release.Tracker
 	releaseScheduler  *release.Scheduler
 	releaseReconciler *release.Reconciler
+
+	// Sortition mode (non-nil when SortitionEnabled). Takes precedence over
+	// gateway and direct modes when set.
+	sessionWatcher *sortition.SessionWatcher
+	jobWatcher     *sortition.JobWatcher
+}
+
+// ecdhKeyChecker adapts the worker ECDH private key to the sortition.KeyChecker
+// interface so the JobWatcher can skip jobs whose session key was wrapped for a
+// different worker before wasting GPU time on a decrypt-bound failure.
+type ecdhKeyChecker struct {
+	key *ecdh.PrivateKey
+}
+
+func (c ecdhKeyChecker) CanDecryptSessionKey(enc []byte) bool {
+	_, err := pkgcrypto.DecryptSessionKey(enc, c.key)
+	return err == nil
 }
 
 // releaseMetricsAdapter bridges release.Metrics (a tiny consumer-side
@@ -115,6 +135,7 @@ func (a releaseMetricsAdapter) IncPauseEvent() { a.m.ReleasePauseEventsTotal.Inc
 func (a releaseMetricsAdapter) SetLastSuccessTimestamp(ts int64) {
 	a.m.ReleaseLastSuccessTimestamp.Set(float64(ts))
 }
+
 func (a releaseMetricsAdapter) SetReconcileLastBlock(block uint64) {
 	a.m.ReleaseReconcileLastBlock.Set(float64(block))
 }
@@ -152,6 +173,10 @@ func New(cfg *config.Config) (*Service, error) {
 	}
 
 	logger := newLogger(cfg.LogLevel, cfg.LogFormat)
+
+	if cfg.SortitionEnabled && cfg.WorkerGatewayURL != "" {
+		logger.Warn("both SORTITION_ENABLED and WORKER_GATEWAY_URL are set — sortition mode takes precedence; gateway will be ignored")
+	}
 
 	// Load Ethereum signing key from the go-ethereum keystore file
 	keystoreJSON, err := os.ReadFile(cfg.WorkerKeystorePath)
@@ -307,10 +332,11 @@ func New(cfg *config.Config) (*Service, error) {
 		return nil, fmt.Errorf("unsupported BLOB_MODE %q", blobMode)
 	}
 
-	// In direct Redis mode (non-gateway), we always need a Redis client for
-	// heartbeat, Asynq job queue, and response publishing. Create it now if
-	// blob mode didn't already create one.
-	if cfg.WorkerGatewayURL == "" && redisClient == nil {
+	// In direct Redis mode (non-gateway) we always need a Redis client for
+	// heartbeat, Asynq job queue, and response publishing. Sortition mode also
+	// needs it for the heartbeat monitor. Create it now if blob mode didn't
+	// already create one.
+	if (cfg.WorkerGatewayURL == "" || cfg.SortitionEnabled) && redisClient == nil {
 		redisOpts, err = redis.ParseURL(cfg.RedisURL)
 		if err != nil {
 			chainClient.Close()
@@ -443,7 +469,10 @@ func New(cfg *config.Config) (*Service, error) {
 	handler.SetReleaseTracker(releaseTracker)
 
 	// --- Gateway mode: skip Asynq and direct Redis heartbeat ---
-	if cfg.WorkerGatewayURL != "" {
+	// SortitionEnabled takes precedence: if both are set we already warned above
+	// and fall through to the direct-Redis path so the monitor and sortition
+	// watchers are constructed there.
+	if cfg.WorkerGatewayURL != "" && !cfg.SortitionEnabled {
 		gwClient := gw.NewClient(cfg.WorkerGatewayURL, signingKey, logger)
 
 		gwCtx, gwCancel := context.WithTimeout(context.Background(), 30*time.Second)
@@ -491,7 +520,8 @@ func New(cfg *config.Config) (*Service, error) {
 		)
 		gwHandler.SetReleaseTracker(releaseTracker)
 
-		logger.Info("worker service initialized (gateway mode)",
+		logger.Info(
+			"worker service initialized (gateway mode)",
 			"address", workerAddr.Hex(),
 			"gateway", cfg.WorkerGatewayURL,
 			"models", len(modelIDs),
@@ -506,7 +536,8 @@ func New(cfg *config.Config) (*Service, error) {
 		if perr == nil && lerr == nil {
 			coordinator.Seed(pendingNonce, latestNonce)
 		} else {
-			logger.Warn("coordinator seed skipped — pending/latest nonce read failed",
+			logger.Warn(
+				"coordinator seed skipped — pending/latest nonce read failed",
 				"pendingErr", perr,
 				"latestErr", lerr,
 				"hint", "first legacy broadcast may race a stuck pool tx; existing ShouldResetNonceOnSendError will recover",
@@ -571,7 +602,8 @@ func New(cfg *config.Config) (*Service, error) {
 		return nil, fmt.Errorf("initial heartbeat write failed — check Redis config: %w", err)
 	}
 
-	logger.Info("worker service initialized",
+	logger.Info(
+		"worker service initialized",
 		"address", workerAddr.Hex(),
 		"models", len(modelIDs),
 		"maxConcurrentJobs", cfg.MaxConcurrentJobs,
@@ -595,10 +627,58 @@ func New(cfg *config.Config) (*Service, error) {
 	if perr == nil && lerr == nil {
 		coordinator.Seed(pendingNonce, latestNonce)
 	} else {
-		logger.Warn("coordinator seed skipped — pending/latest nonce read failed",
+		logger.Warn(
+			"coordinator seed skipped — pending/latest nonce read failed",
 			"pendingErr", perr,
 			"latestErr", lerr,
 			"hint", "first legacy broadcast may race a stuck pool tx; existing ShouldResetNonceOnSendError will recover",
+		)
+	}
+
+	// --- Sortition mode: flag-gated third intake ---
+	// Construct the chain-watcher pair when SortitionEnabled. Both watchers share
+	// a single CursorStore (dir-backed), the shared jobCounter, and the pipeline
+	// handler as their job sink. Gateway/direct paths above are skipped when
+	// SortitionEnabled is true, so asynq and gwClient remain nil and Run will
+	// dispatch to runSortitionMode instead.
+	var sessionWatcher *sortition.SessionWatcher
+	var jobWatcher *sortition.JobWatcher
+	if cfg.SortitionEnabled {
+		cursorStore, csErr := sortition.NewCursorStore(cfg.SortitionStateDir)
+		if csErr != nil {
+			_ = redisClient.Close()
+			chainClient.Close()
+			return nil, fmt.Errorf("open sortition cursor store: %w", csErr)
+		}
+		checker := ecdhKeyChecker{key: ecdhKey}
+		sessionWatcher = sortition.NewSessionWatcher(sortition.SessionWatcherOpts{
+			Client:        chainClient,
+			Cursor:        cursorStore,
+			Worker:        workerAddr,
+			JobCounter:    jobCounter,
+			MaxConcurrent: cfg.MaxConcurrentJobs,
+			ChunkSize:     cfg.SortitionChunkSize,
+			Confirmations: cfg.SortitionConfirmations,
+			PollInterval:  cfg.SortitionPollInterval,
+			Logger:        logger,
+		})
+		jobWatcher = sortition.NewJobWatcher(sortition.JobWatcherOpts{
+			Client:        chainClient,
+			KeyChecker:    checker,
+			Sink:          handler,
+			Cursor:        cursorStore,
+			Worker:        workerAddr,
+			JobCounter:    jobCounter,
+			MaxConcurrent: cfg.MaxConcurrentJobs,
+			ChunkSize:     cfg.SortitionChunkSize,
+			Confirmations: cfg.SortitionConfirmations,
+			PollInterval:  cfg.SortitionPollInterval,
+			Logger:        logger,
+		})
+		logger.Info(
+			"sortition mode enabled",
+			"sessionManagerAddress", cfg.SessionManagerAddress.Hex(),
+			"stateDir", cfg.SortitionStateDir,
 		)
 	}
 
@@ -620,6 +700,8 @@ func New(cfg *config.Config) (*Service, error) {
 		releaseTracker:    releaseTracker,
 		releaseScheduler:  releaseScheduler,
 		releaseReconciler: releaseReconciler,
+		sessionWatcher:    sessionWatcher,
+		jobWatcher:        jobWatcher,
 	}, nil
 }
 
@@ -646,7 +728,8 @@ func (s *Service) startMetricsServer() {
 	s.logger.Info("starting metrics endpoint", "addr", s.metricsServer.Addr)
 	go func() {
 		if err := s.metricsServer.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
-			s.logger.Error("metrics endpoint failed (job processing continues)",
+			s.logger.Error(
+				"metrics endpoint failed (job processing continues)",
 				"addr", s.metricsServer.Addr,
 				"error", err,
 			)
@@ -708,11 +791,16 @@ func (s *Service) Run(ctx context.Context) error {
 	sigCtx, stop := signal.NotifyContext(runCtx, syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
-	// Metrics endpoint runs in both modes. Non-fatal: a bind failure or
+	// Metrics endpoint runs in all modes. Non-fatal: a bind failure or
 	// transient ListenAndServe error logs loudly but does not stop job
 	// processing — observability outages must not cascade into job
 	// outages. Shutdown is handled in s.shutdown() via srv.Shutdown(ctx).
 	s.startMetricsServer()
+
+	// Sortition mode takes precedence — checked before gateway/direct.
+	if s.sessionWatcher != nil {
+		return s.runSortitionMode(sigCtx, runCancel)
+	}
 
 	// Gateway mode: poll loop + gateway heartbeat
 	if s.gwClient != nil {
@@ -820,6 +908,38 @@ func (s *Service) runGatewayMode(ctx context.Context, cancel context.CancelFunc)
 	return s.shutdown(shutdownCtx)
 }
 
+// runSortitionMode runs the worker in sortition mode: the SessionWatcher polls
+// the chain for SessionRequested events and claims eligible sessions; the
+// JobWatcher serves their JobSubmitted events directly into the pipeline.
+// No dispatcher or worker-gateway is involved.
+func (s *Service) runSortitionMode(ctx context.Context, _ context.CancelFunc) error {
+	s.logger.Info("worker sidecar running (sortition mode) — waiting for shutdown signal")
+
+	// Release subsystem runs identically across all modes.
+	s.startReleaseSubsystem(ctx)
+
+	// Heartbeat monitor — same Redis-backed monitor as direct mode.
+	// The worker must advertise health and capabilities so isEligible/model
+	// checks pass in the SessionManager contract.
+	s.monitor.Start(ctx)
+
+	// Both chain watchers run in background goroutines; Start blocks until
+	// ctx is cancelled (ticker loop), so we launch each in its own goroutine.
+	go s.sessionWatcher.Start(ctx)
+	go s.jobWatcher.Start(ctx)
+
+	<-ctx.Done()
+	s.logger.Info("shutdown signal received, stopping gracefully")
+
+	// Set the drain marker so new sessions stop being routed to this worker
+	// while in-flight jobs continue to completion.
+	s.markDrainOnShutdown(false)
+
+	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), s.cfg.ShutdownTimeout)
+	defer shutdownCancel()
+	return s.shutdown(shutdownCtx)
+}
+
 // markDrainOnShutdown writes the drain marker as the worker exits. Failure
 // is non-fatal — a missing drain marker just means the worker will be
 // filtered out by stale-detection (TTL expiry on the heartbeat key)
@@ -835,7 +955,8 @@ func (s *Service) markDrainOnShutdown(gatewayMode bool) {
 		ctx, cancel := context.WithTimeout(context.Background(), shutdownDrainTimeout)
 		defer cancel()
 		if err := s.gwClient.SendDrain(ctx); err != nil {
-			s.logger.Warn("drain_write_failed",
+			s.logger.Warn(
+				"drain_write_failed",
 				"mode", "gateway",
 				"worker", s.workerAddr.Hex(),
 				"error", err,
@@ -860,7 +981,8 @@ func (s *Service) markDrainOnShutdown(gatewayMode bool) {
 	writeCtx, cancel := context.WithTimeout(context.Background(), shutdownDrainTimeout)
 	defer cancel()
 	if err := pkgtypes.SetDraining(writeCtx, s.redis, s.workerAddr.Hex(), ttl); err != nil {
-		s.logger.Warn("drain_write_failed",
+		s.logger.Warn(
+			"drain_write_failed",
 			"mode", "direct",
 			"worker", s.workerAddr.Hex(),
 			"ttl", ttl,
@@ -868,7 +990,8 @@ func (s *Service) markDrainOnShutdown(gatewayMode bool) {
 		)
 		return
 	}
-	s.logger.Info("drain marker set via redis",
+	s.logger.Info(
+		"drain marker set via redis",
 		"worker", s.workerAddr.Hex(),
 		"ttl", ttl,
 	)
@@ -898,7 +1021,8 @@ func (s *Service) computeDrainTTL() time.Duration {
 
 	disputeWindow, err := s.chainClient.GetDisputeWindow(lookupCtx)
 	if err != nil {
-		s.logger.Warn("get dispute window for drain TTL failed; using fallback",
+		s.logger.Warn(
+			"get dispute window for drain TTL failed; using fallback",
 			"fallback", drainTTLFallback,
 			"error", err,
 		)
@@ -930,7 +1054,8 @@ func (s *Service) startReleaseSubsystem(ctx context.Context) {
 	if s.releaseScheduler != nil {
 		s.releaseScheduler.Start(ctx)
 	}
-	s.logger.Info("release subsystem started",
+	s.logger.Info(
+		"release subsystem started",
 		"interval", s.cfg.ReleaseInterval,
 		"probe_interval", s.cfg.ReleaseProbeInterval,
 		"reconcile_interval", s.cfg.ReleaseReconcileInterval,
