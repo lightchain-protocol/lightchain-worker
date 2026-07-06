@@ -51,11 +51,15 @@ type SessionWatcher struct {
 }
 
 // NewSessionWatcher constructs a SessionWatcher from the given options.
-// ChunkSize defaults to 5000 when zero.
+// ChunkSize defaults to 5000 when zero. PollInterval defaults to 30s when zero.
 func NewSessionWatcher(o SessionWatcherOpts) *SessionWatcher {
 	chunk := o.ChunkSize
 	if chunk == 0 {
 		chunk = 5000
+	}
+	interval := o.PollInterval
+	if interval == 0 {
+		interval = 30 * time.Second
 	}
 	return &SessionWatcher{
 		c:        o.Client,
@@ -65,7 +69,7 @@ func NewSessionWatcher(o SessionWatcherOpts) *SessionWatcher {
 		maxJobs:  o.MaxConcurrent,
 		chunk:    chunk,
 		confs:    o.Confirmations,
-		interval: o.PollInterval,
+		interval: interval,
 		log:      o.Logger,
 	}
 }
@@ -133,7 +137,7 @@ func (w *SessionWatcher) RunOnce(ctx context.Context) error {
 
 			ok, err := w.c.EligibleNow(ctx, r.ReqID, w.worker)
 			if err != nil {
-				w.log.Debug("eligibleNow check failed", "reqId", r.ReqID, "error", err)
+				w.log.Warn("eligibleNow check failed", "reqId", r.ReqID, "error", err)
 				continue
 			}
 			if !ok {

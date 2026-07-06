@@ -61,7 +61,8 @@ func (m *mockClaimClient) ClaimSession(_ context.Context, reqID uint64) error {
 }
 
 // newSW builds a SessionWatcher backed by a temp CursorStore, with cursor at 0.
-func newSW(t *testing.T, mc *mockClaimClient, counter *atomic.Int32) *SessionWatcher {
+// Returns both the watcher and its CursorStore for test assertions.
+func newSW(t *testing.T, mc *mockClaimClient, counter *atomic.Int32) (*SessionWatcher, *CursorStore) {
 	t.Helper()
 	cs, err := NewCursorStore(t.TempDir())
 	require.NoError(t, err)
@@ -74,7 +75,7 @@ func newSW(t *testing.T, mc *mockClaimClient, counter *atomic.Int32) *SessionWat
 		ChunkSize:     5000,
 		Confirmations: 0,
 		Logger:        testLogger(t),
-	})
+	}), cs
 }
 
 func TestSessionWatcher_ClaimsOnlyEligible(t *testing.T) {
@@ -88,7 +89,7 @@ func TestSessionWatcher_ClaimsOnlyEligible(t *testing.T) {
 		},
 		eligible: map[uint64]bool{1: true, 2: false, 3: true},
 	}
-	sw := newSW(t, mc, &counter)
+	sw, _ := newSW(t, mc, &counter)
 	require.NoError(t, sw.RunOnce(context.Background()))
 	require.ElementsMatch(t, []uint64{1, 3}, mc.claimed, "claims only eligible requests")
 }
@@ -101,7 +102,7 @@ func TestSessionWatcher_RespectsCapacity(t *testing.T) {
 		requested: []chain.SessionRequestedEvent{{ReqID: 1, BlockNumber: 10}},
 		eligible:  map[uint64]bool{1: true},
 	}
-	sw := newSW(t, mc, &counter)
+	sw, _ := newSW(t, mc, &counter)
 	require.NoError(t, sw.RunOnce(context.Background()))
 	require.Empty(t, mc.claimed, "no claims while at capacity")
 }
@@ -141,8 +142,11 @@ func TestSessionWatcher_AlreadyClaimedIsNotFatal(t *testing.T) {
 		eligible:  map[uint64]bool{1: true},
 		claimErr:  errAlreadyClaimed(),
 	}
-	sw := newSW(t, mc, &counter)
+	sw, cs := newSW(t, mc, &counter)
 	require.NoError(t, sw.RunOnce(context.Background()), "a losing claim does not fail the pass")
+	// Assert cursor advanced despite claim failure
+	got, _ := cs.Get(cursorSessionRequested)
+	require.Equal(t, uint64(100), got, "cursor should advance to safeHead even after claim error")
 }
 
 func TestSessionWatcher_NoOpWhenSafeHeadAtOrBelowCursor(t *testing.T) {
