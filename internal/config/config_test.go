@@ -563,11 +563,9 @@ func requireConfigError(t *testing.T, extra map[string]string, wantSubstr string
 	for k, v := range extra {
 		t.Setenv(k, v)
 	}
-	_, err := Load()
+	cfg, err := Load()
 	// If Load() passes, check Validate() for cross-field errors
 	if err == nil {
-		cfg, loadErr := Load()
-		require.NoError(t, loadErr)
 		errs := cfg.Validate()
 		combined := ""
 		for _, e := range errs {
@@ -595,7 +593,7 @@ func TestConfig_SortitionEnabled_RequiresSessionManager(t *testing.T) {
 	// Enabling sortition without SESSION_MANAGER_ADDRESS must be a config error.
 	requireConfigError(t, map[string]string{
 		"SORTITION_ENABLED": "true",
-	}, "SESSION_MANAGER_ADDRESS")
+	}, "SESSION_MANAGER_ADDRESS is required when SORTITION_ENABLED=true")
 }
 
 func TestConfig_SortitionEnabled_Parses(t *testing.T) {
