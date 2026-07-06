@@ -17,8 +17,10 @@ import (
 )
 
 // Compile-time assertions: ChainClient must satisfy both interfaces.
-var _ RegistrationClient = (*ChainClient)(nil)
-var _ JobExecutionClient = (*ChainClient)(nil)
+var (
+	_ RegistrationClient = (*ChainClient)(nil)
+	_ JobExecutionClient = (*ChainClient)(nil)
+)
 
 // MockRegistrationClient is a hand-rolled mock for RegistrationClient.
 // All fields are function vars so tests can inject return values without a mock library.
@@ -500,4 +502,14 @@ func TestChainClient_GetSessionInfo_NoBindingErrors(t *testing.T) {
 	c := &ChainClient{}
 	_, err := c.GetSessionInfo(context.Background(), 1)
 	require.Error(t, err)
+}
+
+// TestChainClient_GetRequestInfo_NoBindingErrors verifies that a ChainClient
+// without a SessionManager binding returns an error rather than panicking.
+func TestChainClient_GetRequestInfo_NoBindingErrors(t *testing.T) {
+	t.Parallel()
+	c := &ChainClient{}
+	_, err := c.GetRequestInfo(context.Background(), 1)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "session manager binding not configured")
 }

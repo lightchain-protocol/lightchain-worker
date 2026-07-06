@@ -776,6 +776,15 @@ type SessionInfo struct {
 	Status  uint8
 }
 
+// RequestInfo is the subset of on-chain SessionManager.Request storage the
+// SessionWatcher needs to decide whether a pending request is still actionable.
+// ReqStatus enum on-chain: Open=0, Claimed=1, Ready=2, Expired=3.
+type RequestInfo struct {
+	Status uint8
+	Expiry uint64
+	Worker common.Address
+}
+
 // FilterSessionRequested returns all SessionRequested events emitted by the
 // SessionManager contract in [fromBlock, toBlock] (both inclusive). No indexed
 // filter is applied — the caller is expected to further filter by reqId/user/modelId
@@ -866,4 +875,18 @@ func (c *ChainClient) GetSessionInfo(ctx context.Context, sessionID uint64) (Ses
 		Worker:  s.Worker,
 		Status:  s.Status,
 	}, nil
+}
+
+// GetRequestInfo fetches the status, expiry, and assigned worker for the given
+// sortition request ID from the SessionManager contract. Used by the SessionWatcher
+// to re-evaluate pending requests across multiple poll passes.
+func (c *ChainClient) GetRequestInfo(ctx context.Context, reqID uint64) (RequestInfo, error) {
+	if err := c.requireSessionManager(); err != nil {
+		return RequestInfo{}, err
+	}
+	r, err := c.sessionManager.GetRequest(&bind.CallOpts{Context: ctx}, new(big.Int).SetUint64(reqID))
+	if err != nil {
+		return RequestInfo{}, fmt.Errorf("getRequest %d: %w", reqID, err)
+	}
+	return RequestInfo{Status: r.Status, Expiry: r.Expiry, Worker: r.Worker}, nil
 }

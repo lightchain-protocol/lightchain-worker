@@ -19,6 +19,7 @@ const cursorSessionRequested = "session_requested"
 type ClaimClient interface {
 	Head(ctx context.Context) (chain.HeadInfo, error)
 	FilterSessionRequested(ctx context.Context, fromBlock, toBlock uint64) ([]chain.SessionRequestedEvent, error)
+	GetRequestInfo(ctx context.Context, reqID uint64) (chain.RequestInfo, error)
 	EligibleNow(ctx context.Context, reqID uint64, worker common.Address) (bool, error)
 	ClaimSession(ctx context.Context, reqID uint64) error
 }
@@ -38,6 +39,11 @@ type SessionWatcherOpts struct {
 
 // SessionWatcher polls the chain for SessionRequested events and claims
 // sessions this worker is eligible for (subject to local capacity).
+//
+// Discovered requests are held in an in-memory pending set and re-evaluated
+// every pass so that the decaying sortition threshold is respected: a worker
+// becomes eligible only after the claim window widens over blocks, which may
+// happen on a later pass than discovery.
 type SessionWatcher struct {
 	c        ClaimClient
 	cursor   *CursorStore
@@ -48,6 +54,7 @@ type SessionWatcher struct {
 	confs    uint64
 	interval time.Duration
 	log      *slog.Logger
+	pending  map[uint64]struct{}
 }
 
 // NewSessionWatcher constructs a SessionWatcher from the given options.
@@ -71,6 +78,7 @@ func NewSessionWatcher(o SessionWatcherOpts) *SessionWatcher {
 		confs:    o.Confirmations,
 		interval: interval,
 		log:      o.Logger,
+		pending:  make(map[uint64]struct{}),
 	}
 }
 
@@ -90,12 +98,24 @@ func (w *SessionWatcher) Start(ctx context.Context) {
 	}
 }
 
-// RunOnce performs one poll pass: read cursor → safeHead → for each chunk in
-// [cursor+1..safeHead], filter SessionRequested events and claim eligible ones
-// under capacity. Cursor is advanced to each chunk's hi before moving on.
+// RunOnce performs one poll pass in two phases.
+//
+// Phase 1 — Discovery: scan cursor+1..safeHead in chunks, add discovered
+// SessionRequested events to the in-memory pending set, and advance the cursor
+// per chunk (resumable on error). If safeHead <= cursor, discovery is skipped
+// but the evaluation phase still runs.
+//
+// Phase 2 — Evaluation: iterate the pending set. For each request, fetch its
+// on-chain status (GetRequestInfo); drop it if it is no longer Open or has
+// expired. If this worker is now eligible (EligibleNow), claim it. Requests
+// that are not yet eligible are kept in the set for re-evaluation next pass —
+// this is the fix for the decaying sortition threshold: a worker that was
+// ineligible at discovery time will be re-checked here on every subsequent
+// pass until the claim window widens enough.
 //
 // A claim error (e.g. AlreadyClaimed revert, racing loser) is logged at debug
-// and is not fatal — the pass continues and RunOnce returns nil.
+// and is not fatal — the request is removed optimistically (if our tx lost the
+// race, the status will be non-Open on the next pass anyway).
 func (w *SessionWatcher) RunOnce(ctx context.Context) error {
 	head, err := w.c.Head(ctx)
 	if err != nil {
@@ -114,48 +134,76 @@ func (w *SessionWatcher) RunOnce(ctx context.Context) error {
 		return err
 	}
 
-	if safeHead <= cursor {
-		return nil
+	// Phase 1: Discovery — scan new blocks, populate pending.
+	if safeHead > cursor {
+		for lo := cursor + 1; lo <= safeHead; lo += w.chunk {
+			hi := lo + w.chunk - 1
+			if hi > safeHead {
+				hi = safeHead
+			}
+
+			reqs, err := w.c.FilterSessionRequested(ctx, lo, hi)
+			if err != nil {
+				return err
+			}
+
+			for _, r := range reqs {
+				w.pending[r.ReqID] = struct{}{}
+			}
+
+			if err := w.cursor.Set(cursorSessionRequested, hi); err != nil {
+				return err
+			}
+		}
 	}
 
-	for lo := cursor + 1; lo <= safeHead; lo += w.chunk {
-		hi := lo + w.chunk - 1
-		if hi > safeHead {
-			hi = safeHead
-		}
-
-		reqs, err := w.c.FilterSessionRequested(ctx, lo, hi)
+	// Phase 2: Evaluation — re-check all pending requests regardless of
+	// whether discovery ran. This is the core fix: a request discovered in a
+	// prior pass when the worker was ineligible is re-evaluated here every
+	// pass until the sortition claim window widens.
+	for reqID := range w.pending {
+		ri, err := w.c.GetRequestInfo(ctx, reqID)
 		if err != nil {
-			return err
+			w.log.Warn("getRequestInfo failed", "reqId", reqID, "error", err)
+			continue // transient; keep in pending
 		}
 
-		for _, r := range reqs {
-			if int(w.counter.Load()) >= w.maxJobs {
-				w.log.Debug("at capacity, skipping claim", "reqId", r.ReqID)
-				continue
-			}
+		if ri.Status != 0 { // not Open (Claimed=1, Ready=2, Expired=3)
+			delete(w.pending, reqID)
+			continue
+		}
 
-			ok, err := w.c.EligibleNow(ctx, r.ReqID, w.worker)
-			if err != nil {
-				w.log.Warn("eligibleNow check failed", "reqId", r.ReqID, "error", err)
-				continue
-			}
-			if !ok {
-				continue
-			}
+		if uint64(time.Now().Unix()) > ri.Expiry {
+			delete(w.pending, reqID)
+			continue
+		}
 
-			if err := w.c.ClaimSession(ctx, r.ReqID); err != nil {
+		if int(w.counter.Load()) >= w.maxJobs {
+			// At capacity — stop evaluating; all pending requests are
+			// preserved and will be re-tried next pass.
+			break
+		}
+
+		ok, err := w.c.EligibleNow(ctx, reqID, w.worker)
+		if err != nil {
+			w.log.Warn("eligibleNow check failed", "reqId", reqID, "error", err)
+			continue // keep in pending
+		}
+
+		if ok {
+			if err := w.c.ClaimSession(ctx, reqID); err != nil {
 				// Losing a claim race (AlreadyClaimed) or a transient tx error
 				// is not fatal to the pass — log at debug and move on.
-				w.log.Debug("claim not landed", "reqId", r.ReqID, "error", err)
-				continue
+				w.log.Debug("claim not landed", "reqId", reqID, "error", err)
+			} else {
+				w.log.Info("claimed session request", "reqId", reqID)
 			}
-			w.log.Info("claimed session request", "reqId", r.ReqID)
+			// Remove optimistically: if our tx lost the race the request's
+			// status will be non-Open on the next pass and it would be pruned
+			// from pending then anyway.
+			delete(w.pending, reqID)
 		}
-
-		if err := w.cursor.Set(cursorSessionRequested, hi); err != nil {
-			return err
-		}
+		// else: not yet eligible — keep in pending for re-evaluation next pass.
 	}
 
 	return nil
