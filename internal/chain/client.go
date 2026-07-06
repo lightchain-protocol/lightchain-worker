@@ -781,11 +781,11 @@ type SessionInfo struct {
 // filter is applied — the caller is expected to further filter by reqId/user/modelId
 // as needed.
 func (c *ChainClient) FilterSessionRequested(ctx context.Context, fromBlock, toBlock uint64) ([]SessionRequestedEvent, error) {
-	if err := c.requireSessionManager(); err != nil {
-		return nil, err
-	}
 	if toBlock < fromBlock {
 		return nil, fmt.Errorf("FilterSessionRequested: toBlock %d < fromBlock %d", toBlock, fromBlock)
+	}
+	if err := c.requireSessionManager(); err != nil {
+		return nil, err
 	}
 	end := toBlock
 	opts := &bind.FilterOpts{Context: ctx, Start: fromBlock, End: &end}
@@ -818,11 +818,11 @@ func (c *ChainClient) FilterSessionRequested(ctx context.Context, fromBlock, toB
 // (both inclusive). No indexed filter is applied — callers that need only jobs
 // for a specific worker must filter the returned slice themselves.
 func (c *ChainClient) FilterJobSubmitted(ctx context.Context, fromBlock, toBlock uint64) ([]JobSubmittedEvent, error) {
-	if err := c.requireJobRegistry(); err != nil {
-		return nil, err
-	}
 	if toBlock < fromBlock {
 		return nil, fmt.Errorf("FilterJobSubmitted: toBlock %d < fromBlock %d", toBlock, fromBlock)
+	}
+	if err := c.requireJobRegistry(); err != nil {
+		return nil, err
 	}
 	end := toBlock
 	opts := &bind.FilterOpts{Context: ctx, Start: fromBlock, End: &end}

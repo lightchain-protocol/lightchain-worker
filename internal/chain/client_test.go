@@ -460,6 +460,37 @@ func TestChainClient_FilterSessionRequested_RangeGuard(t *testing.T) {
 	c := &ChainClient{}
 	_, err := c.FilterSessionRequested(context.Background(), 10, 5) // to < from
 	require.Error(t, err)
+	require.Contains(t, err.Error(), "toBlock")
+}
+
+// TestChainClient_FilterSessionRequested_NoBindingErrors verifies that a
+// ChainClient without a SessionManager binding returns an error.
+func TestChainClient_FilterSessionRequested_NoBindingErrors(t *testing.T) {
+	t.Parallel()
+	c := &ChainClient{}
+	_, err := c.FilterSessionRequested(context.Background(), 1, 10) // valid range
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "session manager binding not configured")
+}
+
+// TestChainClient_FilterJobSubmitted_RangeGuard verifies that a range
+// where toBlock < fromBlock is rejected immediately.
+func TestChainClient_FilterJobSubmitted_RangeGuard(t *testing.T) {
+	t.Parallel()
+	c := &ChainClient{}
+	_, err := c.FilterJobSubmitted(context.Background(), 10, 5) // to < from
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "toBlock")
+}
+
+// TestChainClient_FilterJobSubmitted_NoBindingErrors verifies that a
+// ChainClient without a JobRegistry binding returns an error.
+func TestChainClient_FilterJobSubmitted_NoBindingErrors(t *testing.T) {
+	t.Parallel()
+	c := &ChainClient{}
+	_, err := c.FilterJobSubmitted(context.Background(), 1, 10) // valid range
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "jobRegistry not configured")
 }
 
 // TestChainClient_GetSessionInfo_NoBindingErrors verifies that a ChainClient
