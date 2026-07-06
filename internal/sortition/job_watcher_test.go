@@ -244,6 +244,44 @@ func TestJobWatcher_CapacityStopsAndRetries(t *testing.T) {
 	require.Equal(t, uint64(19), got, "cursor must be just before the un-served event's block")
 }
 
+// TestJobWatcher_TransientLookupError_StopsAndRetries verifies that a transient
+// chain-read error on a mine event (here GetSessionEncWorkerKey failing) does
+// NOT drop the already-assigned job: RunOnce stops WITHOUT advancing the cursor
+// past the event, so the next pass rescans and retries it. This is the opposite
+// of the undecryptable-key case (permanent), which advances the cursor.
+func TestJobWatcher_TransientLookupError_StopsAndRetries(t *testing.T) {
+	var counter atomic.Int32
+
+	mc := &mockServeClient{
+		head: chain.HeadInfo{Number: 100},
+		jobSubmitted: []chain.JobSubmittedEvent{
+			{JobID: 1, SessionID: 10, Worker: testMyWorker, BlockNumber: 20},
+		},
+		// encWorkerKeys deliberately EMPTY → GetSessionEncWorkerKey returns an
+		// error (models a transient RPC failure reading data the JobSubmitted
+		// event proves exists on-chain), which must trigger stop-and-retry.
+		encWorkerKeys: map[uint64][]byte{},
+		blobInfos: map[uint64]mockBlobInfo{
+			1: {promptHash: common.HexToHash("0xdead"), submitBlock: 20},
+		},
+		sessionInfos: map[uint64]chain.SessionInfo{
+			10: {User: common.HexToAddress("0x5"), Worker: testMyWorker, Status: 1},
+		},
+	}
+	sink := &mockJobSink{}
+	jw, cs := newJW(t, mc, &mockKeyChecker{canDecrypt: true}, sink, &counter)
+
+	require.NoError(t, jw.RunOnce(context.Background()))
+
+	require.Empty(t, sink.received(), "sink must not be called on a transient lookup error")
+
+	got, err := cs.Get(cursorJobSubmitted)
+	require.NoError(t, err)
+	// Transient error → cursor set to ev.BlockNumber-1 = 19 (NOT advanced to
+	// safeHead 100), so the next pass rescans block 20 and retries the job.
+	require.Equal(t, uint64(19), got, "cursor must not advance past the un-served event on a transient error")
+}
+
 // TestJobWatcher_AdvancesCursorWhenNoneMine verifies that when there are no
 // mine events in the range, the cursor still advances to safeHead.
 func TestJobWatcher_AdvancesCursorWhenNoneMine(t *testing.T) {

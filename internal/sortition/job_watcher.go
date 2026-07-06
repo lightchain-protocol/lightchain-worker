@@ -103,6 +103,25 @@ func NewJobWatcher(o JobWatcherOpts) *JobWatcher {
 	}
 }
 
+// stopAndRetry persists the cursor to one block before ev.BlockNumber so
+// the next poll pass rescans from ev.BlockNumber. lo is the chunk lower bound,
+// used as the underflow-safe fallback when ev.BlockNumber is zero.
+//
+// Use for TRANSIENT failures (RPC errors on GetSessionEncWorkerKey,
+// GetJobBlobInfo, GetSessionInfo) where the data provably exists on-chain but
+// the call failed — retrying next pass is correct.
+//
+// Do NOT use for PERMANENT conditions (CanDecryptSessionKey == false): a key
+// wrapped for a different worker never becomes decryptable; stop-and-retry
+// would wedge the watcher indefinitely. Those must use continue to advance.
+func (w *JobWatcher) stopAndRetry(ev chain.JobSubmittedEvent, lo uint64) error {
+	stopAt := lo - 1
+	if ev.BlockNumber > 0 {
+		stopAt = ev.BlockNumber - 1
+	}
+	return w.cursor.Set(cursorJobSubmitted, stopAt)
+}
+
 // Start runs a ticker loop calling RunOnce on each tick until ctx is cancelled.
 func (w *JobWatcher) Start(ctx context.Context) {
 	t := time.NewTicker(w.interval)
@@ -179,28 +198,29 @@ func (w *JobWatcher) RunOnce(ctx context.Context) error {
 			// idempotent — the pipeline checks HasJobAcknowledged/HasJobCompleted
 			// on-chain before re-running any stage.
 			if int(w.counter.Load()) >= w.maxJobs {
-				stopAt := lo - 1
-				if ev.BlockNumber > 0 {
-					stopAt = ev.BlockNumber - 1
-				}
-				if setErr := w.cursor.Set(cursorJobSubmitted, stopAt); setErr != nil {
-					return setErr
+				if stopErr := w.stopAndRetry(ev, lo); stopErr != nil {
+					return stopErr
 				}
 				return nil
 			}
 
 			enc, encErr := w.c.GetSessionEncWorkerKey(ctx, ev.SessionID)
 			if encErr != nil {
-				w.log.Warn("get session enc worker key failed, skipping job",
+				// TRANSIENT: RPC error reading on-chain data that provably exists
+				// (JobSubmitted fires after the session is Active with a key).
+				// Stop-and-retry so the assigned job is not silently dropped.
+				w.log.Warn("get session enc worker key failed, retrying next pass",
 					"jobId", ev.JobID, "sessionId", ev.SessionID, "error", encErr)
-				continue
+				if stopErr := w.stopAndRetry(ev, lo); stopErr != nil {
+					return stopErr
+				}
+				return nil
 			}
 			if !w.keys.CanDecryptSessionKey(enc) {
-				// The session key is wrapped for a different worker key — serving
-				// this job would fail at the decryption stage and waste GPU time.
-				// Log and skip; cursor still advances past this block so the job
-				// is not retried forever. The consumer must call updateSessionKey
-				// for this worker if they want the job served.
+				// PERMANENT: the session key is wrapped for a different worker key.
+				// Retrying would never fix this — the consumer must call
+				// updateSessionKey for this worker. Advance cursor (continue) so
+				// the watcher is not wedged by this event forever.
 				w.log.Warn("session_key_undecryptable, skipping job",
 					"jobId", ev.JobID, "sessionId", ev.SessionID)
 				continue
@@ -208,15 +228,23 @@ func (w *JobWatcher) RunOnce(ctx context.Context) error {
 
 			promptHash, _, submitBlock, _, blobErr := w.c.GetJobBlobInfo(ctx, ev.JobID)
 			if blobErr != nil {
-				w.log.Warn("get job blob info failed, skipping job",
+				// TRANSIENT: stop-and-retry (see stopAndRetry doc).
+				w.log.Warn("get job blob info failed, retrying next pass",
 					"jobId", ev.JobID, "error", blobErr)
-				continue
+				if stopErr := w.stopAndRetry(ev, lo); stopErr != nil {
+					return stopErr
+				}
+				return nil
 			}
 			si, siErr := w.c.GetSessionInfo(ctx, ev.SessionID)
 			if siErr != nil {
-				w.log.Warn("get session info failed, skipping job",
+				// TRANSIENT: stop-and-retry (see stopAndRetry doc).
+				w.log.Warn("get session info failed, retrying next pass",
 					"jobId", ev.JobID, "sessionId", ev.SessionID, "error", siErr)
-				continue
+				if stopErr := w.stopAndRetry(ev, lo); stopErr != nil {
+					return stopErr
+				}
+				return nil
 			}
 
 			payload := pipeline.JobPayload{
