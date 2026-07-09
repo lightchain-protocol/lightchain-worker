@@ -5,6 +5,7 @@ import (
 	"crypto/ecdsa"
 	"fmt"
 	"math/big"
+	"sort"
 	"sync"
 	"time"
 
@@ -856,6 +857,42 @@ func (c *ChainClient) FilterJobSubmitted(ctx context.Context, fromBlock, toBlock
 	if err := iter.Error(); err != nil {
 		return nil, fmt.Errorf("iterate JobSubmitted [%d,%d]: %w", fromBlock, toBlock, err)
 	}
+	return out, nil
+}
+
+// GetPriorSessionJobIDs returns the ascending list of job IDs submitted for
+// sessionID strictly before currentJobID, scanning JobSubmitted events (indexed
+// by sessionId) in [fromBlock, toBlock]. Used by the sortition JobWatcher to
+// reconstruct the conversation-history job list the dispatcher used to supply.
+func (c *ChainClient) GetPriorSessionJobIDs(ctx context.Context, sessionID, currentJobID, fromBlock, toBlock uint64) ([]uint64, error) {
+	if toBlock < fromBlock {
+		return nil, fmt.Errorf("GetPriorSessionJobIDs: toBlock %d < fromBlock %d", toBlock, fromBlock)
+	}
+	if err := c.requireJobRegistry(); err != nil {
+		return nil, err
+	}
+	end := toBlock
+	opts := &bind.FilterOpts{Context: ctx, Start: fromBlock, End: &end}
+	sid := []*big.Int{new(big.Int).SetUint64(sessionID)}
+	iter, err := c.jobRegistry.FilterJobSubmitted(opts, nil, sid)
+	if err != nil {
+		return nil, fmt.Errorf("filter JobSubmitted session %d [%d,%d]: %w", sessionID, fromBlock, toBlock, err)
+	}
+	defer iter.Close()
+	var out []uint64
+	for iter.Next() {
+		ev := iter.Event
+		if ev == nil || ev.JobId == nil {
+			continue
+		}
+		if jid := ev.JobId.Uint64(); jid < currentJobID {
+			out = append(out, jid)
+		}
+	}
+	if err := iter.Error(); err != nil {
+		return nil, fmt.Errorf("iterate JobSubmitted session %d: %w", sessionID, err)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i] < out[j] })
 	return out, nil
 }
 

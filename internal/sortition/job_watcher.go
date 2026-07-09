@@ -25,6 +25,7 @@ type ServeClient interface {
 	GetJobBlobInfo(ctx context.Context, jobID uint64) (promptHash, respHash common.Hash, submitBlock, completeBlock uint64, err error)
 	GetSessionInfo(ctx context.Context, sessionID uint64) (chain.SessionInfo, error)
 	GetSessionEncWorkerKey(ctx context.Context, sessionID uint64) ([]byte, error)
+	GetPriorSessionJobIDs(ctx context.Context, sessionID, currentJobID, fromBlock, toBlock uint64) ([]uint64, error)
 }
 
 // KeyChecker validates that the session key is decryptable before serving a
@@ -50,8 +51,12 @@ type JobWatcherOpts struct {
 	MaxConcurrent int
 	ChunkSize     uint64
 	Confirmations uint64
-	PollInterval  time.Duration
-	Logger        *slog.Logger
+	// HistoryLookbackBlocks bounds the JobSubmitted scan used to reconstruct a
+	// session's prior job IDs for conversation history. Defaults to 50000 when
+	// zero.
+	HistoryLookbackBlocks uint64
+	PollInterval          time.Duration
+	Logger                *slog.Logger
 	// syncServe is an internal test hook. When true, HandleJobPayload is called
 	// synchronously in RunOnce rather than in a goroutine, making unit tests
 	// fully deterministic without WaitGroups or polling. Must not be set in
@@ -62,18 +67,19 @@ type JobWatcherOpts struct {
 // JobWatcher polls the chain for JobSubmitted events and serves jobs destined
 // for this worker into the inference pipeline.
 type JobWatcher struct {
-	c         ServeClient
-	keys      KeyChecker
-	sink      JobSink
-	cursor    *CursorStore
-	worker    common.Address
-	counter   *atomic.Int32
-	maxJobs   int
-	chunk     uint64
-	confs     uint64
-	interval  time.Duration
-	log       *slog.Logger
-	syncServe bool
+	c               ServeClient
+	keys            KeyChecker
+	sink            JobSink
+	cursor          *CursorStore
+	worker          common.Address
+	counter         *atomic.Int32
+	maxJobs         int
+	chunk           uint64
+	confs           uint64
+	historyLookback uint64
+	interval        time.Duration
+	log             *slog.Logger
+	syncServe       bool
 }
 
 // NewJobWatcher constructs a JobWatcher from the given options.
@@ -87,19 +93,24 @@ func NewJobWatcher(o JobWatcherOpts) *JobWatcher {
 	if interval == 0 {
 		interval = 30 * time.Second
 	}
+	lookback := o.HistoryLookbackBlocks
+	if lookback == 0 {
+		lookback = 50000 // ~1.15 days at 2s blocks; covers any realistic session
+	}
 	return &JobWatcher{
-		c:         o.Client,
-		keys:      o.KeyChecker,
-		sink:      o.Sink,
-		cursor:    o.Cursor,
-		worker:    o.Worker,
-		counter:   o.JobCounter,
-		maxJobs:   o.MaxConcurrent,
-		chunk:     chunk,
-		confs:     o.Confirmations,
-		interval:  interval,
-		log:       o.Logger,
-		syncServe: o.syncServe,
+		c:               o.Client,
+		keys:            o.KeyChecker,
+		sink:            o.Sink,
+		cursor:          o.Cursor,
+		worker:          o.Worker,
+		counter:         o.JobCounter,
+		maxJobs:         o.MaxConcurrent,
+		chunk:           chunk,
+		confs:           o.Confirmations,
+		historyLookback: lookback,
+		interval:        interval,
+		log:             o.Logger,
+		syncServe:       o.syncServe,
 	}
 }
 
@@ -257,6 +268,20 @@ func (w *JobWatcher) RunOnce(ctx context.Context) error {
 				BlockNumber:    submitBlock,
 				Timestamp:      time.Now().Unix(),
 				CorrelationID:  fmt.Sprintf("%d-%d", ev.SessionID, ev.JobID),
+			}
+
+			// Sortition mode has no dispatcher to supply PriorJobIDs, so
+			// reconstruct the session's earlier jobs from the chain for
+			// conversation history. Best-effort: on error, serve single-turn.
+			var from uint64
+			if submitBlock > w.historyLookback {
+				from = submitBlock - w.historyLookback
+			}
+			if prior, phErr := w.c.GetPriorSessionJobIDs(ctx, ev.SessionID, ev.JobID, from, submitBlock); phErr != nil {
+				w.log.Warn("prior session jobs lookup failed; serving single-turn",
+					"jobId", ev.JobID, "sessionId", ev.SessionID, "error", phErr)
+			} else if len(prior) > 0 {
+				payload.PriorJobIDs = prior
 			}
 
 			if w.syncServe {

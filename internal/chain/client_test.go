@@ -495,6 +495,27 @@ func TestChainClient_FilterJobSubmitted_NoBindingErrors(t *testing.T) {
 	require.Contains(t, err.Error(), "jobRegistry not configured")
 }
 
+// TestChainClient_GetPriorSessionJobIDs_RangeGuard verifies that a range
+// where toBlock < fromBlock is rejected immediately.
+func TestChainClient_GetPriorSessionJobIDs_RangeGuard(t *testing.T) {
+	t.Parallel()
+	c := &ChainClient{}
+	_, err := c.GetPriorSessionJobIDs(context.Background(), 10, 5, 10, 5) // to < from
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "toBlock")
+}
+
+// TestChainClient_GetPriorSessionJobIDs_NoBindingErrors verifies that a
+// ChainClient without a JobRegistry binding returns an error rather than
+// panicking.
+func TestChainClient_GetPriorSessionJobIDs_NoBindingErrors(t *testing.T) {
+	t.Parallel()
+	c := &ChainClient{}
+	_, err := c.GetPriorSessionJobIDs(context.Background(), 10, 5, 1, 10) // valid range
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "jobRegistry not configured")
+}
+
 // TestChainClient_GetSessionInfo_NoBindingErrors verifies that a ChainClient
 // without a JobRegistry binding returns an error rather than panicking.
 func TestChainClient_GetSessionInfo_NoBindingErrors(t *testing.T) {

@@ -836,6 +836,7 @@ func (h *JobHandler) runInferencePipeline(
 	var response string
 	var history []ollama.ChatMessage
 	if len(p.PriorJobIDs) > 0 {
+		histStart := time.Now()
 		var hErr error
 		history, hErr = h.buildConversationHistory(ctx, p.PriorJobIDs, sessionKey)
 		if hErr != nil {
@@ -845,6 +846,13 @@ func (h *JobHandler) runInferencePipeline(
 				"error", hErr,
 			)
 			history = nil
+		} else {
+			logger.Info("conversation history built",
+				"stage", "build_history",
+				"priorJobs", len(p.PriorJobIDs),
+				"historyTurns", len(history),
+				"durationMs", time.Since(histStart).Milliseconds(),
+			)
 		}
 	}
 

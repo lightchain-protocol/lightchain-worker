@@ -160,12 +160,16 @@ type Config struct {
 	ReleaseDisputeWindowCacheTTL time.Duration
 
 	// Sortition mode (Phase 3 — worker self-claims sessions, no dispatcher).
-	SortitionEnabled      bool
-	SessionManagerAddress common.Address
-	SortitionStateDir     string
-	SortitionChunkSize    uint64
-	SortitionPollInterval time.Duration
+	SortitionEnabled       bool
+	SessionManagerAddress  common.Address
+	SortitionStateDir      string
+	SortitionChunkSize     uint64
+	SortitionPollInterval  time.Duration
 	SortitionConfirmations uint64
+	// SortitionHistoryLookbackBlocks bounds the JobSubmitted scan the sortition
+	// JobWatcher uses to reconstruct a session's prior job IDs for conversation
+	// history. Defaults to 50000.
+	SortitionHistoryLookbackBlocks uint64
 
 	// Logging
 	LogLevel  string
@@ -355,6 +359,7 @@ func Load() (*Config, error) {
 	cfg.SortitionChunkSize = parseUint64("SORTITION_CHUNK_SIZE", 5000, &errs)
 	cfg.SortitionPollInterval = parseDuration("SORTITION_POLL_INTERVAL", "4s", &errs)
 	cfg.SortitionConfirmations = parseUint64("SORTITION_CONFIRMATIONS", 0, &errs)
+	cfg.SortitionHistoryLookbackBlocks = parseUint64("SORTITION_HISTORY_LOOKBACK_BLOCKS", 50000, &errs)
 
 	if len(errs) > 0 {
 		return nil, fmt.Errorf("config load errors:\n  - %s", strings.Join(errs, "\n  - "))

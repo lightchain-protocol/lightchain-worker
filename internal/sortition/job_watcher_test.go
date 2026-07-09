@@ -27,6 +27,8 @@ type mockServeClient struct {
 	sessionInfos  map[uint64]chain.SessionInfo
 	headErr       error
 	filterErr     error
+	priorJobIDs   []uint64 // returned by GetPriorSessionJobIDs
+	priorJobErr   error    // returned by GetPriorSessionJobIDs
 }
 
 type mockBlobInfo struct {
@@ -61,6 +63,13 @@ func (m *mockServeClient) GetSessionEncWorkerKey(_ context.Context, sessionID ui
 		return key, nil
 	}
 	return nil, errors.New("no enc worker key")
+}
+
+func (m *mockServeClient) GetPriorSessionJobIDs(_ context.Context, _, _, _, _ uint64) ([]uint64, error) {
+	if m.priorJobErr != nil {
+		return nil, m.priorJobErr
+	}
+	return m.priorJobIDs, nil
 }
 
 // mockKeyChecker is the test double for KeyChecker.
@@ -304,4 +313,76 @@ func TestJobWatcher_AdvancesCursorWhenNoneMine(t *testing.T) {
 	got, err := cs.Get(cursorJobSubmitted)
 	require.NoError(t, err)
 	require.Equal(t, uint64(50), got, "cursor must advance to safeHead even with no mine events")
+}
+
+// TestJobWatcher_PopulatesPriorJobIDs verifies that when GetPriorSessionJobIDs
+// returns earlier jobs for the session, the served payload carries them as
+// PriorJobIDs so the pipeline can reconstruct conversation history (sortition
+// mode has no dispatcher to supply them).
+func TestJobWatcher_PopulatesPriorJobIDs(t *testing.T) {
+	var counter atomic.Int32
+
+	var modelBytes [32]byte
+	copy(modelBytes[:], []byte("test-model"))
+	consumer := common.HexToAddress("0x0000000000000000000000000000000000000004")
+	promptHash := common.HexToHash("0xbeefbeefbeefbeefbeefbeefbeefbeefbeefbeefbeefbeefbeefbeefbeefbeef")
+
+	mc := &mockServeClient{
+		head: chain.HeadInfo{Number: 100},
+		jobSubmitted: []chain.JobSubmittedEvent{
+			{JobID: 3, SessionID: 10, Worker: testMyWorker, BlockNumber: 50},
+		},
+		encWorkerKeys: map[uint64][]byte{10: []byte("encKey")},
+		blobInfos: map[uint64]mockBlobInfo{
+			3: {promptHash: promptHash, submitBlock: 50},
+		},
+		sessionInfos: map[uint64]chain.SessionInfo{
+			10: {User: consumer, ModelID: modelBytes, Worker: testMyWorker, Status: 1},
+		},
+		priorJobIDs: []uint64{1, 2},
+	}
+	sink := &mockJobSink{}
+	jw, _ := newJW(t, mc, &mockKeyChecker{canDecrypt: true}, sink, &counter)
+
+	require.NoError(t, jw.RunOnce(context.Background()))
+
+	payloads := sink.received()
+	require.Len(t, payloads, 1)
+	require.Equal(t, []uint64{1, 2}, payloads[0].PriorJobIDs,
+		"PriorJobIDs must be populated from GetPriorSessionJobIDs")
+}
+
+// TestJobWatcher_PriorJobIDsLookupError_ServesSingleTurn verifies that when
+// GetPriorSessionJobIDs fails, the job is still served (best-effort) with empty
+// PriorJobIDs — the error must never fail the job.
+func TestJobWatcher_PriorJobIDsLookupError_ServesSingleTurn(t *testing.T) {
+	var counter atomic.Int32
+
+	var modelBytes [32]byte
+	copy(modelBytes[:], []byte("test-model"))
+	consumer := common.HexToAddress("0x0000000000000000000000000000000000000004")
+	promptHash := common.HexToHash("0xbeefbeefbeefbeefbeefbeefbeefbeefbeefbeefbeefbeefbeefbeefbeefbeef")
+
+	mc := &mockServeClient{
+		head: chain.HeadInfo{Number: 100},
+		jobSubmitted: []chain.JobSubmittedEvent{
+			{JobID: 3, SessionID: 10, Worker: testMyWorker, BlockNumber: 50},
+		},
+		encWorkerKeys: map[uint64][]byte{10: []byte("encKey")},
+		blobInfos: map[uint64]mockBlobInfo{
+			3: {promptHash: promptHash, submitBlock: 50},
+		},
+		sessionInfos: map[uint64]chain.SessionInfo{
+			10: {User: consumer, ModelID: modelBytes, Worker: testMyWorker, Status: 1},
+		},
+		priorJobErr: errors.New("rpc boom"),
+	}
+	sink := &mockJobSink{}
+	jw, _ := newJW(t, mc, &mockKeyChecker{canDecrypt: true}, sink, &counter)
+
+	require.NoError(t, jw.RunOnce(context.Background()))
+
+	payloads := sink.received()
+	require.Len(t, payloads, 1, "job must still be served despite prior-jobs lookup error")
+	require.Empty(t, payloads[0].PriorJobIDs, "PriorJobIDs must be empty on lookup error (single-turn)")
 }
