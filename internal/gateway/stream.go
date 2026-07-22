@@ -91,7 +91,7 @@ func (p *StreamPublisher) dial(ctx context.Context) (*websocket.Conn, error) {
 
 // pump writes queued frames until the connection breaks or ctx ends.
 func (p *StreamPublisher) pump(ctx context.Context, conn *websocket.Conn) {
-	defer conn.Close(websocket.StatusNormalClosure, "closing")
+	defer func() { _ = conn.Close(websocket.StatusNormalClosure, "closing") }()
 
 	// Reader goroutine: services pings and detects server close.
 	readCtx, readCancel := context.WithCancel(ctx)
@@ -130,9 +130,9 @@ func (p *StreamPublisher) pump(ctx context.Context, conn *websocket.Conn) {
 }
 
 // enqueue adds a frame non-blocking; returns false when the buffer is full.
-func (p *StreamPublisher) enqueue(msg pkgtypes.PubSubMessage) bool {
+func (p *StreamPublisher) enqueue(msg *pkgtypes.PubSubMessage) bool {
 	select {
-	case p.frames <- msg:
+	case p.frames <- *msg:
 		return true
 	default:
 		return false
@@ -147,7 +147,7 @@ func (p *StreamPublisher) PublishChunk(
 	sequence uint32,
 	payload []byte,
 ) {
-	ok := p.enqueue(pkgtypes.PubSubMessage{
+	ok := p.enqueue(&pkgtypes.PubSubMessage{
 		Type:          pkgtypes.MessageTypeChunk,
 		JobID:         pkgtypes.JobID(jobID),
 		SessionID:     pkgtypes.SessionID(sessionID),
@@ -168,7 +168,7 @@ func (p *StreamPublisher) PublishMetadata(
 	correlationID string,
 	payload []byte,
 ) {
-	ok := p.enqueue(pkgtypes.PubSubMessage{
+	ok := p.enqueue(&pkgtypes.PubSubMessage{
 		Type:          pkgtypes.MessageTypeMetadata,
 		JobID:         pkgtypes.JobID(jobID),
 		SessionID:     pkgtypes.SessionID(sessionID),
@@ -194,7 +194,7 @@ func (p *StreamPublisher) PublishResponse(
 	ciphertext []byte,
 ) {
 	if p.connected.Load() {
-		ok := p.enqueue(pkgtypes.PubSubMessage{
+		ok := p.enqueue(&pkgtypes.PubSubMessage{
 			Type:          pkgtypes.MessageTypeComplete,
 			JobID:         pkgtypes.JobID(jobID),
 			SessionID:     pkgtypes.SessionID(sessionID),

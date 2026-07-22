@@ -89,9 +89,11 @@ type Service struct {
 	metrics       *metrics.Metrics
 	metricsServer *http.Server
 
-	// Gateway mode (non-nil when WORKER_GATEWAY_URL is set)
+	// Gateway mode (non-nil when WORKER_GATEWAY_URL is set). streamPub is
+	// non-nil only in the external sortition profile.
 	gwClient  *gw.Client
 	gwHandler *pipeline.JobHandler
+	streamPub *gw.StreamPublisher
 
 	// Release subsystem. Store is always non-nil (the Tracker writes to it
 	// from the pipeline regardless of cfg.ReleaseEnabled). Scheduler and
@@ -175,7 +177,7 @@ func New(cfg *config.Config) (*Service, error) {
 	logger := newLogger(cfg.LogLevel, cfg.LogFormat)
 
 	if cfg.SortitionEnabled && cfg.WorkerGatewayURL != "" {
-		logger.Warn("both SORTITION_ENABLED and WORKER_GATEWAY_URL are set — sortition mode takes precedence; gateway will be ignored")
+		logger.Info("external worker profile: sortition assignment with gateway egress (responses, heartbeat, drain via worker-gateway)")
 	}
 
 	// Load Ethereum signing key from the go-ethereum keystore file
@@ -332,11 +334,11 @@ func New(cfg *config.Config) (*Service, error) {
 		return nil, fmt.Errorf("unsupported BLOB_MODE %q", blobMode)
 	}
 
-	// In direct Redis mode (non-gateway) we always need a Redis client for
-	// heartbeat, Asynq job queue, and response publishing. Sortition mode also
-	// needs it for the heartbeat monitor. Create it now if blob mode didn't
-	// already create one.
-	if (cfg.WorkerGatewayURL == "" || cfg.SortitionEnabled) && redisClient == nil {
+	// Internal profiles need a Redis client for heartbeat, Asynq queues (or
+	// the sortition heartbeat monitor), and direct response publishing.
+	// External profile (sortition + gateway URL) does all three via the
+	// gateway, so Redis is skipped unless BLOB_MODE=redis already dialed one.
+	if cfg.WorkerGatewayURL == "" && redisClient == nil {
 		redisOpts, err = redis.ParseURL(cfg.RedisURL)
 		if err != nil {
 			chainClient.Close()
@@ -439,6 +441,29 @@ func New(cfg *config.Config) (*Service, error) {
 		searcher = search.NewTavilyClient(cfg.TavilyURL, cfg.TavilyAPIKey, cfg.SearchTimeout)
 	}
 
+	// External profile: replace the direct-Redis publisher with the gateway
+	// stream. The client is reused for heartbeat and drain in runSortitionMode.
+	var extGwClient *gw.Client
+	var extStreamPub *gw.StreamPublisher
+	var publisher pipeline.ResponsePublisher
+	deliveryLabel := metrics.DeliveryAsynq
+	if cfg.SortitionEnabled && cfg.WorkerGatewayURL != "" {
+		extGwClient = gw.NewClient(cfg.WorkerGatewayURL, signingKey, logger)
+		gwAuthCtx, gwAuthCancel := context.WithTimeout(context.Background(), 30*time.Second)
+		err := extGwClient.Authenticate(gwAuthCtx)
+		gwAuthCancel()
+		if err != nil {
+			if redisClient != nil {
+				_ = redisClient.Close()
+			}
+			chainClient.Close()
+			return nil, fmt.Errorf("authenticate with worker-gateway: %w", err)
+		}
+		extStreamPub = gw.NewStreamPublisher(extGwClient, logger)
+		publisher = extStreamPub
+		deliveryLabel = metrics.DeliveryGateway
+	}
+
 	handler := pipeline.NewJobHandler(
 		chainClient,
 		blobFetcher,
@@ -460,10 +485,10 @@ func New(cfg *config.Config) (*Service, error) {
 			SearchMaxResults:    cfg.SearchMaxResults,
 			SearchTimeout:       cfg.SearchTimeout,
 		},
-		nil, // publisher — fallback wires RedisResponsePublisher from redisClient
+		publisher, // nil for internal profiles — fallback wires RedisResponsePublisher
 		checkpoints,
 		metricsCollector,
-		metrics.DeliveryAsynq,
+		deliveryLabel,
 		searcher,
 	)
 	handler.SetReleaseTracker(releaseTracker)
@@ -595,16 +620,21 @@ func New(cfg *config.Config) (*Service, error) {
 		capabilities = append(capabilities, "search")
 	}
 
+	// Heartbeat: internal profiles advertise via Redis; the external profile
+	// heartbeats through the gateway HTTP API in runSortitionMode instead.
 	addrHex := checksumHexNoPrefix(workerAddr)
-	monitor := heartbeat.NewMonitor(redisClient, monitorCfg, addrHex, modelHexStrings, capabilities, jobCounter, cfg.MaxConcurrentJobs, logger, metricsCollector)
+	var monitor *heartbeat.Monitor
+	if redisClient != nil {
+		monitor = heartbeat.NewMonitor(redisClient, monitorCfg, addrHex, modelHexStrings, capabilities, jobCounter, cfg.MaxConcurrentJobs, logger, metricsCollector)
 
-	// Gate startup on a real heartbeat write
-	startCtx, startCancel := context.WithTimeout(context.Background(), startupHeartbeatTimeout)
-	defer startCancel()
-	if err := monitor.EmitOnce(startCtx); err != nil {
-		_ = redisClient.Close()
-		chainClient.Close()
-		return nil, fmt.Errorf("initial heartbeat write failed — check Redis config: %w", err)
+		// Gate startup on a real heartbeat write
+		startCtx, startCancel := context.WithTimeout(context.Background(), startupHeartbeatTimeout)
+		defer startCancel()
+		if err := monitor.EmitOnce(startCtx); err != nil {
+			_ = redisClient.Close()
+			chainClient.Close()
+			return nil, fmt.Errorf("initial heartbeat write failed — check Redis config: %w", err)
+		}
 	}
 
 	logger.Info(
@@ -708,6 +738,8 @@ func New(cfg *config.Config) (*Service, error) {
 		releaseReconciler: releaseReconciler,
 		sessionWatcher:    sessionWatcher,
 		jobWatcher:        jobWatcher,
+		gwClient:          extGwClient,
+		streamPub:         extStreamPub,
 	}, nil
 }
 
@@ -861,6 +893,29 @@ func (s *Service) Run(ctx context.Context) error {
 	return runErr
 }
 
+// gatewayHeartbeatLoop advertises liveness via the gateway HTTP API. Used by
+// legacy gateway mode and the external sortition profile (no direct Redis).
+func (s *Service) gatewayHeartbeatLoop(ctx context.Context) {
+	ticker := time.NewTicker(s.cfg.HeartbeatInterval)
+	defer ticker.Stop()
+	for {
+		payload := gw.HeartbeatPayload{
+			ActiveJobs:   int(s.jobCounter.Load()),
+			MaxJobs:      s.cfg.MaxConcurrentJobs,
+			OllamaStatus: "ready",
+			Uptime:       0, // parity with the legacy gateway-mode loop
+		}
+		if err := s.gwClient.SendHeartbeat(ctx, payload); err != nil {
+			s.logger.Warn("gateway heartbeat failed", "error", err)
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
+	}
+}
+
 // runGatewayMode runs the worker in gateway mode: connects to the worker-gateway
 // via WebSocket for instant job delivery, and sends heartbeats via HTTP.
 func (s *Service) runGatewayMode(ctx context.Context, cancel context.CancelFunc) error {
@@ -870,26 +925,7 @@ func (s *Service) runGatewayMode(ctx context.Context, cancel context.CancelFunc)
 	s.startReleaseSubsystem(ctx)
 
 	// Heartbeat loop (HTTP POST, unchanged)
-	go func() {
-		ticker := time.NewTicker(s.cfg.HeartbeatInterval)
-		defer ticker.Stop()
-		for {
-			payload := gw.HeartbeatPayload{
-				ActiveJobs:   int(s.jobCounter.Load()),
-				MaxJobs:      s.cfg.MaxConcurrentJobs,
-				OllamaStatus: "ready",
-				Uptime:       0, // simplified for MVP
-			}
-			if err := s.gwClient.SendHeartbeat(ctx, payload); err != nil {
-				s.logger.Warn("gateway heartbeat failed", "error", err)
-			}
-			select {
-			case <-ctx.Done():
-				return
-			case <-ticker.C:
-			}
-		}
-	}()
+	go s.gatewayHeartbeatLoop(ctx)
 
 	// Job stream via WebSocket (BRPOP-backed, instant delivery)
 	go s.gwClient.StreamJobs(ctx, s.cfg.MaxConcurrentJobs, func(jobCtx context.Context, job pipeline.JobPayload) error {
@@ -924,10 +960,17 @@ func (s *Service) runSortitionMode(ctx context.Context, _ context.CancelFunc) er
 	// Release subsystem runs identically across all modes.
 	s.startReleaseSubsystem(ctx)
 
-	// Heartbeat monitor — same Redis-backed monitor as direct mode.
-	// The worker must advertise health and capabilities so isEligible/model
-	// checks pass in the SessionManager contract.
-	s.monitor.Start(ctx)
+	// Heartbeat + egress: internal profile uses the Redis monitor; external
+	// profile heartbeats over the gateway and runs the response stream.
+	if s.monitor != nil {
+		s.monitor.Start(ctx)
+	}
+	if s.gwClient != nil {
+		go s.gatewayHeartbeatLoop(ctx)
+	}
+	if s.streamPub != nil {
+		go s.streamPub.Run(ctx)
+	}
 
 	// Both chain watchers run in background goroutines; Start blocks until
 	// ctx is cancelled (ticker loop), so we launch each in its own goroutine.
@@ -938,8 +981,9 @@ func (s *Service) runSortitionMode(ctx context.Context, _ context.CancelFunc) er
 	s.logger.Info("shutdown signal received, stopping gracefully")
 
 	// Set the drain marker so new sessions stop being routed to this worker
-	// while in-flight jobs continue to completion.
-	s.markDrainOnShutdown(false)
+	// while in-flight jobs continue to completion. External profile drains
+	// via the gateway; internal profile writes directly to Redis.
+	s.markDrainOnShutdown(s.gwClient != nil)
 
 	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), s.cfg.ShutdownTimeout)
 	defer shutdownCancel()

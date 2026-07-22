@@ -49,7 +49,7 @@ func newFakeGateway(t *testing.T, wsEnabled bool) (*fakeGateway, *httptest.Serve
 		if err != nil {
 			return
 		}
-		defer conn.Close(websocket.StatusNormalClosure, "")
+		defer func() { _ = conn.Close(websocket.StatusNormalClosure, "") }()
 		for {
 			_, data, err := conn.Read(r.Context())
 			if err != nil {
