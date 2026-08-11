@@ -3,6 +3,7 @@ package chain
 import (
 	"context"
 	"crypto/ecdsa"
+	"errors"
 	"fmt"
 	"math/big"
 	"sort"
@@ -506,6 +507,21 @@ func (c *ChainClient) HasJobCompleted(ctx context.Context, jobID uint64) (bool, 
 // Source: contracts/src/interfaces/IJobRegistry.sol — enum SessionStatus { Active, ... }
 const sessionStatusActive uint8 = 0
 
+// ErrSessionNotActive marks a session that is not in Active status — a
+// condition retrying cannot fix from the worker's side (Closed, or
+// Reassigning away from this worker). Callers classify it as permanent
+// (bounded retry, then skip) rather than transient (unlimited retry).
+var ErrSessionNotActive = errors.New("session not active")
+
+// sessionNotActiveErr builds the ErrSessionNotActive-wrapped error returned
+// by GetSessionEncWorkerKey when a session's status is not Active. Split out
+// from GetSessionEncWorkerKey so the classification is unit-testable without
+// a live chain backend (jobRegistry is a concrete generated binding with no
+// mockable interface seam).
+func sessionNotActiveErr(sessionID uint64, status uint8) error {
+	return fmt.Errorf("session %d: %w (status=%d)", sessionID, ErrSessionNotActive, status)
+}
+
 // GetSessionEncWorkerKey retrieves the current encrypted worker key for a session
 // from JobRegistry session storage. Sessions that are not currently Active are
 // blocked until on-chain failover has completed.
@@ -518,7 +534,7 @@ func (c *ChainClient) GetSessionEncWorkerKey(ctx context.Context, sessionID uint
 		return nil, fmt.Errorf("GetSession %d: %w", sessionID, err)
 	}
 	if sess.Status != sessionStatusActive {
-		return nil, fmt.Errorf("session %d not active: status=%d", sessionID, sess.Status)
+		return nil, sessionNotActiveErr(sessionID, sess.Status)
 	}
 	encWorkerKey := sess.EncWorkerKey
 	if len(encWorkerKey) == 0 {

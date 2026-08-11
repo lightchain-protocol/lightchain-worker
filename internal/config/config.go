@@ -170,6 +170,11 @@ type Config struct {
 	// JobWatcher uses to reconstruct a session's prior job IDs for conversation
 	// history. Defaults to 50000.
 	SortitionHistoryLookbackBlocks uint64
+	// SortitionSessionRetryLimit bounds how many passes the JobWatcher retries
+	// a job whose session is not Active before giving up and skipping it, so
+	// one session that never returns to Active cannot wedge the watcher and
+	// starve every job behind it. Defaults to 10.
+	SortitionSessionRetryLimit int
 
 	// Logging
 	LogLevel  string
@@ -360,6 +365,7 @@ func Load() (*Config, error) {
 	cfg.SortitionPollInterval = parseDuration("SORTITION_POLL_INTERVAL", "4s", &errs)
 	cfg.SortitionConfirmations = parseUint64("SORTITION_CONFIRMATIONS", 0, &errs)
 	cfg.SortitionHistoryLookbackBlocks = parseUint64("SORTITION_HISTORY_LOOKBACK_BLOCKS", 50000, &errs)
+	cfg.SortitionSessionRetryLimit = parseInt("SORTITION_SESSION_RETRY_LIMIT", 10, &errs)
 
 	if len(errs) > 0 {
 		return nil, fmt.Errorf("config load errors:\n  - %s", strings.Join(errs, "\n  - "))

@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -29,6 +30,10 @@ type mockServeClient struct {
 	filterErr     error
 	priorJobIDs   []uint64 // returned by GetPriorSessionJobIDs
 	priorJobErr   error    // returned by GetPriorSessionJobIDs
+	// encWorkerKeyErrOverride, keyed by sessionID, forces GetSessionEncWorkerKey
+	// to always return the given error (takes priority over encWorkerKeys).
+	// Used to model a session that never becomes Active again.
+	encWorkerKeyErrOverride map[uint64]error
 }
 
 type mockBlobInfo struct {
@@ -59,6 +64,9 @@ func (m *mockServeClient) GetSessionInfo(_ context.Context, sessionID uint64) (c
 }
 
 func (m *mockServeClient) GetSessionEncWorkerKey(_ context.Context, sessionID uint64) ([]byte, error) {
+	if err, ok := m.encWorkerKeyErrOverride[sessionID]; ok {
+		return nil, err
+	}
 	if key, ok := m.encWorkerKeys[sessionID]; ok {
 		return key, nil
 	}
@@ -385,4 +393,125 @@ func TestJobWatcher_PriorJobIDsLookupError_ServesSingleTurn(t *testing.T) {
 	payloads := sink.received()
 	require.Len(t, payloads, 1, "job must still be served despite prior-jobs lookup error")
 	require.Empty(t, payloads[0].PriorJobIDs, "PriorJobIDs must be empty on lookup error (single-turn)")
+}
+
+// TestJobWatcher_SessionNotActive_BoundedRetryThenSkip verifies that a job
+// whose session key read keeps returning chain.ErrSessionNotActive is
+// retried at most SessionRetryLimit passes (stop-and-retry, cursor parked
+// before the event) and then skipped (cursor advances past it) on the final
+// pass — and that a later job reachable in that same pass is then served.
+// This is the wedge fix: one session that never returns to Active must not
+// starve every job behind it forever.
+func TestJobWatcher_SessionNotActive_BoundedRetryThenSkip(t *testing.T) {
+	var counter atomic.Int32
+	const retryLimit = 3
+
+	consumer := common.HexToAddress("0x0000000000000000000000000000000000000004")
+	promptHash := common.HexToHash("0xbeefbeefbeefbeefbeefbeefbeefbeefbeefbeefbeefbeefbeefbeefbeefbeef")
+
+	mc := &mockServeClient{
+		head: chain.HeadInfo{Number: 100},
+		jobSubmitted: []chain.JobSubmittedEvent{
+			// job 1's session never comes back Active.
+			{JobID: 1, SessionID: 10, Worker: testMyWorker, BlockNumber: 20},
+			// job 2 is healthy and reachable once job 1 is given up on.
+			{JobID: 2, SessionID: 11, Worker: testMyWorker, BlockNumber: 30},
+		},
+		encWorkerKeyErrOverride: map[uint64]error{
+			10: fmt.Errorf("session %d: %w (status=2)", 10, chain.ErrSessionNotActive),
+		},
+		encWorkerKeys: map[uint64][]byte{
+			11: []byte("encKey"),
+		},
+		blobInfos: map[uint64]mockBlobInfo{
+			2: {promptHash: promptHash, submitBlock: 30},
+		},
+		sessionInfos: map[uint64]chain.SessionInfo{
+			11: {User: consumer, Worker: testMyWorker, Status: 1},
+		},
+	}
+	sink := &mockJobSink{}
+	cs, err := NewCursorStore(t.TempDir())
+	require.NoError(t, err)
+	jw := NewJobWatcher(JobWatcherOpts{
+		Client:            mc,
+		KeyChecker:        &mockKeyChecker{canDecrypt: true},
+		Sink:              sink,
+		Cursor:            cs,
+		Worker:            testMyWorker,
+		JobCounter:        &counter,
+		MaxConcurrent:     4,
+		ChunkSize:         5000,
+		Confirmations:     0,
+		SessionRetryLimit: retryLimit,
+		Logger:            testLogger(t),
+		syncServe:         true,
+	})
+
+	// Passes 1..retryLimit-1: still under the bound, so job 1 stop-and-retries
+	// and RunOnce returns before ever reaching job 2.
+	for i := 1; i < retryLimit; i++ {
+		require.NoError(t, jw.RunOnce(context.Background()))
+		require.Empty(t, sink.received(), "pass %d: nothing must be served while session 10 is stuck", i)
+		got, gErr := cs.Get(cursorJobSubmitted)
+		require.NoError(t, gErr)
+		require.Equal(t, uint64(19), got, "pass %d: cursor must stay parked before job 1's block", i)
+	}
+
+	// Final pass: the bound is hit, job 1 is given up on (continue, not
+	// stop-and-retry), so the loop proceeds to job 2 in the same pass.
+	require.NoError(t, jw.RunOnce(context.Background()))
+
+	payloads := sink.received()
+	require.Len(t, payloads, 1, "job 2 must be served once job 1 is given up on")
+	require.Equal(t, uint64(2), payloads[0].JobID)
+
+	got, err := cs.Get(cursorJobSubmitted)
+	require.NoError(t, err)
+	require.Equal(t, uint64(100), got, "cursor must advance to safeHead after giving up on job 1")
+}
+
+// TestJobWatcher_PlainRPCError_NeverGivesUp verifies that the bounded-retry
+// skip is scoped to chain.ErrSessionNotActive only: an ordinary transient RPC
+// error on GetSessionEncWorkerKey keeps stop-and-retrying forever, even past
+// SessionRetryLimit passes, because it never satisfies errors.Is(err,
+// chain.ErrSessionNotActive).
+func TestJobWatcher_PlainRPCError_NeverGivesUp(t *testing.T) {
+	var counter atomic.Int32
+	const retryLimit = 2 // deliberately small to prove RPC errors ignore it
+
+	mc := &mockServeClient{
+		head: chain.HeadInfo{Number: 100},
+		jobSubmitted: []chain.JobSubmittedEvent{
+			{JobID: 1, SessionID: 10, Worker: testMyWorker, BlockNumber: 20},
+		},
+		// encWorkerKeys deliberately empty → GetSessionEncWorkerKey returns the
+		// mock's generic "no enc worker key" error, which does NOT satisfy
+		// errors.Is(_, chain.ErrSessionNotActive).
+	}
+	sink := &mockJobSink{}
+	cs, err := NewCursorStore(t.TempDir())
+	require.NoError(t, err)
+	jw := NewJobWatcher(JobWatcherOpts{
+		Client:            mc,
+		KeyChecker:        &mockKeyChecker{canDecrypt: true},
+		Sink:              sink,
+		Cursor:            cs,
+		Worker:            testMyWorker,
+		JobCounter:        &counter,
+		MaxConcurrent:     4,
+		ChunkSize:         5000,
+		Confirmations:     0,
+		SessionRetryLimit: retryLimit,
+		Logger:            testLogger(t),
+		syncServe:         true,
+	})
+
+	for i := 1; i <= retryLimit+3; i++ {
+		require.NoError(t, jw.RunOnce(context.Background()))
+		require.Empty(t, sink.received(), "pass %d: job must never be served on a plain RPC error", i)
+		got, gErr := cs.Get(cursorJobSubmitted)
+		require.NoError(t, gErr)
+		require.Equal(t, uint64(19), got, "pass %d: cursor must stay parked (no skip) past retryLimit", i)
+	}
 }

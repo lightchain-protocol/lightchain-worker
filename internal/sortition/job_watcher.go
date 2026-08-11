@@ -3,6 +3,7 @@ package sortition
 import (
 	"context"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"log/slog"
 	"sync/atomic"
@@ -55,8 +56,14 @@ type JobWatcherOpts struct {
 	// session's prior job IDs for conversation history. Defaults to 50000 when
 	// zero.
 	HistoryLookbackBlocks uint64
-	PollInterval          time.Duration
-	Logger                *slog.Logger
+	// SessionRetryLimit bounds how many passes a job may stop-and-retry on
+	// chain.ErrSessionNotActive before it is given up on (cursor advances,
+	// skipping the job) so one session that never returns to Active cannot
+	// wedge the watcher and starve every job behind it. Defaults to 10 when
+	// zero.
+	SessionRetryLimit int
+	PollInterval      time.Duration
+	Logger            *slog.Logger
 	// syncServe is an internal test hook. When true, HandleJobPayload is called
 	// synchronously in RunOnce rather than in a goroutine, making unit tests
 	// fully deterministic without WaitGroups or polling. Must not be set in
@@ -67,19 +74,25 @@ type JobWatcherOpts struct {
 // JobWatcher polls the chain for JobSubmitted events and serves jobs destined
 // for this worker into the inference pipeline.
 type JobWatcher struct {
-	c               ServeClient
-	keys            KeyChecker
-	sink            JobSink
-	cursor          *CursorStore
-	worker          common.Address
-	counter         *atomic.Int32
-	maxJobs         int
-	chunk           uint64
-	confs           uint64
-	historyLookback uint64
-	interval        time.Duration
-	log             *slog.Logger
-	syncServe       bool
+	c                 ServeClient
+	keys              KeyChecker
+	sink              JobSink
+	cursor            *CursorStore
+	worker            common.Address
+	counter           *atomic.Int32
+	maxJobs           int
+	chunk             uint64
+	confs             uint64
+	historyLookback   uint64
+	sessionRetryLimit int
+	// notActiveRetries counts consecutive chain.ErrSessionNotActive passes per
+	// jobID. Only ever touched from RunOnce, which Start() calls sequentially
+	// off a single ticker goroutine, so no mutex is needed. Cleared on success
+	// or on give-up.
+	notActiveRetries map[uint64]int
+	interval         time.Duration
+	log              *slog.Logger
+	syncServe        bool
 }
 
 // NewJobWatcher constructs a JobWatcher from the given options.
@@ -97,20 +110,26 @@ func NewJobWatcher(o JobWatcherOpts) *JobWatcher {
 	if lookback == 0 {
 		lookback = 50000 // ~1.15 days at 2s blocks; covers any realistic session
 	}
+	retryLimit := o.SessionRetryLimit
+	if retryLimit == 0 {
+		retryLimit = 10
+	}
 	return &JobWatcher{
-		c:               o.Client,
-		keys:            o.KeyChecker,
-		sink:            o.Sink,
-		cursor:          o.Cursor,
-		worker:          o.Worker,
-		counter:         o.JobCounter,
-		maxJobs:         o.MaxConcurrent,
-		chunk:           chunk,
-		confs:           o.Confirmations,
-		historyLookback: lookback,
-		interval:        interval,
-		log:             o.Logger,
-		syncServe:       o.syncServe,
+		c:                 o.Client,
+		keys:              o.KeyChecker,
+		sink:              o.Sink,
+		cursor:            o.Cursor,
+		worker:            o.Worker,
+		counter:           o.JobCounter,
+		maxJobs:           o.MaxConcurrent,
+		chunk:             chunk,
+		confs:             o.Confirmations,
+		historyLookback:   lookback,
+		sessionRetryLimit: retryLimit,
+		notActiveRetries:  make(map[uint64]int),
+		interval:          interval,
+		log:               o.Logger,
+		syncServe:         o.syncServe,
 	}
 }
 
@@ -217,6 +236,27 @@ func (w *JobWatcher) RunOnce(ctx context.Context) error {
 
 			enc, encErr := w.c.GetSessionEncWorkerKey(ctx, ev.SessionID)
 			if encErr != nil {
+				if errors.Is(encErr, chain.ErrSessionNotActive) {
+					// Bounded PERMANENT-ish condition: the session may still
+					// return to Active (on-chain failover reassigns it back to
+					// us), so retry a few passes — but not forever, or a
+					// session that's actually Closed for good wedges the
+					// watcher and starves every job behind it.
+					w.notActiveRetries[ev.JobID]++
+					attempts := w.notActiveRetries[ev.JobID]
+					if attempts < w.sessionRetryLimit {
+						w.log.Warn("session not active, retrying next pass",
+							"jobId", ev.JobID, "sessionId", ev.SessionID, "attempts", attempts, "error", encErr)
+						if stopErr := w.stopAndRetry(ev, lo); stopErr != nil {
+							return stopErr
+						}
+						return nil
+					}
+					w.log.Warn("session_not_active_giving_up",
+						"jobId", ev.JobID, "sessionId", ev.SessionID, "attempts", attempts)
+					delete(w.notActiveRetries, ev.JobID)
+					continue
+				}
 				// TRANSIENT: RPC error reading on-chain data that provably exists
 				// (JobSubmitted fires after the session is Active with a key).
 				// Stop-and-retry so the assigned job is not silently dropped.
@@ -227,6 +267,7 @@ func (w *JobWatcher) RunOnce(ctx context.Context) error {
 				}
 				return nil
 			}
+			delete(w.notActiveRetries, ev.JobID) // session is Active again; clear any prior bounded-retry count
 			if !w.keys.CanDecryptSessionKey(enc) {
 				// PERMANENT: the session key is wrapped for a different worker key.
 				// Retrying would never fix this — the consumer must call

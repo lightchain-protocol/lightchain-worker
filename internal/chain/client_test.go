@@ -3,6 +3,7 @@ package chain
 import (
 	"context"
 	"errors"
+	"fmt"
 	"math/big"
 	"sync"
 	"testing"
@@ -533,4 +534,33 @@ func TestChainClient_GetRequestInfo_NoBindingErrors(t *testing.T) {
 	_, err := c.GetRequestInfo(context.Background(), 1)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "session manager binding not configured")
+}
+
+// TestSessionNotActiveErr_MatchesSentinel verifies that the error
+// GetSessionEncWorkerKey returns for a non-Active session is matchable via
+// errors.Is(err, ErrSessionNotActive), and carries sessionID+status context.
+// sessionNotActiveErr is the exact helper GetSessionEncWorkerKey calls, so
+// this exercises the real classification logic without needing a live/mock
+// chain backend (jobRegistry is a concrete *bindings.JobRegistry with no
+// interface seam — see the "NoBindingErrors" tests above).
+func TestSessionNotActiveErr_MatchesSentinel(t *testing.T) {
+	t.Parallel()
+	err := sessionNotActiveErr(42, 2)
+	require.True(t, errors.Is(err, ErrSessionNotActive), "must satisfy errors.Is(err, ErrSessionNotActive)")
+	require.Contains(t, err.Error(), "42")
+	require.Contains(t, err.Error(), "status=2")
+}
+
+// TestSessionNotActiveErr_RPCFailureDoesNotMatchSentinel verifies that a
+// plain RPC failure — wrapped the same way GetSessionEncWorkerKey wraps the
+// GetSession() call error — does NOT satisfy errors.Is(err,
+// ErrSessionNotActive). Only the explicit non-Active-status branch produces a
+// sentinel-matchable error; a transient RPC error must keep retrying forever
+// (stop-and-retry), never hit the bounded-retry skip path.
+func TestSessionNotActiveErr_RPCFailureDoesNotMatchSentinel(t *testing.T) {
+	t.Parallel()
+	rpcErr := errors.New("dial tcp: i/o timeout")
+	wrapped := fmt.Errorf("GetSession %d: %w", 42, rpcErr)
+	require.False(t, errors.Is(wrapped, ErrSessionNotActive))
+	require.True(t, errors.Is(wrapped, rpcErr))
 }
