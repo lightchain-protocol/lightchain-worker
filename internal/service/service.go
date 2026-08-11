@@ -708,6 +708,7 @@ func New(cfg *config.Config) (*Service, error) {
 			ChunkSize:             cfg.SortitionChunkSize,
 			Confirmations:         cfg.SortitionConfirmations,
 			HistoryLookbackBlocks: cfg.SortitionHistoryLookbackBlocks,
+			SessionRetryLimit:     cfg.SortitionSessionRetryLimit,
 			PollInterval:          cfg.SortitionPollInterval,
 			Logger:                logger,
 		})

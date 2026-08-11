@@ -30,6 +30,7 @@ var allEnvKeys = []string{
 	"SORTITION_ENABLED", "SESSION_MANAGER_ADDRESS",
 	"SORTITION_STATE_DIR", "SORTITION_CHUNK_SIZE",
 	"SORTITION_POLL_INTERVAL", "SORTITION_CONFIRMATIONS",
+	"SORTITION_SESSION_RETRY_LIMIT",
 }
 
 // clearEnv ensures all config-related env vars are unset before each test.
@@ -587,6 +588,16 @@ func TestConfig_SortitionDefaults(t *testing.T) {
 	require.Equal(t, uint64(5000), cfg.SortitionChunkSize)
 	require.Equal(t, 4*time.Second, cfg.SortitionPollInterval)
 	require.Equal(t, uint64(0), cfg.SortitionConfirmations)
+	require.Equal(t, 10, cfg.SortitionSessionRetryLimit)
+}
+
+func TestConfig_SortitionSessionRetryLimit_Parses(t *testing.T) {
+	cfg := loadValidConfig(t, map[string]string{
+		"SORTITION_ENABLED":             "true",
+		"SESSION_MANAGER_ADDRESS":       "0x000000000000000000000000000000000000dEaD",
+		"SORTITION_SESSION_RETRY_LIMIT": "25",
+	})
+	require.Equal(t, 25, cfg.SortitionSessionRetryLimit)
 }
 
 func TestConfig_SortitionEnabled_RequiresSessionManager(t *testing.T) {
