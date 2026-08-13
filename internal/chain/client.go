@@ -209,6 +209,23 @@ func (c *ChainClient) AddSupportedModel(ctx context.Context, modelID [32]byte) e
 	})
 }
 
+// SetCapabilities declares this worker's full on-chain capability mask (overwrite, not merge). LC-30.
+func (c *ChainClient) SetCapabilities(ctx context.Context, mask *big.Int) error {
+	return c.submitPreparedTx(ctx, "SetCapabilities", nil, func(opts *bind.TransactOpts) (*types.Transaction, error) {
+		return c.registry.SetCapabilities(opts, mask)
+	})
+}
+
+// GetWorkerCapabilities reads the declared capability mask for the given worker. LC-30.
+func (c *ChainClient) GetWorkerCapabilities(ctx context.Context, worker common.Address) (*big.Int, error) {
+	return c.registry.GetWorkerCapabilities(&bind.CallOpts{Context: ctx}, worker)
+}
+
+// GetCapabilityMask resolves a capability name to its bitmask (zero = not registered on-chain). LC-30.
+func (c *ChainClient) GetCapabilityMask(ctx context.Context, name string) (*big.Int, error) {
+	return c.registry.GetCapabilityMask(&bind.CallOpts{Context: ctx}, name)
+}
+
 // DeregisterWorker submits a deregisterWorker transaction, withdrawing all stake.
 func (c *ChainClient) DeregisterWorker(ctx context.Context) error {
 	return c.submitPreparedTx(ctx, "DeregisterWorker", nil, func(opts *bind.TransactOpts) (*types.Transaction, error) {
@@ -411,6 +428,11 @@ func (c *ChainClient) ClaimSession(ctx context.Context, reqID uint64) error {
 	return c.submitPreparedTx(ctx, "ClaimSession", nil, func(opts *bind.TransactOpts) (*types.Transaction, error) {
 		return c.sessionManager.ClaimSession(opts, new(big.Int).SetUint64(reqID))
 	})
+}
+
+// GetRequiredCapabilities reads a session request's required-capability mask (zero = unconstrained). LC-30.
+func (c *ChainClient) GetRequiredCapabilities(ctx context.Context, reqID uint64) (*big.Int, error) {
+	return c.sessionManager.GetRequiredCapabilities(&bind.CallOpts{Context: ctx}, new(big.Int).SetUint64(reqID))
 }
 
 // EligibleNow returns whether `worker` currently clears the sortition threshold for the request.

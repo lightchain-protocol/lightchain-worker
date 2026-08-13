@@ -162,3 +162,50 @@ func (m *RegistrationManager) Deregister(ctx context.Context) error {
 	m.logger.Info("worker deregistered", "address", m.workerAddr.Hex())
 	return nil
 }
+
+// EnsureCapabilities merges the desired capability names into the worker's
+// on-chain capability mask (LC-30). Best-effort by design: every failure is
+// logged and skipped, never fatal — the worker must come up even when a
+// capability is not yet registered on-chain or the RPC read fails. The
+// on-chain claimSession check is the enforcement point, not this call.
+func (m *RegistrationManager) EnsureCapabilities(ctx context.Context, names []string) {
+	if len(names) == 0 {
+		return
+	}
+
+	want := new(big.Int)
+	for _, name := range names {
+		mask, err := m.client.GetCapabilityMask(ctx, name)
+		if err != nil {
+			m.logger.Warn("capability mask lookup failed", "name", name, "error", err)
+			continue
+		}
+		if mask.Sign() == 0 {
+			m.logger.Warn("capability not registered on-chain; skipping declaration", "name", name)
+			continue
+		}
+		want.Or(want, mask)
+	}
+	if want.Sign() == 0 {
+		return
+	}
+
+	current, err := m.client.GetWorkerCapabilities(ctx, m.workerAddr)
+	if err != nil {
+		m.logger.Warn("worker capability read failed; skipping declaration", "error", err)
+		return
+	}
+	merged := new(big.Int).Or(current, want)
+	if merged.Cmp(current) == 0 {
+		return // already declared
+	}
+
+	if err := m.client.SetCapabilities(ctx, merged); err != nil {
+		m.logger.Warn("setCapabilities failed", "error", err)
+		return
+	}
+	m.logger.Info("declared worker capabilities on-chain",
+		"address", m.workerAddr.Hex(),
+		"mask", merged.String(),
+	)
+}

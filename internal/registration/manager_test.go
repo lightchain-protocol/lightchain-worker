@@ -22,6 +22,21 @@ type mockClient struct {
 	deregisterWorkerFn       func(ctx context.Context) error
 	getMinWorkerStakeFn      func(ctx context.Context) (*big.Int, error)
 	getWorkerEncryptionKeyFn func(ctx context.Context, worker common.Address) ([]byte, error)
+	getCapabilityMaskFn      func(ctx context.Context, name string) (*big.Int, error)
+	getWorkerCapabilitiesFn  func(ctx context.Context, worker common.Address) (*big.Int, error)
+	setCapabilitiesFn        func(ctx context.Context, mask *big.Int) error
+}
+
+func (m *mockClient) GetCapabilityMask(ctx context.Context, name string) (*big.Int, error) {
+	return m.getCapabilityMaskFn(ctx, name)
+}
+
+func (m *mockClient) GetWorkerCapabilities(ctx context.Context, worker common.Address) (*big.Int, error) {
+	return m.getWorkerCapabilitiesFn(ctx, worker)
+}
+
+func (m *mockClient) SetCapabilities(ctx context.Context, mask *big.Int) error {
+	return m.setCapabilitiesFn(ctx, mask)
 }
 
 func (m *mockClient) IsWorkerRegistered(ctx context.Context, worker common.Address) (bool, error) {
@@ -371,4 +386,104 @@ func TestEnsureRegistered_InvalidPubKey_Rejected(t *testing.T) {
 			assert.False(t, chainCalled, "no chain calls must be made when pubkey validation fails")
 		})
 	}
+}
+
+// ──────────────────────────────────────────────
+// EnsureCapabilities (LC-30)
+// ──────────────────────────────────────────────
+
+func TestEnsureCapabilities_DeclaresWhenMissing(t *testing.T) {
+	var setMask *big.Int
+	setCalls := 0
+	mock := &mockClient{
+		getCapabilityMaskFn: func(_ context.Context, name string) (*big.Int, error) {
+			require.Equal(t, "search", name)
+			return big.NewInt(1), nil
+		},
+		getWorkerCapabilitiesFn: func(_ context.Context, _ common.Address) (*big.Int, error) {
+			return big.NewInt(0), nil
+		},
+		setCapabilitiesFn: func(_ context.Context, mask *big.Int) error {
+			setCalls++
+			setMask = mask
+			return nil
+		},
+	}
+
+	mgr := NewManager(mock, testAddr, nil, newLogger())
+	mgr.EnsureCapabilities(context.Background(), []string{"search"})
+	require.Equal(t, 1, setCalls, "SetCapabilities must be called exactly once")
+	assert.Zero(t, setMask.Cmp(big.NewInt(1)), "declared mask must be the search bit")
+}
+
+func TestEnsureCapabilities_IdempotentWhenAlreadyDeclared(t *testing.T) {
+	setCalls := 0
+	mock := &mockClient{
+		getCapabilityMaskFn: func(_ context.Context, _ string) (*big.Int, error) {
+			return big.NewInt(1), nil
+		},
+		getWorkerCapabilitiesFn: func(_ context.Context, _ common.Address) (*big.Int, error) {
+			return big.NewInt(1), nil // already declared
+		},
+		setCapabilitiesFn: func(_ context.Context, _ *big.Int) error {
+			setCalls++
+			return nil
+		},
+	}
+
+	mgr := NewManager(mock, testAddr, nil, newLogger())
+	mgr.EnsureCapabilities(context.Background(), []string{"search"})
+	assert.Zero(t, setCalls, "SetCapabilities must not be called when the mask already covers the wanted bits")
+}
+
+func TestEnsureCapabilities_SkipsUnregisteredCapability(t *testing.T) {
+	setCalls := 0
+	mock := &mockClient{
+		getCapabilityMaskFn: func(_ context.Context, _ string) (*big.Int, error) {
+			return big.NewInt(0), nil // capability not registered on-chain
+		},
+		getWorkerCapabilitiesFn: func(_ context.Context, _ common.Address) (*big.Int, error) {
+			t.Fatal("GetWorkerCapabilities must not be called when nothing resolves")
+			return nil, nil
+		},
+		setCapabilitiesFn: func(_ context.Context, _ *big.Int) error {
+			setCalls++
+			return nil
+		},
+	}
+
+	mgr := NewManager(mock, testAddr, nil, newLogger())
+	mgr.EnsureCapabilities(context.Background(), []string{"search"})
+	assert.Zero(t, setCalls, "SetCapabilities must not be called for an unregistered capability")
+}
+
+func TestEnsureCapabilities_ReadFailureIsNonFatal(t *testing.T) {
+	setCalls := 0
+	mock := &mockClient{
+		getCapabilityMaskFn: func(_ context.Context, _ string) (*big.Int, error) {
+			return big.NewInt(1), nil
+		},
+		getWorkerCapabilitiesFn: func(_ context.Context, _ common.Address) (*big.Int, error) {
+			return nil, errors.New("rpc down")
+		},
+		setCapabilitiesFn: func(_ context.Context, _ *big.Int) error {
+			setCalls++
+			return nil
+		},
+	}
+
+	mgr := NewManager(mock, testAddr, nil, newLogger())
+	mgr.EnsureCapabilities(context.Background(), []string{"search"})
+	assert.Zero(t, setCalls, "SetCapabilities must not be called when the current mask cannot be read")
+}
+
+func TestEnsureCapabilities_NoNamesIsNoOp(t *testing.T) {
+	mock := &mockClient{
+		getCapabilityMaskFn: func(_ context.Context, _ string) (*big.Int, error) {
+			t.Fatal("no chain calls expected for an empty capability list")
+			return nil, nil
+		},
+	}
+	mgr := NewManager(mock, testAddr, nil, newLogger())
+	mgr.EnsureCapabilities(context.Background(), nil)
 }
