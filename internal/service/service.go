@@ -696,8 +696,14 @@ func New(cfg *config.Config) (*Service, error) {
 		}
 		capCtx, capCancel := context.WithTimeout(context.Background(), 30*time.Second)
 		registration.NewManager(chainClient, workerAddr, nil, logger).EnsureCapabilities(capCtx, desiredCaps)
-		ownCaps, capErr := chainClient.GetWorkerCapabilities(capCtx, workerAddr)
 		capCancel()
+		// Fresh budget for the read-back: when EnsureCapabilities actually
+		// broadcast (first boot with a new predicate), WaitMined may have eaten
+		// most of capCtx — reusing it would fail the read and pin ownCaps to 0
+		// for the whole process lifetime, silently skipping constrained sessions.
+		readCtx, readCancel := context.WithTimeout(context.Background(), 30*time.Second)
+		ownCaps, capErr := chainClient.GetWorkerCapabilities(readCtx, workerAddr)
+		readCancel()
 		if capErr != nil {
 			logger.Warn("worker capability mask read failed; watcher runs with empty mask", "error", capErr)
 			ownCaps = big.NewInt(0)
