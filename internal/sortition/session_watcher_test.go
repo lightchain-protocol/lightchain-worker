@@ -53,9 +53,9 @@ type mockClaimClient struct {
 	requestInfos map[uint64]chain.RequestInfo
 	claimed      []uint64
 	claimErr     error
-	requiredCaps map[uint64]*big.Int // LC-30; absent key → 0 (unconstrained)
-	capsErr      error               // LC-30; forces GetRequiredCapabilities to fail
-	capsReads    int                 // LC-30; counts GetRequiredCapabilities calls
+	requiredCaps map[uint64]*big.Int // absent key → 0 (unconstrained)
+	capsErr      error               // forces GetRequiredCapabilities to fail
+	capsReads    int                 // counts GetRequiredCapabilities calls
 }
 
 func (m *mockClaimClient) GetRequiredCapabilities(_ context.Context, reqID uint64) (*big.Int, error) {
@@ -294,7 +294,7 @@ func TestSessionWatcher_DropsExpiredRequest(t *testing.T) {
 }
 
 // ──────────────────────────────────────────────
-// Capability-aware claiming (LC-30)
+// Capability-aware claiming
 // ──────────────────────────────────────────────
 
 // newSWWithCaps mirrors newSW but sets the worker's own capability mask.

@@ -21,7 +21,7 @@ type ClaimClient interface {
 	Head(ctx context.Context) (chain.HeadInfo, error)
 	FilterSessionRequested(ctx context.Context, fromBlock, toBlock uint64) ([]chain.SessionRequestedEvent, error)
 	GetRequestInfo(ctx context.Context, reqID uint64) (chain.RequestInfo, error)
-	// GetRequiredCapabilities reads a request's required-capability mask (zero = unconstrained). LC-30.
+	// GetRequiredCapabilities reads a request's required-capability mask (zero = unconstrained)..
 	GetRequiredCapabilities(ctx context.Context, reqID uint64) (*big.Int, error)
 	EligibleNow(ctx context.Context, reqID uint64, worker common.Address) (bool, error)
 	ClaimSession(ctx context.Context, reqID uint64) error
@@ -38,7 +38,7 @@ type SessionWatcherOpts struct {
 	Confirmations uint64
 	PollInterval  time.Duration
 	Logger        *slog.Logger
-	// OwnCapabilities is this worker's declared on-chain capability mask (LC-30).
+	// OwnCapabilities is this worker's declared on-chain capability mask.
 	// Requests requiring bits outside it are skipped instead of burning a doomed
 	// claim tx. Nil is treated as zero (no capabilities).
 	OwnCapabilities *big.Int
@@ -194,7 +194,7 @@ func (w *SessionWatcher) RunOnce(ctx context.Context) error {
 			continue
 		}
 
-		// LC-30: skip requests whose required capabilities this worker does not
+		// Skip requests whose required capabilities this worker does not
 		// cover — the claim would revert MissingCapabilities anyway. Fail-open on
 		// read errors (the on-chain check is the guarantee, this is gas politeness).
 		caps := w.pending[reqID]

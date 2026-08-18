@@ -163,31 +163,34 @@ func (m *RegistrationManager) Deregister(ctx context.Context) error {
 	return nil
 }
 
-// EnsureCapabilities merges the desired capability names into the worker's
-// on-chain capability mask (LC-30). Best-effort by design: every failure is
-// logged and skipped, never fatal — the worker must come up even when a
-// capability is not yet registered on-chain or the RPC read fails. The
+// EnsureCapabilities syncs the worker's on-chain capability mask to the
+// desired capability names — the worker's configuration is the source of
+// truth, matching setCapabilities' overwrite (not merge) semantics. A worker
+// whose config drops a capability (e.g. search disabled after a revoked API
+// key) must stop advertising it, or it keeps winning constrained claims it
+// can no longer serve.
+//
+// Best-effort by design: every failure is logged and skipped, never fatal —
+// the worker must come up even when a capability is not yet registered
+// on-chain or the RPC read fails. If any desired name fails to resolve, the
+// sync degrades to add-only (never clears bits on partial knowledge). The
 // on-chain claimSession check is the enforcement point, not this call.
 func (m *RegistrationManager) EnsureCapabilities(ctx context.Context, names []string) {
-	if len(names) == 0 {
-		return
-	}
-
 	want := new(big.Int)
+	resolvedAll := true
 	for _, name := range names {
 		mask, err := m.client.GetCapabilityMask(ctx, name)
 		if err != nil {
 			m.logger.Warn("capability mask lookup failed", "name", name, "error", err)
+			resolvedAll = false
 			continue
 		}
 		if mask.Sign() == 0 {
 			m.logger.Warn("capability not registered on-chain; skipping declaration", "name", name)
+			resolvedAll = false
 			continue
 		}
 		want.Or(want, mask)
-	}
-	if want.Sign() == 0 {
-		return
 	}
 
 	current, err := m.client.GetWorkerCapabilities(ctx, m.workerAddr)
@@ -195,17 +198,23 @@ func (m *RegistrationManager) EnsureCapabilities(ctx context.Context, names []st
 		m.logger.Warn("worker capability read failed; skipping declaration", "error", err)
 		return
 	}
-	merged := new(big.Int).Or(current, want)
-	if merged.Cmp(current) == 0 {
-		return // already declared
+
+	target := want
+	if !resolvedAll {
+		// Partial knowledge: only add the bits that resolved; clearing a bit
+		// we merely failed to look up would un-declare a live capability.
+		target = new(big.Int).Or(current, want)
+	}
+	if target.Cmp(current) == 0 {
+		return // already in sync
 	}
 
-	if err := m.client.SetCapabilities(ctx, merged); err != nil {
+	if err := m.client.SetCapabilities(ctx, target); err != nil {
 		m.logger.Warn("setCapabilities failed", "error", err)
 		return
 	}
 	m.logger.Info("declared worker capabilities on-chain",
 		"address", m.workerAddr.Hex(),
-		"mask", merged.String(),
+		"mask", target.String(),
 	)
 }
