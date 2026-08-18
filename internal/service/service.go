@@ -685,7 +685,7 @@ func New(cfg *config.Config) (*Service, error) {
 			chainClient.Close()
 			return nil, fmt.Errorf("open sortition cursor store: %w", csErr)
 		}
-		// LC-30: best-effort capability self-declaration (same predicate that
+		// Best-effort capability self-declaration (same predicate that
 		// advertises "search" in the heartbeat), then one read of the final mask
 		// for the watcher's politeness skip. Every failure degrades to an empty
 		// mask — unconstrained requests stay claimable and the on-chain
