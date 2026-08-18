@@ -94,7 +94,8 @@ func (m *RegistrationManager) EnsureRegistered(ctx context.Context, ecdhPubKey [
 				m.workerAddr.Hex(),
 			)
 		}
-		m.logger.Info("worker already registered on-chain with matching encryption key",
+		m.logger.Info(
+			"worker already registered on-chain with matching encryption key",
 			"address", m.workerAddr.Hex(),
 		)
 		return nil
@@ -121,7 +122,8 @@ func (m *RegistrationManager) EnsureRegistered(ctx context.Context, ecdhPubKey [
 		return fmt.Errorf("register worker: %w", err)
 	}
 
-	m.logger.Info("worker registered on-chain",
+	m.logger.Info(
+		"worker registered on-chain",
 		"address", m.workerAddr.Hex(),
 		"stakeWei", stake.String(),
 	)
@@ -129,24 +131,28 @@ func (m *RegistrationManager) EnsureRegistered(ctx context.Context, ecdhPubKey [
 	for i, modelID := range m.modelIDs {
 		if err := m.client.AddSupportedModel(ctx, modelID); err != nil {
 			modelErr := fmt.Errorf("add supported model at index %d: %w", i, err)
-			m.logger.Warn("AddSupportedModel failed, rolling back registration",
+			m.logger.Warn(
+				"AddSupportedModel failed, rolling back registration",
 				"modelIndex", i,
 				"error", err,
 			)
 			if rollbackErr := m.client.DeregisterWorker(ctx); rollbackErr != nil {
-				m.logger.Error("rollback deregistration also failed",
+				m.logger.Error(
+					"rollback deregistration also failed",
 					"error", rollbackErr,
 				)
 				return errors.Join(modelErr, fmt.Errorf("rollback deregister: %w", rollbackErr))
 			}
-			m.logger.Info("registration rolled back after model failure",
+			m.logger.Info(
+				"registration rolled back after model failure",
 				"address", m.workerAddr.Hex(),
 			)
 			return modelErr
 		}
 	}
 
-	m.logger.Info("all models registered",
+	m.logger.Info(
+		"all models registered",
 		"address", m.workerAddr.Hex(),
 		"modelCount", len(m.modelIDs),
 	)
@@ -213,7 +219,8 @@ func (m *RegistrationManager) EnsureCapabilities(ctx context.Context, names []st
 		m.logger.Warn("setCapabilities failed", "error", err)
 		return
 	}
-	m.logger.Info("declared worker capabilities on-chain",
+	m.logger.Info(
+		"declared worker capabilities on-chain",
 		"address", m.workerAddr.Hex(),
 		"mask", target.String(),
 	)
