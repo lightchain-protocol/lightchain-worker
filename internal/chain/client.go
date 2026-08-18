@@ -432,6 +432,9 @@ func (c *ChainClient) ClaimSession(ctx context.Context, reqID uint64) error {
 
 // GetRequiredCapabilities reads a session request's required-capability mask (zero = unconstrained). LC-30.
 func (c *ChainClient) GetRequiredCapabilities(ctx context.Context, reqID uint64) (*big.Int, error) {
+	if err := c.requireSessionManager(); err != nil {
+		return nil, err
+	}
 	return c.sessionManager.GetRequiredCapabilities(&bind.CallOpts{Context: ctx}, new(big.Int).SetUint64(reqID))
 }
 
