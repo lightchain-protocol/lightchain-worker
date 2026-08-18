@@ -3,6 +3,7 @@ package sortition
 import (
 	"context"
 	"log/slog"
+	"math/big"
 	"sync/atomic"
 	"time"
 
@@ -20,6 +21,8 @@ type ClaimClient interface {
 	Head(ctx context.Context) (chain.HeadInfo, error)
 	FilterSessionRequested(ctx context.Context, fromBlock, toBlock uint64) ([]chain.SessionRequestedEvent, error)
 	GetRequestInfo(ctx context.Context, reqID uint64) (chain.RequestInfo, error)
+	// GetRequiredCapabilities reads a request's required-capability mask (zero = unconstrained)..
+	GetRequiredCapabilities(ctx context.Context, reqID uint64) (*big.Int, error)
 	EligibleNow(ctx context.Context, reqID uint64, worker common.Address) (bool, error)
 	ClaimSession(ctx context.Context, reqID uint64) error
 }
@@ -35,6 +38,10 @@ type SessionWatcherOpts struct {
 	Confirmations uint64
 	PollInterval  time.Duration
 	Logger        *slog.Logger
+	// OwnCapabilities is this worker's declared on-chain capability mask.
+	// Requests requiring bits outside it are skipped instead of burning a doomed
+	// claim tx. Nil is treated as zero (no capabilities).
+	OwnCapabilities *big.Int
 }
 
 // SessionWatcher polls the chain for SessionRequested events and claims
@@ -54,7 +61,11 @@ type SessionWatcher struct {
 	confs    uint64
 	interval time.Duration
 	log      *slog.Logger
-	pending  map[uint64]struct{}
+	ownCaps  *big.Int
+	// pending maps reqID → its required-capability mask, fetched lazily on first
+	// evaluation (nil = not yet fetched). The mask is immutable per request, so a
+	// successful fetch is cached for every later pass.
+	pending map[uint64]*big.Int
 }
 
 // NewSessionWatcher constructs a SessionWatcher from the given options.
@@ -68,6 +79,10 @@ func NewSessionWatcher(o SessionWatcherOpts) *SessionWatcher {
 	if interval == 0 {
 		interval = 30 * time.Second
 	}
+	ownCaps := o.OwnCapabilities
+	if ownCaps == nil {
+		ownCaps = big.NewInt(0)
+	}
 	return &SessionWatcher{
 		c:        o.Client,
 		cursor:   o.Cursor,
@@ -78,7 +93,8 @@ func NewSessionWatcher(o SessionWatcherOpts) *SessionWatcher {
 		confs:    o.Confirmations,
 		interval: interval,
 		log:      o.Logger,
-		pending:  make(map[uint64]struct{}),
+		ownCaps:  ownCaps,
+		pending:  make(map[uint64]*big.Int),
 	}
 }
 
@@ -148,7 +164,7 @@ func (w *SessionWatcher) RunOnce(ctx context.Context) error {
 			}
 
 			for _, r := range reqs {
-				w.pending[r.ReqID] = struct{}{}
+				w.pending[r.ReqID] = nil // capability mask fetched lazily at evaluation
 			}
 
 			if err := w.cursor.Set(cursorSessionRequested, hi); err != nil {
@@ -174,6 +190,28 @@ func (w *SessionWatcher) RunOnce(ctx context.Context) error {
 		}
 
 		if uint64(time.Now().Unix()) > ri.Expiry {
+			delete(w.pending, reqID)
+			continue
+		}
+
+		// Skip requests whose required capabilities this worker does not
+		// cover — the claim would revert MissingCapabilities anyway. Fail-open on
+		// read errors (the on-chain check is the guarantee, this is gas politeness).
+		caps := w.pending[reqID]
+		if caps == nil {
+			fetched, err := w.c.GetRequiredCapabilities(ctx, reqID)
+			if err != nil {
+				w.log.Warn("required-capabilities read failed; proceeding unconstrained",
+					"reqId", reqID, "error", err)
+				fetched = big.NewInt(0) // fail-open; not cached so the next pass retries
+			} else {
+				w.pending[reqID] = fetched
+			}
+			caps = fetched
+		}
+		if caps.Sign() != 0 && new(big.Int).And(caps, w.ownCaps).Cmp(caps) != 0 {
+			w.log.Debug("skipping request requiring capabilities this worker lacks",
+				"reqId", reqID, "requiredMask", caps.String())
 			delete(w.pending, reqID)
 			continue
 		}

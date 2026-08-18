@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"math/big"
 	"sync/atomic"
 	"testing"
 
@@ -52,6 +53,20 @@ type mockClaimClient struct {
 	requestInfos map[uint64]chain.RequestInfo
 	claimed      []uint64
 	claimErr     error
+	requiredCaps map[uint64]*big.Int // absent key → 0 (unconstrained)
+	capsErr      error               // forces GetRequiredCapabilities to fail
+	capsReads    int                 // counts GetRequiredCapabilities calls
+}
+
+func (m *mockClaimClient) GetRequiredCapabilities(_ context.Context, reqID uint64) (*big.Int, error) {
+	m.capsReads++
+	if m.capsErr != nil {
+		return nil, m.capsErr
+	}
+	if c, ok := m.requiredCaps[reqID]; ok {
+		return c, nil
+	}
+	return big.NewInt(0), nil
 }
 
 func (m *mockClaimClient) Head(_ context.Context) (chain.HeadInfo, error) {
@@ -276,4 +291,104 @@ func TestSessionWatcher_DropsExpiredRequest(t *testing.T) {
 	require.NoError(t, sw.RunOnce(context.Background()))
 	require.Empty(t, mc.claimed, "no claim for expired request")
 	require.NotContains(t, sw.pending, uint64(1), "expired request must be pruned from pending")
+}
+
+// ──────────────────────────────────────────────
+// Capability-aware claiming
+// ──────────────────────────────────────────────
+
+// newSWWithCaps mirrors newSW but sets the worker's own capability mask.
+func newSWWithCaps(t *testing.T, mc *mockClaimClient, counter *atomic.Int32, ownCaps *big.Int) *SessionWatcher {
+	t.Helper()
+	cs, err := NewCursorStore(t.TempDir())
+	require.NoError(t, err)
+	return NewSessionWatcher(SessionWatcherOpts{
+		Client:          mc,
+		Cursor:          cs,
+		Worker:          common.HexToAddress("0x0000000000000000000000000000000000000001"),
+		JobCounter:      counter,
+		MaxConcurrent:   4,
+		ChunkSize:       5000,
+		Confirmations:   0,
+		Logger:          testLogger(t),
+		OwnCapabilities: ownCaps,
+	})
+}
+
+func TestSessionWatcher_SkipsRequestRequiringMissingCapability(t *testing.T) {
+	var counter atomic.Int32
+	mc := &mockClaimClient{
+		head:         chain.HeadInfo{Number: 100},
+		requested:    []chain.SessionRequestedEvent{{ReqID: 1, BlockNumber: 10}},
+		eligible:     map[uint64]bool{1: true},
+		requiredCaps: map[uint64]*big.Int{1: big.NewInt(1)},
+	}
+	sw := newSWWithCaps(t, mc, &counter, big.NewInt(0)) // worker has no capabilities
+	require.NoError(t, sw.RunOnce(context.Background()))
+	require.Empty(t, mc.claimed, "must not claim a request whose capabilities it lacks")
+
+	// The request is pruned from pending — a second pass does not re-evaluate it.
+	reads := mc.capsReads
+	require.NoError(t, sw.RunOnce(context.Background()))
+	require.Empty(t, mc.claimed)
+	require.Equal(t, reads, mc.capsReads, "pruned request must not be re-fetched")
+}
+
+func TestSessionWatcher_ClaimsCoveredCapabilityRequest(t *testing.T) {
+	var counter atomic.Int32
+	mc := &mockClaimClient{
+		head:         chain.HeadInfo{Number: 100},
+		requested:    []chain.SessionRequestedEvent{{ReqID: 1, BlockNumber: 10}},
+		eligible:     map[uint64]bool{1: true},
+		requiredCaps: map[uint64]*big.Int{1: big.NewInt(1)},
+	}
+	sw := newSWWithCaps(t, mc, &counter, big.NewInt(1)) // worker declares the bit
+	require.NoError(t, sw.RunOnce(context.Background()))
+	require.Equal(t, []uint64{1}, mc.claimed, "covered request must be claimed")
+}
+
+func TestSessionWatcher_CapabilityReadFailure_FailsOpen(t *testing.T) {
+	var counter atomic.Int32
+	mc := &mockClaimClient{
+		head:      chain.HeadInfo{Number: 100},
+		requested: []chain.SessionRequestedEvent{{ReqID: 1, BlockNumber: 10}},
+		eligible:  map[uint64]bool{1: true},
+		capsErr:   errors.New("rpc down"),
+	}
+	sw := newSWWithCaps(t, mc, &counter, big.NewInt(0))
+	require.NoError(t, sw.RunOnce(context.Background()))
+	require.Equal(t, []uint64{1}, mc.claimed,
+		"capability read failure must fail open — the on-chain claim check is the guarantee")
+}
+
+func TestSessionWatcher_UnconstrainedRequest_ClaimedWithoutCapabilities(t *testing.T) {
+	var counter atomic.Int32
+	mc := &mockClaimClient{
+		head:      chain.HeadInfo{Number: 100},
+		requested: []chain.SessionRequestedEvent{{ReqID: 1, BlockNumber: 10}},
+		eligible:  map[uint64]bool{1: true},
+	}
+	sw := newSWWithCaps(t, mc, &counter, big.NewInt(0))
+	require.NoError(t, sw.RunOnce(context.Background()))
+	require.Equal(t, []uint64{1}, mc.claimed, "mask-0 requests remain claimable by any worker")
+}
+
+func TestSessionWatcher_CapabilityMaskCachedAcrossPasses(t *testing.T) {
+	var counter atomic.Int32
+	mc := &mockClaimClient{
+		head:         chain.HeadInfo{Number: 100},
+		requested:    []chain.SessionRequestedEvent{{ReqID: 1, BlockNumber: 10}},
+		eligible:     map[uint64]bool{1: false}, // not yet sortition-eligible — stays pending
+		requiredCaps: map[uint64]*big.Int{1: big.NewInt(1)},
+	}
+	sw := newSWWithCaps(t, mc, &counter, big.NewInt(1))
+	require.NoError(t, sw.RunOnce(context.Background()))
+	require.NoError(t, sw.RunOnce(context.Background()))
+	require.Equal(t, 1, mc.capsReads, "immutable mask is fetched once and cached in pending")
+
+	// When the window widens, the cached mask is used and the claim lands.
+	mc.eligible[1] = true
+	require.NoError(t, sw.RunOnce(context.Background()))
+	require.Equal(t, []uint64{1}, mc.claimed)
+	require.Equal(t, 1, mc.capsReads)
 }

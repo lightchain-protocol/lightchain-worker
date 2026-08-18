@@ -685,17 +685,42 @@ func New(cfg *config.Config) (*Service, error) {
 			chainClient.Close()
 			return nil, fmt.Errorf("open sortition cursor store: %w", csErr)
 		}
+		// Best-effort capability self-declaration (same predicate that
+		// advertises "search" in the heartbeat), then one read of the final mask
+		// for the watcher's politeness skip. Every failure degrades to an empty
+		// mask — unconstrained requests stay claimable and the on-chain
+		// claimSession check remains the guarantee for constrained ones.
+		var desiredCaps []string
+		if cfg.SearchEnabled && cfg.TavilyAPIKey != "" {
+			desiredCaps = append(desiredCaps, "search")
+		}
+		capCtx, capCancel := context.WithTimeout(context.Background(), 30*time.Second)
+		registration.NewManager(chainClient, workerAddr, nil, logger).EnsureCapabilities(capCtx, desiredCaps)
+		capCancel()
+		// Fresh budget for the read-back: when EnsureCapabilities actually
+		// broadcast (first boot with a new predicate), WaitMined may have eaten
+		// most of capCtx — reusing it would fail the read and pin ownCaps to 0
+		// for the whole process lifetime, silently skipping constrained sessions.
+		readCtx, readCancel := context.WithTimeout(context.Background(), 30*time.Second)
+		ownCaps, capErr := chainClient.GetWorkerCapabilities(readCtx, workerAddr)
+		readCancel()
+		if capErr != nil {
+			logger.Warn("worker capability mask read failed; watcher runs with empty mask", "error", capErr)
+			ownCaps = big.NewInt(0)
+		}
+
 		checker := ecdhKeyChecker{key: ecdhKey}
 		sessionWatcher = sortition.NewSessionWatcher(sortition.SessionWatcherOpts{
-			Client:        chainClient,
-			Cursor:        cursorStore,
-			Worker:        workerAddr,
-			JobCounter:    jobCounter,
-			MaxConcurrent: cfg.MaxConcurrentJobs,
-			ChunkSize:     cfg.SortitionChunkSize,
-			Confirmations: cfg.SortitionConfirmations,
-			PollInterval:  cfg.SortitionPollInterval,
-			Logger:        logger,
+			Client:          chainClient,
+			Cursor:          cursorStore,
+			Worker:          workerAddr,
+			JobCounter:      jobCounter,
+			MaxConcurrent:   cfg.MaxConcurrentJobs,
+			ChunkSize:       cfg.SortitionChunkSize,
+			Confirmations:   cfg.SortitionConfirmations,
+			PollInterval:    cfg.SortitionPollInterval,
+			Logger:          logger,
+			OwnCapabilities: ownCaps,
 		})
 		jobWatcher = sortition.NewJobWatcher(sortition.JobWatcherOpts{
 			Client:                chainClient,
