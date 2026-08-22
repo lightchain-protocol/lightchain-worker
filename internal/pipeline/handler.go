@@ -6,6 +6,7 @@ import (
 	"crypto/ecdsa"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"math/big"
@@ -140,6 +141,26 @@ type HandlerConfig struct {
 	// values fall back to the tokenCoalescer defaults.
 	StreamChunkTokens   int
 	StreamChunkInterval time.Duration
+
+	// DeadlineGuardEnabled turns on the on-chain deadline guard: the
+	// pipeline reads job.deadline at pickup, before inference, and before
+	// the stage-8a blob tx, and aborts with a no-retry error when the job
+	// can no longer settle (completeJob reverts DeadlineExceeded past the
+	// deadline). Only takes effect when the chain client implements
+	// JobDeadlineClient. See pipeline/deadline.go.
+	DeadlineGuardEnabled bool
+	// SettleReserve is the time the guard keeps in hand after generation
+	// ends for encrypt + publish + blob tx + completeJob. Zero falls back
+	// to defaultSettleReserve.
+	SettleReserve time.Duration
+	// CompletionReserve is the minimum remaining window required to start
+	// stage 8a. Zero falls back to defaultCompletionReserve.
+	CompletionReserve time.Duration
+	// MinInferenceBudget is the smallest generation window worth starting;
+	// an acknowledged job with less than SettleReserve+MinInferenceBudget
+	// left is aborted before inference. Zero falls back to
+	// defaultMinInferenceBudget.
+	MinInferenceBudget time.Duration
 }
 
 // ResponsePublisher publishes encrypted responses for real-time delivery.
@@ -569,6 +590,17 @@ func (h *JobHandler) processJob(ctx context.Context, p JobPayload) (err error) {
 		).Observe(time.Since(jobStart).Seconds())
 	}()
 
+	// Stage 0: on-chain deadline guard. completeJob reverts DeadlineExceeded
+	// once the job's deadline passes, so a job that is already expired - or
+	// (retries/redeliveries) too close to expiry to finish inference plus
+	// settlement - is abandoned here, before the ack tx burns gas. Nil when
+	// disabled or when the chain client cannot report deadlines.
+	guard := h.newDeadlineGuard(p.JobID)
+	if guardErr := guard.checkPickup(ctx, logger); guardErr != nil {
+		err = guardErr
+		return err
+	}
+
 	// Stage 1: ACK â€” acknowledge job on-chain. With overlap enabled this
 	// covers the broadcast only and returns a handle joined at stage 1b
 	// below; the ack mines while stages 2-6 run.
@@ -644,7 +676,7 @@ func (h *JobHandler) processJob(ctx context.Context, p JobPayload) (err error) {
 		// answer. Suppress the deltas; the terminal frame is skipped
 		// below by the same flag.
 		producedCiphertext, streamed, infErr := h.runInferencePipeline(
-			ctx, logger, p, blobData, model, delivery, !ckpt.Delivered,
+			ctx, logger, p, blobData, model, delivery, !ckpt.Delivered, guard,
 		)
 		if infErr != nil {
 			err = infErr
@@ -723,7 +755,7 @@ func (h *JobHandler) processJob(ctx context.Context, p JobPayload) (err error) {
 	}
 
 	// Stage 8a: Submit blob TX.
-	versionedHash, blobErr := h.ensureBlobSubmitted(ctx, logger, p.JobID, ckpt, ciphertext, model, delivery)
+	versionedHash, blobErr := h.ensureBlobSubmitted(ctx, logger, p.JobID, ckpt, ciphertext, model, delivery, guard)
 	if blobErr != nil {
 		err = blobErr
 		return err
@@ -737,7 +769,7 @@ func (h *JobHandler) processJob(ctx context.Context, p JobPayload) (err error) {
 		"versionedHash", versionedHash.Hex(),
 		"ciphertextHash", responseCiphertextHash.Hex(),
 	)
-	if cjErr := h.completeJob(ctx, logger, p.JobID, versionedHash, responseCiphertextHash); cjErr != nil {
+	if cjErr := h.completeJob(ctx, logger, p.JobID, versionedHash, responseCiphertextHash, guard); cjErr != nil {
 		rec.End(metrics.OutcomeError, metrics.CacheNone)
 		err = fmt.Errorf("stage 8 (complete job): %w", cjErr)
 		return err
@@ -809,6 +841,10 @@ func (h *JobHandler) readCheckpoint(ctx context.Context, logger *slog.Logger, jo
 //
 // streamDeltas is the caller's permission to emit chunk frames; it is false
 // on a retry whose checkpoint already records a delivered terminal frame.
+//
+// guard is the per-job on-chain deadline guard; nil disables the gate and
+// the inference-window clamp. When active it can abort the pipeline before
+// the history build with a no-retry ErrJobDoomed error.
 func (h *JobHandler) runInferencePipeline(
 	ctx context.Context,
 	logger *slog.Logger,
@@ -816,6 +852,7 @@ func (h *JobHandler) runInferencePipeline(
 	blobData []byte,
 	model, delivery string,
 	streamDeltas bool,
+	guard *deadlineGuard,
 ) ([]byte, uint32, error) {
 	// Stage 3: Get session key (cache miss â†’ chain fetch â†’ store)
 	rec := h.metrics.StartStage(metrics.StageSessionKey, model, delivery)
@@ -873,10 +910,23 @@ func (h *JobHandler) runInferencePipeline(
 		return nil, 0, fmt.Errorf("stage 5 (decode prompt): %w", err)
 	}
 
+	// Deadline gate: an acknowledged job whose remaining window cannot
+	// cover generation plus settlement aborts here with a no-retry error,
+	// before the model load begins. Otherwise the inference context is
+	// clamped to deadline-minus-settle-reserve so an over-running
+	// generation (cold load, slow decode) is cut off while stage 8 could
+	// still theoretically land - and the stage-8a gate makes the final
+	// call before any blob gas is burned.
+	infCtx, infCancel, gateErr := guard.gateInference(ctx, logger)
+	if gateErr != nil {
+		return nil, 0, gateErr
+	}
+	defer infCancel()
+
 	var history []ollama.ChatMessage
 	if len(p.PriorJobIDs) > 0 {
 		var hErr error
-		history, hErr = h.buildConversationHistory(ctx, p.PriorJobIDs, sessionKey)
+		history, hErr = h.buildConversationHistory(infCtx, p.PriorJobIDs, sessionKey)
 		if hErr != nil {
 			logger.Warn("failed to build conversation history, falling back to single prompt",
 				"stage", "inference",
@@ -886,7 +936,7 @@ func (h *JobHandler) runInferencePipeline(
 		}
 	}
 
-	streamer := h.newChunkStreamer(ctx, logger, p, sessionKey, streamDeltas)
+	streamer := h.newChunkStreamer(infCtx, logger, p, sessionKey, streamDeltas)
 
 	rec = h.metrics.StartStage(metrics.StageInference, model, delivery)
 	logger.Info("stage 5 starting",
@@ -898,13 +948,28 @@ func (h *JobHandler) runInferencePipeline(
 		"streaming", streamer != nil,
 		"reasoning", h.cfg.StreamReasoning,
 	)
-	response, stats, err := h.runInference(ctx, logger, modelName, envelope, history, streamer)
+	response, stats, err := h.runInference(infCtx, logger, modelName, envelope, history, streamer)
 	if err != nil {
 		rec.End(metrics.OutcomeError, metrics.CacheMiss)
+		var wrapped error
 		if len(history) > 0 {
-			return nil, streamer.frames(), fmt.Errorf("stage 5 (chat inference): %w", err)
+			wrapped = fmt.Errorf("stage 5 (chat inference): %w", err)
+		} else {
+			wrapped = fmt.Errorf("stage 5 (inference): %w", err)
 		}
-		return nil, streamer.frames(), fmt.Errorf("stage 5 (inference): %w", err)
+		// No-retry classifications. An empty generation repeats
+		// deterministically under identical parameters, and a job whose
+		// on-chain deadline passed mid-generation (e.g. the clamped
+		// inference context fired during a cold model load) can no longer
+		// settle - both are terminal for this job regardless of attempt
+		// count, and retrying only delays the keeper refund.
+		if errors.Is(err, ollama.ErrEmptyGeneration) {
+			return nil, streamer.frames(), noRetry(wrapped)
+		}
+		if guard.isDoomedNow(ctx, logger) {
+			return nil, streamer.frames(), noRetry(fmt.Errorf("%w: %w", wrapped, ErrJobDoomed))
+		}
+		return nil, streamer.frames(), wrapped
 	}
 	d = rec.End(metrics.OutcomeOK, metrics.CacheMiss)
 	logger.Info("stage 5 complete",
@@ -1252,7 +1317,12 @@ func (h *JobHandler) awaitAcknowledged(
 // broadcast slot indefinitely) and persists the resulting hash. Post-audit
 // the contract's completeJob takes a single bytes32 responseBlobHash and
 // enforces blobhash(0) == responseBlobHash, so the blob tx must carry
-// exactly one blob â€” that invariant is checked here.
+// exactly one blob — that invariant is checked here.
+//
+// guard gates the miss path: when the remaining deadline window cannot fit
+// the blob tx plus completeJob, the job is doomed and the blob tx must not
+// be burned. This is the load-bearing deadline gate for retries, where a
+// checkpoint hit bypassed the stage-5 gate entirely.
 func (h *JobHandler) ensureBlobSubmitted(
 	ctx context.Context,
 	logger *slog.Logger,
@@ -1260,6 +1330,7 @@ func (h *JobHandler) ensureBlobSubmitted(
 	ckpt JobCheckpoint,
 	ciphertext []byte,
 	model, delivery string,
+	guard *deadlineGuard,
 ) (common.Hash, error) {
 	if ckpt.HasVersionedHash() {
 		// Cache hit: short-circuit. Record an outcome=skipped sample so
@@ -1277,6 +1348,10 @@ func (h *JobHandler) ensureBlobSubmitted(
 	}
 
 	rec := h.metrics.StartStage(metrics.StageSubmitBlob, model, delivery)
+	if gateErr := guard.gateBlobSubmit(ctx, logger); gateErr != nil {
+		rec.End(metrics.OutcomeError, metrics.CacheMiss)
+		return common.Hash{}, gateErr
+	}
 	logger.Info("stage 8a starting",
 		"stage", "submit_blob",
 		"ciphertextBytes", len(ciphertext),
@@ -1317,6 +1392,7 @@ func (h *JobHandler) completeJob(
 	jobID uint64,
 	responseBlobHash [32]byte,
 	responseCiphertextHash [32]byte,
+	guard *deadlineGuard,
 ) error {
 	// On a retry the job has usually already been completed by the earlier
 	// attempt, so CompleteJob would fail gas estimation against the contract's
@@ -1345,6 +1421,19 @@ func (h *JobHandler) completeJob(
 				"error", err,
 			)
 			return nil
+		}
+		// Past the on-chain deadline the contract's DeadlineExceeded revert
+		// is permanent: no retry can ever settle this job, so classify it
+		// no-retry and let the keeper refund the consumer. Checking chain
+		// state beats parsing the revert reason, which not all RPC nodes
+		// surface faithfully.
+		if guard.isDoomedNow(ctx, logger) {
+			logger.Warn("stage 8b: completeJob failed and the on-chain deadline has passed; not retrying",
+				"stage", "complete_job",
+				"jobID", jobID,
+				"error", err,
+			)
+			return noRetry(fmt.Errorf("complete job: %w: %w", err, ErrJobDoomed))
 		}
 		return fmt.Errorf("complete job: %w", err)
 	}
@@ -1576,7 +1665,22 @@ func (h *JobHandler) buildConversationHistory(
 			if err != nil {
 				return nil, fmt.Errorf("decrypt prompt for job %d: %w", jobID, err)
 			}
-			messages = append(messages, ollama.ChatMessage{Role: "user", Content: string(promptText)})
+			// Prior prompts may be versioned envelopes. Decoding restores
+			// the actual question as the user turn's text and re-attaches
+			// its images, instead of dumping the raw JSON envelope -
+			// including full base64 image payloads - into the context as
+			// text, where it wastes prompt tokens against num_ctx and the
+			// vision model never sees the image as an image.
+			env, dErr := decodePrompt(promptText)
+			if dErr != nil {
+				// Practically unreachable: stage 5 enforces the same image
+				// limit before a job can complete and land in history. Stay
+				// conservative and keep the raw text rather than drop the
+				// turn.
+				messages = append(messages, ollama.ChatMessage{Role: "user", Content: string(promptText)})
+			} else {
+				messages = append(messages, ollama.ChatMessage{Role: "user", Content: env.Text, Images: env.Images})
+			}
 		}
 
 		// Fetch and decrypt response (single blob, lives in completeJob TX block).

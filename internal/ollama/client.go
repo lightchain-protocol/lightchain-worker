@@ -6,6 +6,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -467,6 +468,11 @@ func (c *OllamaClient) GenerateStream(
 // the consumer is charged, the relay publishes nothing, and the browser
 // renders a blank message. Failing here instead lets the job retry.
 //
+// Every returned error wraps ErrEmptyGeneration so the pipeline can mark the
+// failure no-retry: the request parameters are identical on every attempt,
+// so a retry reproduces the same empty generation deterministically and only
+// delays the keeper refund.
+//
 // thinkingBytes separates the two ways this happens, because they need
 // different fixes: a model that spent its whole budget reasoning wants
 // think=false or a larger num_predict, whereas a model that emitted nothing
@@ -477,12 +483,19 @@ func errEmptyGeneration(contentBytes, thinkingBytes int) error {
 	}
 	if thinkingBytes > 0 {
 		return fmt.Errorf(
-			"ollama returned no answer: the whole generation arrived as thinking (%d bytes), which is never transmitted",
+			"%w: the whole generation arrived as thinking (%d bytes), which is never transmitted",
+			ErrEmptyGeneration,
 			thinkingBytes,
 		)
 	}
-	return fmt.Errorf("ollama returned an empty response")
+	return ErrEmptyGeneration
 }
+
+// ErrEmptyGeneration marks a generation that produced zero answer bytes.
+// Retrying with identical parameters reproduces it deterministically, so
+// callers should treat it as no-retry (the pipeline maps it to
+// asynq.SkipRetry).
+var ErrEmptyGeneration = errors.New("ollama returned an empty response")
 
 // ChatStream is the stream=true form of Chat. Deltas arrive in
 // message.content rather than a top-level response field; otherwise the

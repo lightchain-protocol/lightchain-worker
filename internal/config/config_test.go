@@ -22,6 +22,8 @@ var allEnvKeys = []string{
 	"OLLAMA_STREAM", "OLLAMA_KEEP_ALIVE", "OLLAMA_NUM_PREDICT", "OLLAMA_NUM_CTX",
 	"OLLAMA_THINK",
 	"STREAM_CHUNK_TOKENS", "STREAM_CHUNK_INTERVAL",
+	"DEADLINE_GUARD_ENABLED", "DEADLINE_SETTLE_RESERVE",
+	"DEADLINE_COMPLETION_RESERVE", "DEADLINE_MIN_INFERENCE_BUDGET",
 	"BEACON_API_URL", "SESSION_KEY_FILE",
 	"MAX_CONCURRENT_JOBS", "ACK_TX_TIMEOUT", "BLOB_TX_TIMEOUT", "BLOB_FETCH_TIMEOUT",
 	"BLOB_FETCH_RETRIES", "RECEIPT_POLL_INTERVAL", "REDIS_PUBLISH_TIMEOUT",
@@ -603,4 +605,51 @@ func TestValidate_JobRegistryZeroAddress(t *testing.T) {
 		combined += e + " "
 	}
 	assert.Contains(t, combined, "JOB_REGISTRY_ADDRESS must be a non-zero address")
+}
+
+func TestLoad_DeadlineGuardDefaults(t *testing.T) {
+	validEnv(t)
+
+	cfg, err := Load()
+	require.NoError(t, err)
+	assert.True(t, cfg.DeadlineGuardEnabled)
+	assert.Equal(t, 25*time.Second, cfg.SettleReserve)
+	assert.Equal(t, 12*time.Second, cfg.CompletionReserve)
+	assert.Equal(t, 10*time.Second, cfg.MinInferenceBudget)
+	assert.Empty(t, cfg.Validate())
+}
+
+func TestLoad_DeadlineGuardOverrides(t *testing.T) {
+	validEnv(t)
+	t.Setenv("DEADLINE_GUARD_ENABLED", "false")
+	t.Setenv("DEADLINE_SETTLE_RESERVE", "40s")
+	t.Setenv("DEADLINE_COMPLETION_RESERVE", "20s")
+	t.Setenv("DEADLINE_MIN_INFERENCE_BUDGET", "5s")
+
+	cfg, err := Load()
+	require.NoError(t, err)
+	assert.False(t, cfg.DeadlineGuardEnabled)
+	assert.Equal(t, 40*time.Second, cfg.SettleReserve)
+	assert.Equal(t, 20*time.Second, cfg.CompletionReserve)
+	assert.Equal(t, 5*time.Second, cfg.MinInferenceBudget)
+	// Disabled guard skips the reserve constraints entirely.
+	assert.Empty(t, cfg.Validate())
+}
+
+func TestValidate_DeadlineGuardConstraints(t *testing.T) {
+	validEnv(t)
+	// Settle reserve below the completion floor is a misconfiguration: the
+	// guard would clamp inference past the point where stage 8a still runs.
+	t.Setenv("DEADLINE_SETTLE_RESERVE", "10s")
+	t.Setenv("DEADLINE_COMPLETION_RESERVE", "15s")
+
+	cfg, err := Load()
+	require.NoError(t, err)
+
+	combined := ""
+	for _, e := range cfg.Validate() {
+		combined += e + " "
+	}
+	assert.Contains(t, combined, "DEADLINE_SETTLE_RESERVE")
+	assert.Contains(t, combined, "DEADLINE_COMPLETION_RESERVE")
 }

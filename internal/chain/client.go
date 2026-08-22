@@ -770,6 +770,34 @@ func (c *ChainClient) GetJobState(ctx context.Context, jobID uint64) (JobStateIn
 	}, nil
 }
 
+// GetJobDeadline reads the on-chain Job struct and returns the fields the
+// pipeline's deadline guard needs: the job's current binding deadline and
+// whether it has been acknowledged.
+//
+// The contract maintains a single job.deadline field with two meanings over
+// the job's life: at submit it is submittedAt + ackTimeout, and acknowledgeJob
+// rewrites it to ackTimestamp + completionTimeout (JobRegistry.sol). Callers
+// must therefore interpret the returned deadline together with the
+// acknowledged flag: pre-ack it bounds the acknowledgement, post-ack it
+// bounds completion.
+//
+// A zero deadline means the job does not exist (or predates the deadline
+// field); that is an error here so callers fail open by disabling the guard
+// rather than aborting a healthy job on a phantom zero time.
+func (c *ChainClient) GetJobDeadline(ctx context.Context, jobID uint64) (deadline time.Time, acknowledged bool, err error) {
+	if err := c.requireJobRegistry(); err != nil {
+		return time.Time{}, false, err
+	}
+	job, err := c.jobRegistry.GetJob(&bind.CallOpts{Context: ctx}, new(big.Int).SetUint64(jobID))
+	if err != nil {
+		return time.Time{}, false, fmt.Errorf("GetJob %d: %w", jobID, err)
+	}
+	if job.Deadline == nil || job.Deadline.Sign() == 0 {
+		return time.Time{}, false, fmt.Errorf("GetJob %d: zero deadline (job missing or predates deadline field)", jobID)
+	}
+	return time.Unix(job.Deadline.Int64(), 0), JobState(job.State) >= JobStateAcknowledged, nil
+}
+
 // GetDisputeWindow reads AIConfig.getDisputeWindow() with TTL'd caching. The
 // returned duration is the contract's window in seconds (converted to
 // time.Duration).

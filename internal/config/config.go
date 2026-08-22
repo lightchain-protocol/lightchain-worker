@@ -91,6 +91,31 @@ type Config struct {
 	// surfaced roughly 320, leaving the user on a spinner for the rest.
 	StreamReasoning bool
 
+	// Deadline guard (on-chain job.deadline awareness).
+	//
+	// completeJob reverts DeadlineExceeded once block.timestamp passes
+	// job.deadline (ackTimeout before ack, completionTimeout = 120 s after).
+	// The worker's own budgets (asynq task timeout, OllamaTimeout,
+	// BlobTxTimeout) are not derived from that deadline, so without a guard
+	// a cold model load can carry a job past the point where settlement is
+	// possible - the job then still burns its stage-8a blob tx, fails
+	// completeJob, and retries pointlessly until the keeper refunds the
+	// consumer ~2h later.
+	//
+	// DeadlineGuardEnabled (DEADLINE_GUARD_ENABLED, default on) makes the
+	// pipeline read job.deadline at pickup, before inference, and before
+	// the blob tx, aborting with a no-retry error when settlement is
+	// impossible. SettleReserve (DEADLINE_SETTLE_RESERVE, default 25s) is
+	// the post-generation budget the guard protects: encrypt + publish +
+	// blob tx + completeJob. CompletionReserve (DEADLINE_COMPLETION_RESERVE,
+	// default 12s) is the minimum window required to start stage 8a.
+	// MinInferenceBudget (DEADLINE_MIN_INFERENCE_BUDGET, default 10s) is
+	// the smallest generation window worth starting.
+	DeadlineGuardEnabled bool
+	SettleReserve        time.Duration
+	CompletionReserve    time.Duration
+	MinInferenceBudget   time.Duration
+
 	// Beacon API (CL node)
 	BeaconAPIURL string
 
@@ -357,6 +382,12 @@ func Load() (*Config, error) {
 	cfg.StreamChunkInterval = parseDuration("STREAM_CHUNK_INTERVAL", "250ms", &errs)
 	cfg.StreamReasoning = parseBool("STREAM_REASONING", true, &errs)
 
+	// On-chain deadline guard. Defaults match pipeline's fallback reserves.
+	cfg.DeadlineGuardEnabled = parseBool("DEADLINE_GUARD_ENABLED", true, &errs)
+	cfg.SettleReserve = parseDuration("DEADLINE_SETTLE_RESERVE", "25s", &errs)
+	cfg.CompletionReserve = parseDuration("DEADLINE_COMPLETION_RESERVE", "12s", &errs)
+	cfg.MinInferenceBudget = parseDuration("DEADLINE_MIN_INFERENCE_BUDGET", "10s", &errs)
+
 	// Stuck-nonce recovery config
 	cfg.StuckNonceThreshold = parseInt("WORKER_STUCK_NONCE_THRESHOLD", 5, &errs)
 	cfg.StuckNonceMaxBumps = parseInt("WORKER_STUCK_NONCE_MAX_BUMPS", 3, &errs)
@@ -468,6 +499,21 @@ func (c *Config) Validate() []string {
 	}
 	if c.StreamChunkInterval <= 0 {
 		errs = append(errs, "STREAM_CHUNK_INTERVAL must be positive")
+	}
+	if c.DeadlineGuardEnabled {
+		if c.SettleReserve <= 0 {
+			errs = append(errs, "DEADLINE_SETTLE_RESERVE must be positive")
+		}
+		if c.CompletionReserve <= 0 {
+			errs = append(errs, "DEADLINE_COMPLETION_RESERVE must be positive")
+		}
+		if c.MinInferenceBudget <= 0 {
+			errs = append(errs, "DEADLINE_MIN_INFERENCE_BUDGET must be positive")
+		}
+		if c.SettleReserve <= c.CompletionReserve {
+			errs = append(errs, fmt.Sprintf("DEADLINE_SETTLE_RESERVE (%s) must be > DEADLINE_COMPLETION_RESERVE (%s) - the reserve covers the blob tx AND completeJob, the completion floor only the last leg",
+				c.SettleReserve, c.CompletionReserve))
+		}
 	}
 	if c.LogFormat != "json" && c.LogFormat != "text" {
 		errs = append(errs, fmt.Sprintf("LOG_FORMAT: must be \"json\" or \"text\", got %q", c.LogFormat))

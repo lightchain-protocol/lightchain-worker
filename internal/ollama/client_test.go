@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -549,4 +550,25 @@ func TestVerifyModels_ServerError(t *testing.T) {
 	err := client.VerifyModels(context.Background(), []string{"llama3-8b"})
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "status 503")
+}
+
+func TestErrEmptyGeneration_WrapsSentinel(t *testing.T) {
+	t.Parallel()
+
+	// Both empty-generation variants must unwrap to the exported sentinel:
+	// the pipeline maps it to asynq.SkipRetry, and a regression here would
+	// silently restore the burn-all-retries behaviour.
+	err := errEmptyGeneration(0, 0)
+	require.ErrorIs(t, err, ErrEmptyGeneration)
+	assert.Contains(t, err.Error(), "empty response")
+
+	err = errEmptyGeneration(0, 128)
+	require.ErrorIs(t, err, ErrEmptyGeneration)
+	assert.Contains(t, err.Error(), "thinking")
+	assert.Contains(t, err.Error(), "128")
+
+	// A non-empty generation is never an error, and the sentinel never
+	// leaks into unrelated errors.
+	assert.NoError(t, errEmptyGeneration(5, 0))
+	assert.False(t, errors.Is(fmt.Errorf("boom"), ErrEmptyGeneration))
 }
