@@ -19,6 +19,9 @@ var allEnvKeys = []string{
 	"SUPPORTED_MODELS",
 	"REDIS_URL", "REDIS_PASSWORD",
 	"HEARTBEAT_INTERVAL", "OLLAMA_URL", "OLLAMA_TIMEOUT",
+	"OLLAMA_STREAM", "OLLAMA_KEEP_ALIVE", "OLLAMA_NUM_PREDICT", "OLLAMA_NUM_CTX",
+	"OLLAMA_THINK",
+	"STREAM_CHUNK_TOKENS", "STREAM_CHUNK_INTERVAL",
 	"BEACON_API_URL", "SESSION_KEY_FILE",
 	"MAX_CONCURRENT_JOBS", "ACK_TX_TIMEOUT", "BLOB_TX_TIMEOUT", "BLOB_FETCH_TIMEOUT",
 	"BLOB_FETCH_RETRIES", "RECEIPT_POLL_INTERVAL", "REDIS_PUBLISH_TIMEOUT",
@@ -75,6 +78,77 @@ func TestLoad_ValidConfig(t *testing.T) {
 	assert.Equal(t, 5, cfg.StuckNonceThreshold)
 	assert.Equal(t, 3, cfg.StuckNonceMaxBumps)
 	assert.True(t, cfg.StuckNonceAutoReplace, "auto-replace must default to true")
+	// Token streaming defaults
+	assert.True(t, cfg.OllamaStream, "streaming must default to on")
+	assert.Equal(t, "-1", cfg.OllamaKeepAlive)
+	assert.Equal(t, 1024, cfg.OllamaNumPredict)
+	assert.Equal(t, 0, cfg.OllamaNumCtx, "0 means leave the model's context window alone")
+	assert.False(t, cfg.OllamaThink, "thinking must default to off: the worker never transmits it")
+	assert.Equal(t, 8, cfg.StreamChunkTokens)
+	assert.Equal(t, 250*time.Millisecond, cfg.StreamChunkInterval)
+}
+
+func TestLoad_StreamingOverrides(t *testing.T) {
+	validEnv(t)
+	t.Setenv("WORKER_KEYSTORE_PATH", "/tmp/keystore.json")
+	t.Setenv("WORKER_KEYSTORE_PASSWORD", "secret")
+	t.Setenv("OLLAMA_STREAM", "false")
+	t.Setenv("OLLAMA_KEEP_ALIVE", "30m")
+	t.Setenv("OLLAMA_NUM_PREDICT", "2048")
+	t.Setenv("OLLAMA_NUM_CTX", "8192")
+	t.Setenv("STREAM_CHUNK_TOKENS", "16")
+	t.Setenv("STREAM_CHUNK_INTERVAL", "100ms")
+
+	cfg, err := Load()
+	require.NoError(t, err)
+	assert.False(t, cfg.OllamaStream)
+	assert.Equal(t, "30m", cfg.OllamaKeepAlive)
+	assert.Equal(t, 2048, cfg.OllamaNumPredict)
+	assert.Equal(t, 8192, cfg.OllamaNumCtx)
+	assert.Equal(t, 16, cfg.StreamChunkTokens)
+	assert.Equal(t, 100*time.Millisecond, cfg.StreamChunkInterval)
+
+	assert.Empty(t, cfg.Validate())
+}
+
+func TestValidate_StreamingConstraints(t *testing.T) {
+	validEnv(t)
+	t.Setenv("WORKER_KEYSTORE_PATH", "/tmp/keystore.json")
+	t.Setenv("WORKER_KEYSTORE_PASSWORD", "secret")
+	t.Setenv("OLLAMA_NUM_PREDICT", "0")
+	t.Setenv("OLLAMA_NUM_CTX", "-1")
+	t.Setenv("STREAM_CHUNK_TOKENS", "0")
+	t.Setenv("STREAM_CHUNK_INTERVAL", "0s")
+
+	cfg, err := Load()
+	require.NoError(t, err)
+
+	combined := ""
+	for _, e := range cfg.Validate() {
+		combined += e + " "
+	}
+	assert.Contains(t, combined, "OLLAMA_NUM_PREDICT")
+	assert.Contains(t, combined, "OLLAMA_NUM_CTX")
+	assert.Contains(t, combined, "STREAM_CHUNK_TOKENS")
+	assert.Contains(t, combined, "STREAM_CHUNK_INTERVAL")
+}
+
+// TestValidate_NumPredictAcceptsOllamaSentinels pins that -1 (unlimited)
+// and -2 (fill context) stay usable — an operator disabling the cap must
+// not be blocked by the zero check.
+func TestValidate_NumPredictAcceptsOllamaSentinels(t *testing.T) {
+	for _, v := range []string{"-1", "-2"} {
+		t.Run(v, func(t *testing.T) {
+			validEnv(t)
+			t.Setenv("WORKER_KEYSTORE_PATH", "/tmp/keystore.json")
+			t.Setenv("WORKER_KEYSTORE_PASSWORD", "secret")
+			t.Setenv("OLLAMA_NUM_PREDICT", v)
+
+			cfg, err := Load()
+			require.NoError(t, err)
+			assert.Empty(t, cfg.Validate())
+		})
+	}
 }
 
 func TestLoad_StuckNonceOverrides(t *testing.T) {
@@ -458,6 +532,29 @@ func TestLoad_JobExecutionDefaults(t *testing.T) {
 	assert.Equal(t, 10*time.Second, cfg.BlobFetchTimeout)
 	assert.Equal(t, 120*time.Second, cfg.OllamaTimeout)
 	assert.Equal(t, 2*time.Second, cfg.ReceiptPollInterval)
+	assert.True(t, cfg.AckOverlapEnabled, "ack overlap must default to on")
+}
+
+func TestLoad_AckOverlapOverride(t *testing.T) {
+	validEnv(t)
+	t.Setenv("WORKER_KEYSTORE_PATH", "/tmp/keystore.json")
+	t.Setenv("WORKER_KEYSTORE_PASSWORD", "secret")
+	t.Setenv("ACK_OVERLAP_ENABLED", "false")
+
+	cfg, err := Load()
+	require.NoError(t, err)
+	assert.False(t, cfg.AckOverlapEnabled)
+}
+
+func TestLoad_AckOverlapInvalidBoolean(t *testing.T) {
+	validEnv(t)
+	t.Setenv("WORKER_KEYSTORE_PATH", "/tmp/keystore.json")
+	t.Setenv("WORKER_KEYSTORE_PASSWORD", "secret")
+	t.Setenv("ACK_OVERLAP_ENABLED", "sometimes")
+
+	_, err := Load()
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "ACK_OVERLAP_ENABLED")
 }
 
 func TestLoad_JobExecutionOverrides(t *testing.T) {

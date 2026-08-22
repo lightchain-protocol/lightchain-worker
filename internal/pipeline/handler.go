@@ -41,6 +41,23 @@ type InferenceClient interface {
 	Chat(ctx context.Context, model string, messages []ollama.ChatMessage) (string, error)
 }
 
+// StreamingInferenceClient is the optional token-streaming extension of
+// InferenceClient. *ollama.OllamaClient satisfies it. The handler probes
+// for it at stage 5 and silently falls back to the batch methods when the
+// configured client does not implement it, so an InferenceClient that only
+// knows Generate/Chat keeps working unchanged.
+//
+// Both methods return the full accumulated response â€” byte-identical to the
+// concatenation of every delta passed to OnToken â€” so the caller can stream
+// deltas to the user and still encrypt one canonical full response for
+// settlement. Reasoning deltas go to OnThinking and are deliberately absent
+// from that return value; letting them in would change the hash committed by
+// completeJob.
+type StreamingInferenceClient interface {
+	GenerateStream(ctx context.Context, model, prompt string, images []string, h ollama.StreamHandlers) (string, ollama.StreamStats, error)
+	ChatStream(ctx context.Context, model string, messages []ollama.ChatMessage, h ollama.StreamHandlers) (string, ollama.StreamStats, error)
+}
+
 // JobExecutionClient submits job lifecycle transactions on-chain.
 type JobExecutionClient interface {
 	AcknowledgeJob(ctx context.Context, jobID uint64) error
@@ -58,6 +75,23 @@ type JobExecutionClient interface {
 	// completed job along with the blocks they were submitted in. Used to build
 	// conversation history.
 	GetJobBlobInfo(ctx context.Context, jobID uint64) (promptHash common.Hash, responseHash common.Hash, submitBlock uint64, completionBlock uint64, err error)
+}
+
+// AsyncAckClient is the optional non-blocking extension of
+// JobExecutionClient. *chain.ChainClient satisfies it. Stage 1 probes for it
+// and falls back to the blocking AcknowledgeJob when the configured client
+// does not implement it, so a JobExecutionClient that only knows the
+// original method keeps working unchanged.
+//
+// AcknowledgeJobAsync returns once the acknowledgement is on the wire,
+// along with its tx hash and a join function that blocks until the tx is
+// mined with receipt status 1. The join function must be called exactly
+// once: the implementation may hold broadcast resources until it runs.
+//
+// The join is a plain func rather than an interface value so this package
+// stays free of any dependency on the chain package.
+type AsyncAckClient interface {
+	AcknowledgeJobAsync(ctx context.Context, jobID uint64) (common.Hash, func(context.Context) error, error)
 }
 
 // BlobFetcher fetches EIP-4844 blob data from the consensus layer.
@@ -78,18 +112,82 @@ type HandlerConfig struct {
 	ModelIDToName       map[string]string
 	ChainID             *big.Int
 	JobRegistryAddr     common.Address
+
+	// AckOverlapEnabled lets stage 1 return as soon as the acknowledge tx
+	// is broadcast, so stages 2-6 run during the block it mines in rather
+	// than after. It only takes effect when the chain client implements
+	// AsyncAckClient. Stage 1b joins the confirmation before anything is
+	// published or settled â€” see processJob. When off, stage 1 blocks on
+	// the receipt exactly as it did before overlap existed.
+	//
+	// AckTxTimeout bounds broadcast and confirmation together, so the
+	// overlap does not widen the window against the contract's
+	// submit-time ack deadline.
+	AckOverlapEnabled bool
+
+	// StreamEnabled turns on incremental delivery at stage 5. It only
+	// takes effect when the inference client implements
+	// StreamingInferenceClient and the publisher reports SupportsChunks.
+	// When off, the pipeline behaves exactly as it did before streaming
+	// existed: one terminal frame at the end of generation.
+	StreamEnabled bool
+	// StreamReasoning forwards a reasoning model's chain of thought on its
+	// own frame kind instead of discarding it. Off by default: a consumer
+	// that cannot render reasoning would pay for frames it drops.
+	StreamReasoning bool
+	// StreamChunkTokens / StreamChunkInterval are the coalescing window.
+	// A chunk frame goes out when either threshold is reached. Zero
+	// values fall back to the tokenCoalescer defaults.
+	StreamChunkTokens   int
+	StreamChunkInterval time.Duration
 }
 
 // ResponsePublisher publishes encrypted responses for real-time delivery.
 // Implementations: RedisResponsePublisher (direct Redis PUBLISH) and
 // gateway-based publisher (POST to worker-gateway).
+//
+// Frame contract, matching the relay's existing streaming envelope:
+//
+//   - PublishChunk emits type=chunk with Sequence 1..N and TotalChunks 0.
+//     Zero means "not yet known" â€” the worker cannot know how many chunks
+//     a generation will produce until it ends.
+//   - PublishResponse emits the single terminal type=complete frame with
+//     Sequence == TotalChunks == totalFrames, where totalFrames counts
+//     every frame published for the response including this one. A
+//     non-streamed response is therefore Sequence=1, TotalChunks=1.
+//
+// Only the terminal frame carries a signature. It is the EIP-191 signature
+// over the FULL response ciphertext â€” the same bytes anchored in the blob
+// and hashed into completeJob â€” so it stays verifiable against
+// JobRegistry.disputeResponseMismatch. Chunk frames deliberately carry no
+// signature: there is no on-chain commitment to an individual delta, and
+// inventing a per-chunk scheme would produce evidence the contract cannot
+// check.
+//
+// Chunk frames additionally carry a FrameKind naming which content channel
+// the delta belongs to. Sequence stays global across kinds so the relay's gap
+// detection and the terminal frame's totalFrames accounting keep working; the
+// consumer demultiplexes on Kind. Only FrameKindText accumulates into the
+// settlement ciphertext.
 type ResponsePublisher interface {
-	PublishResponse(ctx context.Context, jobID, sessionID uint64, correlationID string, signature string, ciphertext []byte)
+	// PublishResponse publishes the terminal `complete` frame.
+	PublishResponse(ctx context.Context, jobID, sessionID uint64, correlationID string, signature string, ciphertext []byte, totalFrames uint32)
+
+	// PublishChunk publishes one in-flight `chunk` frame carrying a
+	// single coalesced, independently AES-GCM-encrypted delta of the
+	// given kind.
+	PublishChunk(ctx context.Context, jobID, sessionID uint64, correlationID string, sequence uint32, kind pkgtypes.FrameKind, ciphertext []byte)
+
+	// SupportsChunks reports whether PublishChunk actually reaches the
+	// consumer as a distinct `chunk` frame. Publishers that cannot emit
+	// one return false and the handler skips per-chunk encryption
+	// entirely rather than doing work that gets dropped downstream.
+	SupportsChunks() bool
 }
 
 // ReleaseTracker records that a job has just been completed and is now
 // awaiting on-chain release. Defined at the consumer (pipeline) per Go
-// conventions; release.Tracker satisfies it. Optional — the handler runs
+// conventions; release.Tracker satisfies it. Optional â€” the handler runs
 // fine when nil and the periodic reconciler will backfill missed writes.
 type ReleaseTracker interface {
 	MarkEligible(ctx context.Context, jobID uint64, completedAt int64) error
@@ -111,7 +209,7 @@ type JobHandler struct {
 	logger            *slog.Logger
 	cfg               HandlerConfig
 	modelIDToName     map[string]string
-	// metrics is the per-process Prometheus surface. Always non-nil — service.New
+	// metrics is the per-process Prometheus surface. Always non-nil â€” service.New
 	// constructs one and threads it through. Tests construct their own via
 	// metrics.New(testModels) for isolation.
 	metrics *metrics.Metrics
@@ -126,7 +224,7 @@ type JobHandler struct {
 	// releaseTracker is optional. When set (via SetReleaseTracker), the
 	// handler records a stage-8b success so the release scheduler can
 	// settle the job after the dispute window. Failure to write is
-	// non-fatal — the periodic reconciler picks up missed writes.
+	// non-fatal â€” the periodic reconciler picks up missed writes.
 	releaseTracker ReleaseTracker
 	// keyFetchGroup coalesces concurrent cache-miss derivations for the same
 	// session so that N parallel jobs trigger exactly one chain RPC. Only
@@ -142,8 +240,8 @@ func (h *JobHandler) SetReleaseTracker(t ReleaseTracker) {
 }
 
 // NewJobHandler creates a handler wired with all dependencies. publisher
-// may be nil — when nil and redisClient is non-nil, a RedisResponsePublisher
-// is auto-built. checkpoints may be nil — when nil, the handler skips the
+// may be nil â€” when nil and redisClient is non-nil, a RedisResponsePublisher
+// is auto-built. checkpoints may be nil â€” when nil, the handler skips the
 // retry-safety cache (stages 2-6 re-run on every retry).
 //
 // metricsCollector must be non-nil; service.New constructs it. delivery
@@ -226,32 +324,77 @@ type RedisResponsePublisher struct {
 	metrics *metrics.Metrics
 }
 
-// PublishResponse builds the PubSubMessage and PUBLISHes it to the session's
-// Redis channel. Errors are logged but non-fatal — the on-chain blob is the
-// authoritative response. Failure counters are incremented when present so
-// dashboards can track publish health independently of the on-chain path.
+// PublishResponse builds the terminal `complete` PubSubMessage and PUBLISHes
+// it to the session's Redis channel. Errors are logged but non-fatal â€” the
+// on-chain blob is the authoritative response. Failure counters are
+// incremented when present so dashboards can track publish health
+// independently of the on-chain path.
+//
+// totalFrames is the number of frames published for this response including
+// this one, so a non-streamed response passes 1 and reproduces the
+// pre-streaming envelope's TotalChunks.
 func (p *RedisResponsePublisher) PublishResponse(
 	ctx context.Context,
 	jobID, sessionID uint64,
 	correlationID string,
 	signature string,
 	ciphertext []byte,
+	totalFrames uint32,
 ) {
-	resp := pkgtypes.PubSubMessage{
+	if totalFrames == 0 {
+		totalFrames = 1
+	}
+	p.publish(ctx, pkgtypes.PubSubMessage{
 		Type:          pkgtypes.MessageTypeComplete,
 		JobID:         pkgtypes.JobID(jobID),
 		SessionID:     pkgtypes.SessionID(sessionID),
-		Sequence:      0,
-		TotalChunks:   1,
+		Sequence:      totalFrames,
+		TotalChunks:   totalFrames,
 		Payload:       ciphertext,
 		Signature:     signature,
 		CorrelationID: correlationID,
 		Timestamp:     time.Now().Unix(),
-	}
+	})
+}
 
-	data, err := json.Marshal(resp)
+// PublishChunk PUBLISHes one in-flight `chunk` frame. TotalChunks stays 0
+// because the chunk count is not known until generation ends, and the frame
+// is unsigned â€” see the ResponsePublisher doc comment.
+func (p *RedisResponsePublisher) PublishChunk(
+	ctx context.Context,
+	jobID, sessionID uint64,
+	correlationID string,
+	sequence uint32,
+	kind pkgtypes.FrameKind,
+	ciphertext []byte,
+) {
+	p.publish(ctx, pkgtypes.PubSubMessage{
+		Type:          pkgtypes.MessageTypeChunk,
+		Kind:          kind.Normalize(),
+		JobID:         pkgtypes.JobID(jobID),
+		SessionID:     pkgtypes.SessionID(sessionID),
+		Sequence:      sequence,
+		TotalChunks:   0,
+		Payload:       ciphertext,
+		CorrelationID: correlationID,
+		Timestamp:     time.Now().Unix(),
+	})
+}
+
+// SupportsChunks is always true: the relay subscribes to the same channel
+// and forwards every frame immediately without batching or re-typing.
+func (p *RedisResponsePublisher) SupportsChunks() bool { return true }
+
+// publish marshals and PUBLISHes one frame, bounded by publishTimeout so a
+// slow Redis cannot eat into the caller's remaining stage budget.
+func (p *RedisResponsePublisher) publish(ctx context.Context, msg pkgtypes.PubSubMessage) {
+	data, err := json.Marshal(msg)
 	if err != nil {
-		p.logger.Warn("failed to marshal response for Redis", "jobID", jobID, "error", err)
+		p.logger.Warn("failed to marshal response for Redis",
+			"jobID", uint64(msg.JobID),
+			"type", msg.Type,
+			"error", err,
+		)
 		if p.metrics != nil {
 			p.metrics.RedisPublishFailures.Inc()
 		}
@@ -265,9 +408,14 @@ func (p *RedisResponsePublisher) PublishResponse(
 		defer cancel()
 	}
 
-	channel := fmt.Sprintf("session:%d:responses", sessionID)
+	channel := fmt.Sprintf("session:%d:responses", uint64(msg.SessionID))
 	if err := p.client.Publish(pubCtx, channel, data).Err(); err != nil {
-		p.logger.Warn("failed to publish response to Redis", "jobID", jobID, "channel", channel, "error", err)
+		p.logger.Warn("failed to publish response to Redis",
+			"jobID", uint64(msg.JobID),
+			"type", msg.Type,
+			"channel", channel,
+			"error", err,
+		)
 		if p.metrics != nil {
 			p.metrics.RedisPublishFailures.Inc()
 		}
@@ -315,8 +463,8 @@ func (h *JobHandler) HandleTask(ctx context.Context, task *asynq.Task) error {
 
 	// Surface the dispatcher-configured asynq task deadline so operators
 	// can correlate "context deadline exceeded" cascades with the upstream
-	// timeout. The worker does not control this ceiling — the dispatcher
-	// passes it via ctx — so we log it and warn loudly if it looks too
+	// timeout. The worker does not control this ceiling â€” the dispatcher
+	// passes it via ctx â€” so we log it and warn loudly if it looks too
 	// tight for the pipeline's own stage timeouts.
 	deadline, hasDeadline := ctx.Deadline()
 	budget := time.Duration(0)
@@ -410,7 +558,7 @@ func (h *JobHandler) processJob(ctx context.Context, p JobPayload) (err error) {
 				cacheState, delivery, metrics.OutcomePanic,
 			).Observe(time.Since(jobStart).Seconds())
 			// Re-panic so asynq/gateway sees the failure and the stack
-			// trace is preserved — silently swallowing would mask the bug.
+			// trace is preserved â€” silently swallowing would mask the bug.
 			panic(r)
 		}
 		outcome := metrics.OutcomeFor(err)
@@ -421,9 +569,12 @@ func (h *JobHandler) processJob(ctx context.Context, p JobPayload) (err error) {
 		).Observe(time.Since(jobStart).Seconds())
 	}()
 
-	// Stage 1: ACK — acknowledge job on-chain
+	// Stage 1: ACK â€” acknowledge job on-chain. With overlap enabled this
+	// covers the broadcast only and returns a handle joined at stage 1b
+	// below; the ack mines while stages 2-6 run.
 	rec := h.metrics.StartStage(metrics.StageAck, model, delivery)
-	if ackErr := h.ensureAcknowledged(ctx, logger, p.JobID); ackErr != nil {
+	ack, ackErr := h.ensureAcknowledged(ctx, logger, p.JobID)
+	if ackErr != nil {
 		rec.End(metrics.OutcomeError, metrics.CacheNone)
 		err = fmt.Errorf("stage 1 (ack): %w", ackErr)
 		return err
@@ -431,16 +582,21 @@ func (h *JobHandler) processJob(ctx context.Context, p JobPayload) (err error) {
 	d := rec.End(metrics.OutcomeOK, metrics.CacheNone)
 	logger.Info("stage 1 complete",
 		"stage", "ack",
+		"overlapped", ack != nil,
 		"durationMs", d.Milliseconds(),
 	)
 
 	// Read checkpoint once after stage 1. The result determines whether
 	// stages 2-6 (inference), 7 (redis publish), and 8a (blob submit) can
 	// be skipped on a retry. Nil handler or Get error => treat as cache
-	// miss and run the full pipeline — same as pre-checkpoint behavior.
+	// miss and run the full pipeline â€” same as pre-checkpoint behavior.
 	ckpt := h.readCheckpoint(ctx, logger, p.JobID)
 
 	var ciphertext []byte
+	// chunkFrames counts the in-flight `chunk` frames stage 5 streamed.
+	// It stays 0 on a checkpoint hit (inference did not re-run) and feeds
+	// the terminal frame's Sequence/TotalChunks below.
+	var chunkFrames uint32
 
 	if ckpt.HasCiphertext() {
 		cacheState = metrics.CacheHit
@@ -482,16 +638,24 @@ func (h *JobHandler) processJob(ctx context.Context, p JobPayload) (err error) {
 		// Stages 3-6 produce ciphertext; they're wrapped in a helper so the
 		// old inlined code keeps its exact stage-boundary logging but the
 		// checkpoint branching stays readable.
-		producedCiphertext, infErr := h.runInferencePipeline(ctx, logger, p, blobData, model, delivery)
+		// ckpt.Delivered means a terminal frame already reached the
+		// consumer on an earlier attempt, so re-streaming deltas now
+		// would append text after the user already saw the final
+		// answer. Suppress the deltas; the terminal frame is skipped
+		// below by the same flag.
+		producedCiphertext, streamed, infErr := h.runInferencePipeline(
+			ctx, logger, p, blobData, model, delivery, !ckpt.Delivered,
+		)
 		if infErr != nil {
 			err = infErr
 			return err
 		}
 		ciphertext = producedCiphertext
+		chunkFrames = streamed
 
 		// Persist canonical ciphertext. Under a concurrent retry on the
 		// same jobID, SetCiphertextIfAbsent returns the earlier writer's
-		// bytes — we overwrite our local with canonical so stage 7's
+		// bytes â€” we overwrite our local with canonical so stage 7's
 		// publish and stage 8b's hash match what the user already received.
 		if h.checkpoints != nil {
 			canonical, wasSet, cErr := h.checkpoints.SetCiphertextIfAbsent(ctx, p.JobID, ciphertext)
@@ -518,6 +682,18 @@ func (h *JobHandler) processJob(ctx context.Context, p JobPayload) (err error) {
 		}
 	}
 
+	// Stage 1b: join the overlapped acknowledgement. Everything past this
+	// point either shows the user a final answer or moves the job toward
+	// settlement, and neither may happen on a job whose acknowledgement is
+	// not confirmed on-chain. No-op when stage 1 already blocked.
+	//
+	// Normally instant: the ack mines in about one block while stages 2-6
+	// take far longer, so the confirmation has long since landed.
+	if ackErr := h.awaitAcknowledged(ctx, logger, p.JobID, ack, model, delivery); ackErr != nil {
+		err = ackErr
+		return err
+	}
+
 	// Stage 7: Publish to Redis (non-fatal on error). Skipped on retry if
 	// the checkpoint records delivered=true so relay subscribers don't see
 	// a duplicate complete frame.
@@ -529,10 +705,11 @@ func (h *JobHandler) processJob(ctx context.Context, p JobPayload) (err error) {
 		)
 	} else {
 		rec = h.metrics.StartStage(metrics.StageRedisPublish, model, delivery)
-		h.publishToRedis(ctx, logger, p.JobID, p.SessionID, p.CorrelationID, ciphertext)
+		h.publishToRedis(ctx, logger, p.JobID, p.SessionID, p.CorrelationID, ciphertext, chunkFrames+1)
 		d = rec.End(metrics.OutcomeOK, metrics.CacheMiss)
 		logger.Info("stage 7 complete",
 			"stage", "redis_publish",
+			"chunkFrames", chunkFrames,
 			"durationMs", d.Milliseconds(),
 		)
 		if h.checkpoints != nil {
@@ -575,7 +752,7 @@ func (h *JobHandler) processJob(ctx context.Context, p JobPayload) (err error) {
 	// completedAt here is wall-clock time. The reconciler later overwrites
 	// it with the authoritative on-chain Job.completedAt, and the
 	// scheduler always re-reads on-chain state via GetJobState before
-	// releasing — so a slightly off local timestamp can only delay
+	// releasing â€” so a slightly off local timestamp can only delay
 	// release, never cause a wrongful one. This call MUST be non-fatal:
 	// a failure cannot fail the job (which would trigger asynq retry of
 	// an already-completed on-chain job). Reconciler backs us up.
@@ -626,21 +803,26 @@ func (h *JobHandler) readCheckpoint(ctx context.Context, logger *slog.Logger, jo
 // runInferencePipeline runs stages 3-6: session key fetch, prompt
 // decryption, Ollama inference (with optional conversation history),
 // and response encryption. Returns the ciphertext that stages 7 and 8a
-// will publish/submit. All stage-boundary log lines are preserved
+// will publish/submit, plus the number of in-flight `chunk` frames stage 5
+// streamed to the consumer. All stage-boundary log lines are preserved
 // verbatim against the pre-checkpoint implementation.
+//
+// streamDeltas is the caller's permission to emit chunk frames; it is false
+// on a retry whose checkpoint already records a delivered terminal frame.
 func (h *JobHandler) runInferencePipeline(
 	ctx context.Context,
 	logger *slog.Logger,
 	p JobPayload,
 	blobData []byte,
 	model, delivery string,
-) ([]byte, error) {
-	// Stage 3: Get session key (cache miss → chain fetch → store)
+	streamDeltas bool,
+) ([]byte, uint32, error) {
+	// Stage 3: Get session key (cache miss â†’ chain fetch â†’ store)
 	rec := h.metrics.StartStage(metrics.StageSessionKey, model, delivery)
 	sessionKey, err := h.getOrDeriveSessionKey(ctx, logger, p.SessionID)
 	if err != nil {
 		rec.End(metrics.OutcomeError, metrics.CacheMiss)
-		return nil, fmt.Errorf("stage 3 (session key): %w", err)
+		return nil, 0, fmt.Errorf("stage 3 (session key): %w", err)
 	}
 	d := rec.End(metrics.OutcomeOK, metrics.CacheMiss)
 	logger.Info("stage 3 complete",
@@ -650,7 +832,7 @@ func (h *JobHandler) runInferencePipeline(
 
 	// Stage 4: Decrypt prompt.
 	//
-	// On decryption failure, try refreshing the session key from chain once —
+	// On decryption failure, try refreshing the session key from chain once â€”
 	// the session key may have been rotated via updateSessionKey.
 	// GetSessionEncWorkerKey reads session storage directly, so a refresh
 	// picks up the current key regardless of how it was set.
@@ -664,13 +846,13 @@ func (h *JobHandler) runInferencePipeline(
 		refreshed, refreshErr := h.refreshSessionKey(ctx, logger, p.SessionID)
 		if refreshErr != nil {
 			rec.End(metrics.OutcomeError, metrics.CacheMiss)
-			return nil, fmt.Errorf("stage 4 (decrypt prompt): %w (refresh failed: %v)", err, refreshErr)
+			return nil, 0, fmt.Errorf("stage 4 (decrypt prompt): %w (refresh failed: %v)", err, refreshErr)
 		}
 		sessionKey = refreshed
 		prompt, err = pkgcrypto.Decrypt(sessionKey, blobData)
 		if err != nil {
 			rec.End(metrics.OutcomeError, metrics.CacheMiss)
-			return nil, fmt.Errorf("stage 4 (decrypt prompt after key refresh): %w", err)
+			return nil, 0, fmt.Errorf("stage 4 (decrypt prompt after key refresh): %w", err)
 		}
 	}
 	d = rec.End(metrics.OutcomeOK, metrics.CacheMiss)
@@ -683,10 +865,14 @@ func (h *JobHandler) runInferencePipeline(
 	// Stage 5: AI inference (with conversation history if prior jobs exist)
 	modelName, err := h.resolveModelName(p.ModelID)
 	if err != nil {
-		return nil, fmt.Errorf("stage 5 (resolve model): %w", err)
+		return nil, 0, fmt.Errorf("stage 5 (resolve model): %w", err)
 	}
 
-	var response string
+	envelope, err := decodePrompt(prompt)
+	if err != nil {
+		return nil, 0, fmt.Errorf("stage 5 (decode prompt): %w", err)
+	}
+
 	var history []ollama.ChatMessage
 	if len(p.PriorJobIDs) > 0 {
 		var hErr error
@@ -700,41 +886,57 @@ func (h *JobHandler) runInferencePipeline(
 		}
 	}
 
+	streamer := h.newChunkStreamer(ctx, logger, p, sessionKey, streamDeltas)
+
 	rec = h.metrics.StartStage(metrics.StageInference, model, delivery)
 	logger.Info("stage 5 starting",
 		"stage", "inference",
 		"model", modelName,
-		"promptBytes", len(prompt),
+		"promptBytes", envelope.bytes(),
+		"promptImages", len(envelope.Images),
 		"historyTurns", len(history),
+		"streaming", streamer != nil,
+		"reasoning", h.cfg.StreamReasoning,
 	)
-	if len(history) > 0 {
-		messages := append(history, ollama.ChatMessage{Role: "user", Content: string(prompt)})
-		response, err = h.ollamaClient.Chat(ctx, modelName, messages)
-		if err != nil {
-			rec.End(metrics.OutcomeError, metrics.CacheMiss)
-			return nil, fmt.Errorf("stage 5 (chat inference): %w", err)
+	response, stats, err := h.runInference(ctx, logger, modelName, envelope, history, streamer)
+	if err != nil {
+		rec.End(metrics.OutcomeError, metrics.CacheMiss)
+		if len(history) > 0 {
+			return nil, streamer.frames(), fmt.Errorf("stage 5 (chat inference): %w", err)
 		}
-	} else {
-		response, err = h.ollamaClient.Generate(ctx, modelName, string(prompt))
-		if err != nil {
-			rec.End(metrics.OutcomeError, metrics.CacheMiss)
-			return nil, fmt.Errorf("stage 5 (inference): %w", err)
-		}
+		return nil, streamer.frames(), fmt.Errorf("stage 5 (inference): %w", err)
 	}
 	d = rec.End(metrics.OutcomeOK, metrics.CacheMiss)
 	logger.Info("stage 5 complete",
 		"stage", "inference",
 		"model", modelName,
 		"responseBytes", len(response),
+		"chunkFrames", streamer.frames(),
+		"promptTokens", stats.PromptTokens,
+		"evalTokens", stats.EvalTokens,
+		"thinkingBytes", stats.ThinkingBytes,
+		"tokensPerSecond", fmt.Sprintf("%.1f", stats.TokensPerSecond()),
 		"durationMs", d.Milliseconds(),
 	)
 
-	// Stage 6: Encrypt response
+	// Hand the model's own measurements to the consumer alongside the
+	// answer. Ollama reports these on its terminal object and the worker
+	// used to drop them, so the UI had no way to show tokens or throughput.
+	streamer.recordStats(stats)
+
+	// Stage 6: Encrypt response.
+	//
+	// This is the canonical full-response ciphertext: it is what stage 7's
+	// terminal frame carries and signs, what stage 8a anchors in the blob,
+	// and what stage 8b hashes into completeJob. Streaming does not touch
+	// it â€” the per-chunk ciphertexts published above are an independent,
+	// throwaway encryption of the same plaintext deltas and are never
+	// concatenated, hashed, or committed anywhere.
 	rec = h.metrics.StartStage(metrics.StageEncrypt, model, delivery)
 	ciphertext, err := pkgcrypto.Encrypt(sessionKey, []byte(response))
 	if err != nil {
 		rec.End(metrics.OutcomeError, metrics.CacheMiss)
-		return nil, fmt.Errorf("stage 6 (encrypt response): %w", err)
+		return nil, streamer.frames(), fmt.Errorf("stage 6 (encrypt response): %w", err)
 	}
 	d = rec.End(metrics.OutcomeOK, metrics.CacheMiss)
 	logger.Info("stage 6 complete",
@@ -743,20 +945,146 @@ func (h *JobHandler) runInferencePipeline(
 		"durationMs", d.Milliseconds(),
 	)
 
-	return ciphertext, nil
+	return ciphertext, streamer.frames(), nil
 }
 
-func (h *JobHandler) ensureAcknowledged(ctx context.Context, logger *slog.Logger, jobID uint64) error {
+// runInference executes the stage-5 model call. When streamer is non-nil it
+// uses the streaming API and feeds coalesced deltas to the consumer as they
+// arrive; otherwise it makes the original batch call. Either way it returns
+// the complete response text.
+func (h *JobHandler) runInference(
+	ctx context.Context,
+	logger *slog.Logger,
+	modelName string,
+	prompt promptEnvelope,
+	history []ollama.ChatMessage,
+	streamer *chunkStreamer,
+) (string, ollama.StreamStats, error) {
+	if streamer == nil {
+		var (
+			text string
+			err  error
+		)
+		if len(history) > 0 || len(prompt.Images) > 0 {
+			text, err = h.ollamaClient.Chat(ctx, modelName, chatMessages(history, prompt))
+		} else {
+			text, err = h.ollamaClient.Generate(ctx, modelName, prompt.Text)
+		}
+		return text, ollama.StreamStats{}, err
+	}
+
+	handlers := ollama.StreamHandlers{
+		OnToken: func(delta string) error {
+			return streamer.Add(pkgtypes.FrameKindText, delta)
+		},
+	}
+	// Reasoning is only forwarded when the consumer asked for it. A client
+	// that cannot render a reasoning part would otherwise receive frames it
+	// silently drops, having paid for the bandwidth.
+	if h.cfg.StreamReasoning {
+		handlers.OnThinking = func(delta string) error {
+			return streamer.Add(pkgtypes.FrameKindReasoning, delta)
+		}
+	}
+
+	var (
+		response string
+		stats    ollama.StreamStats
+		err      error
+	)
+	if len(history) > 0 || len(prompt.Images) > 0 {
+		response, stats, err = streamer.client.ChatStream(ctx, modelName, chatMessages(history, prompt), handlers)
+	} else {
+		response, stats, err = streamer.client.GenerateStream(ctx, modelName, prompt.Text, prompt.Images, handlers)
+	}
+	if err != nil {
+		return "", stats, err
+	}
+
+	// Emit whatever is left in every coalescing window. publish never
+	// returns an error, so this can only fail if the coalescer contract
+	// changes; log rather than fail a generation that already succeeded.
+	if fErr := streamer.FlushAll(); fErr != nil {
+		logger.Warn("failed to flush trailing token chunk",
+			"stage", "inference",
+			"error", fErr,
+		)
+	}
+	return response, stats, nil
+}
+
+// chatMessages appends the current prompt as the final user turn. Images ride
+// on that turn: Ollama attaches them to the most recent user message.
+func chatMessages(history []ollama.ChatMessage, prompt promptEnvelope) []ollama.ChatMessage {
+	messages := make([]ollama.ChatMessage, 0, len(history)+1)
+	messages = append(messages, history...)
+	return append(messages, ollama.ChatMessage{
+		Role:    "user",
+		Content: prompt.Text,
+		Images:  prompt.Images,
+	})
+}
+
+// ackConfirmation is the handle stage 1 hands to stage 1b when the
+// acknowledgement was broadcast but not yet mined. The confirmation runs on
+// its own goroutine from the moment of broadcast, so it makes progress
+// during stages 2-6 and the join is normally already satisfied.
+//
+// A nil *ackConfirmation means there is nothing to join â€” the job was
+// already acknowledged, or stage 1 blocked on the receipt itself. All
+// methods are nil-safe.
+type ackConfirmation struct {
+	txHash common.Hash
+	// done is closed once err holds the final result. Closing establishes
+	// the happens-before edge that lets the joiner read err unsynchronized.
+	done chan struct{}
+	err  error
+}
+
+// awaitConfirmed blocks until the confirmation resolves, ctx is done, or
+// timeout elapses. The timeout is a backstop: the watcher goroutine is
+// already bounded by the same budget, so a job can never park here waiting
+// on a goroutine that has silently stopped making progress.
+func (a *ackConfirmation) awaitConfirmed(ctx context.Context, timeout time.Duration) error {
+	if a == nil {
+		return nil
+	}
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+
+	select {
+	case <-a.done:
+		return a.err
+	case <-timer.C:
+		return fmt.Errorf("timed out after %s waiting for ack tx %s to confirm", timeout, a.txHash.Hex())
+	case <-ctx.Done():
+		return fmt.Errorf("job context ended before ack tx %s confirmed: %w", a.txHash.Hex(), ctx.Err())
+	}
+}
+
+// ensureAcknowledged runs stage 1. It returns a non-nil *ackConfirmation
+// only when an acknowledgement is in flight and stage 1b must join it;
+// nil means the job is known-acknowledged and the pipeline may proceed
+// unconditionally.
+func (h *JobHandler) ensureAcknowledged(
+	ctx context.Context,
+	logger *slog.Logger,
+	jobID uint64,
+) (*ackConfirmation, error) {
 	acknowledged, err := h.chainClient.HasJobAcknowledged(ctx, jobID)
 	if err != nil {
-		return fmt.Errorf("check acknowledged state: %w", err)
+		return nil, fmt.Errorf("check acknowledged state: %w", err)
 	}
 	if acknowledged {
 		logger.Info("stage 1: job already acknowledged on-chain, skipping ack tx",
 			"stage", "ack",
 			"path", "already_acked",
 		)
-		return nil
+		return nil, nil
+	}
+
+	if async, ok := h.asyncAckClient(); ok {
+		return h.broadcastAck(ctx, logger, async, jobID)
 	}
 
 	logger.Info("stage 1: sending ack tx",
@@ -769,21 +1097,152 @@ func (h *JobHandler) ensureAcknowledged(ctx context.Context, logger *slog.Logger
 	defer ackCancel()
 
 	if err := h.chainClient.AcknowledgeJob(ackCtx, jobID); err != nil {
-		acknowledged, checkErr := h.chainClient.HasJobAcknowledged(ctx, jobID)
-		if checkErr != nil {
-			return fmt.Errorf("acknowledge job: %w (recheck failed: %v)", err, checkErr)
-		}
-		if acknowledged {
-			logger.Warn("stage 1: ack tx returned error but job is acknowledged on-chain",
-				"stage", "ack",
-				"error", err,
-			)
-			return nil
-		}
-		return fmt.Errorf("acknowledge job: %w", err)
+		return nil, h.reconcileAckError(ctx, logger, jobID, err)
 	}
 
-	return nil
+	return nil, nil
+}
+
+// asyncAckClient reports whether stage 1 may overlap, i.e. the operator
+// left ACK_OVERLAP_ENABLED on and the configured chain client can broadcast
+// without blocking on the receipt.
+func (h *JobHandler) asyncAckClient() (AsyncAckClient, bool) {
+	if !h.cfg.AckOverlapEnabled {
+		return nil, false
+	}
+	async, ok := h.chainClient.(AsyncAckClient)
+	return async, ok
+}
+
+// broadcastAck puts the acknowledgement on the wire and starts watching for
+// its receipt in the background, returning as soon as the broadcast lands
+// so the caller can start fetching the blob and generating.
+func (h *JobHandler) broadcastAck(
+	ctx context.Context,
+	logger *slog.Logger,
+	async AsyncAckClient,
+	jobID uint64,
+) (*ackConfirmation, error) {
+	logger.Info("stage 1: broadcasting ack tx, confirming in background",
+		"stage", "ack",
+		"path", "broadcast_ack",
+		"timeout", h.cfg.AckTxTimeout.String(),
+	)
+
+	// One budget covers broadcast and confirmation together, matching what
+	// the blocking path spends end to end. Overlapping must not stretch
+	// the ack past the deadline the contract recorded at submit time.
+	ackCtx, ackCancel := context.WithTimeout(ctx, h.cfg.AckTxTimeout)
+
+	txHash, join, err := async.AcknowledgeJobAsync(ackCtx, jobID)
+	if err != nil {
+		ackCancel()
+		return nil, h.reconcileAckError(ctx, logger, jobID, err)
+	}
+
+	confirmation := &ackConfirmation{txHash: txHash, done: make(chan struct{})}
+	go func() {
+		// Ordering matters: err is written, then done is closed, then the
+		// budget is released. Deferred calls run last-registered-first.
+		defer ackCancel()
+		defer close(confirmation.done)
+		confirmation.err = join(ackCtx)
+	}()
+
+	return confirmation, nil
+}
+
+// reconcileAckError converts a failed acknowledge attempt into either a
+// clean nil (the tx actually landed) or a wrapped error. Shared by the
+// blocking and broadcast paths.
+func (h *JobHandler) reconcileAckError(
+	ctx context.Context,
+	logger *slog.Logger,
+	jobID uint64,
+	ackErr error,
+) error {
+	acknowledged, checkErr := h.chainClient.HasJobAcknowledged(ctx, jobID)
+	if checkErr != nil {
+		return fmt.Errorf("acknowledge job: %w (recheck failed: %v)", ackErr, checkErr)
+	}
+	if acknowledged {
+		logger.Warn("stage 1: ack tx returned error but job is acknowledged on-chain",
+			"stage", "ack",
+			"error", ackErr,
+		)
+		return nil
+	}
+	return fmt.Errorf("acknowledge job: %w", ackErr)
+}
+
+// awaitAcknowledged runs stage 1b: the join that guarantees nothing is
+// published or settled for a job whose acknowledgement is not confirmed
+// on-chain with receipt status 1.
+//
+// Failure here is deliberately terminal. The job is abandoned before stage
+// 7's terminal frame and before stages 8a/8b, so no settlement is attempted
+// against an unacknowledged job. The error names the acknowledgement
+// explicitly so it reads differently from an inference failure in logs and
+// in the {reason} metric label.
+func (h *JobHandler) awaitAcknowledged(
+	ctx context.Context,
+	logger *slog.Logger,
+	jobID uint64,
+	ack *ackConfirmation,
+	model, delivery string,
+) error {
+	if ack == nil {
+		return nil
+	}
+
+	rec := h.metrics.StartStage(metrics.StageAckConfirm, model, delivery)
+	confirmErr := ack.awaitConfirmed(ctx, h.cfg.AckTxTimeout)
+	if confirmErr == nil {
+		d := rec.End(metrics.OutcomeOK, metrics.CacheNone)
+		logger.Info("stage 1b complete",
+			"stage", "ack_confirm",
+			"ackTxHash", ack.txHash.Hex(),
+			"durationMs", d.Milliseconds(),
+		)
+		return nil
+	}
+
+	// The watcher can lose its race without the acknowledgement having
+	// failed â€” a receipt wait that expires moments before the tx lands, a
+	// dropped RPC connection. Re-read chain state before condemning the
+	// job: stages 2-6 have burned far more wall time than the confirmation
+	// budget, so a late mine is visible by now. The JobAcknowledged event
+	// only exists if the tx mined successfully, so this cannot mistake a
+	// revert for a success.
+	acknowledged, checkErr := h.chainClient.HasJobAcknowledged(ctx, jobID)
+	if checkErr == nil && acknowledged {
+		d := rec.End(metrics.OutcomeOK, metrics.CacheNone)
+		logger.Warn("stage 1b: ack confirmation failed but job is acknowledged on-chain",
+			"stage", "ack_confirm",
+			"ackTxHash", ack.txHash.Hex(),
+			"durationMs", d.Milliseconds(),
+			"error", confirmErr,
+		)
+		return nil
+	}
+
+	rec.End(metrics.OutcomeError, metrics.CacheNone)
+	logger.Error("stage 1b: acknowledgement not confirmed, abandoning job before settlement",
+		"stage", "ack_confirm",
+		"ackTxHash", ack.txHash.Hex(),
+		"error", confirmErr,
+		"recheckError", checkErr,
+	)
+	if checkErr != nil {
+		return fmt.Errorf(
+			"stage 1b (ack confirm): acknowledgement for job %d not confirmed on-chain, refusing to settle: %w (recheck failed: %v)",
+			jobID, confirmErr, checkErr,
+		)
+	}
+	return fmt.Errorf(
+		"stage 1b (ack confirm): acknowledgement for job %d not confirmed on-chain, refusing to settle: %w",
+		jobID, confirmErr,
+	)
 }
 
 // ensureBlobSubmitted is the stage-8a equivalent of ensureAcknowledged: it
@@ -793,7 +1252,7 @@ func (h *JobHandler) ensureAcknowledged(ctx context.Context, logger *slog.Logger
 // broadcast slot indefinitely) and persists the resulting hash. Post-audit
 // the contract's completeJob takes a single bytes32 responseBlobHash and
 // enforces blobhash(0) == responseBlobHash, so the blob tx must carry
-// exactly one blob — that invariant is checked here.
+// exactly one blob â€” that invariant is checked here.
 func (h *JobHandler) ensureBlobSubmitted(
 	ctx context.Context,
 	logger *slog.Logger,
@@ -859,6 +1318,22 @@ func (h *JobHandler) completeJob(
 	responseBlobHash [32]byte,
 	responseCiphertextHash [32]byte,
 ) error {
+	// On a retry the job has usually already been completed by the earlier
+	// attempt, so CompleteJob would fail gas estimation against the contract's
+	// JobState.Acknowledged requirement. That failure is harmless on its own -
+	// nothing is broadcast - but it used to reset the shared nonce counter
+	// while sibling jobs held allocated nonces, stalling them behind a 30s
+	// Asynq retry. Ask first on the path where the answer is usually yes.
+	if retryCount, _ := asynq.GetRetryCount(ctx); retryCount > 0 {
+		if completed, cErr := h.chainClient.HasJobCompleted(ctx, jobID); cErr == nil && completed {
+			logger.Info("stage 8b: job already completed on-chain, skipping",
+				"stage", "complete_job",
+				"path", "retry_already_complete",
+			)
+			return nil
+		}
+	}
+
 	if err := h.chainClient.CompleteJob(ctx, jobID, responseBlobHash, responseCiphertextHash); err != nil {
 		completed, checkErr := h.chainClient.HasJobCompleted(ctx, jobID)
 		if checkErr != nil {
@@ -954,7 +1429,7 @@ func (h *JobHandler) deriveAndStoreSessionKey(ctx context.Context, logger *slog.
 	}
 
 	if err := h.keyStore.StoreKey(sessionID, sessionKey); err != nil {
-		// Log but don't fail — key is in memory for this job
+		// Log but don't fail â€” key is in memory for this job
 		logger.Warn("failed to persist session key",
 			"stage", "session_key",
 			"error", err,
@@ -990,14 +1465,24 @@ func init() {
 	}
 }
 
-// publishToRedis signs and publishes the response via the configured ResponsePublisher.
-// Errors are logged but non-fatal — the on-chain blob is the authoritative response.
+// publishToRedis signs and publishes the terminal response frame via the
+// configured ResponsePublisher. Errors are logged but non-fatal â€” the
+// on-chain blob is the authoritative response.
+//
+// The signature is over the FULL response ciphertext, unchanged by
+// streaming: it is the same EIP-191 evidence
+// JobRegistry.disputeResponseMismatch verifies, over the same bytes stage
+// 8a anchors and stage 8b hashes.
+//
+// totalFrames is chunkFrames+1 â€” every frame published for this response
+// including this terminal one, so a non-streamed response passes 1.
 func (h *JobHandler) publishToRedis(
 	ctx context.Context,
 	logger *slog.Logger,
 	jobID, sessionID uint64,
 	correlationID string,
 	ciphertext []byte,
+	totalFrames uint32,
 ) {
 	if h.responsePublisher == nil {
 		return
@@ -1014,7 +1499,7 @@ func (h *JobHandler) publishToRedis(
 	}
 
 	sigHex := "0x" + hex.EncodeToString(sig)
-	h.responsePublisher.PublishResponse(ctx, jobID, sessionID, correlationID, sigHex, ciphertext)
+	h.responsePublisher.PublishResponse(ctx, jobID, sessionID, correlationID, sigHex, ciphertext, totalFrames)
 }
 
 // signMismatchEvidence produces an EIP-191 worker signature over the domain-separated
@@ -1036,7 +1521,7 @@ func signMismatchEvidence(
 }
 
 // responseMismatchDigest computes keccak256(abi.encode(chainid, jobRegistryAddr,
-// jobId, sessionId, ciphertext)) — the inner hash that JobRegistry wraps with
+// jobId, sessionId, ciphertext)) â€” the inner hash that JobRegistry wraps with
 // EIP-191 before verifying in disputeResponseMismatch.
 func responseMismatchDigest(
 	chainID *big.Int,
@@ -1064,7 +1549,7 @@ func responseMismatchDigest(
 // decrypts them, and assembles an ordered conversation.
 //
 // Security: PriorJobIDs comes from the trusted dispatcher (not user input).
-// Additionally, blobs are decrypted with the current session's key — if a job
+// Additionally, blobs are decrypted with the current session's key â€” if a job
 // ID belongs to a different session, decryption will fail, preventing
 // cross-session data leakage.
 func (h *JobHandler) buildConversationHistory(

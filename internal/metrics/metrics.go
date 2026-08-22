@@ -49,7 +49,14 @@ const (
 	// Stage names — must match the slog "stage" attribute used in
 	// pipeline/handler.go, so log-based and metric-based diagnostics can
 	// be cross-referenced by stage name.
+	//
+	// ack and ack_confirm split what used to be a single blocking stage 1.
+	// With ACK_OVERLAP_ENABLED, ack covers only the broadcast and
+	// ack_confirm covers the later join on the receipt; the two together
+	// are comparable to the old ack timing. With overlap off, ack keeps
+	// its original meaning and ack_confirm is never observed.
 	StageAck          = "ack"
+	StageAckConfirm   = "ack_confirm"
 	StageFetchBlob    = "fetch_blob"
 	StageSessionKey   = "session_key"
 	StageDecrypt      = "decrypt"

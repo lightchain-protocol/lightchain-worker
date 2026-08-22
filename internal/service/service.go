@@ -249,8 +249,15 @@ func New(cfg *config.Config) (*Service, error) {
 		return nil, fmt.Errorf("create session key store: %w", err)
 	}
 
-	// Ollama client
-	ollamaClient := ollama.NewOllamaClient(cfg.OllamaURL, cfg.OllamaTimeout)
+	// Ollama client. keep_alive and the options object ride in every
+	// request body, so they configure any Ollama instance the worker talks
+	// to without operator action on that host.
+	ollamaClient := ollama.NewOllamaClientWithOptions(cfg.OllamaURL, cfg.OllamaTimeout, ollama.ClientOptions{
+		KeepAlive:  cfg.OllamaKeepAlive,
+		NumPredict: cfg.OllamaNumPredict,
+		NumCtx:     cfg.OllamaNumCtx,
+		Think:      ollama.ThinkSetting(cfg.OllamaThink),
+	})
 	if err := ollamaClient.VerifyModels(context.Background(), cfg.SupportedModels); err != nil {
 		logger.Warn("ollama model verification failed (non-fatal)", "error", err)
 	}
@@ -424,6 +431,11 @@ func New(cfg *config.Config) (*Service, error) {
 			ModelIDToName:       modelIDToName,
 			ChainID:             big.NewInt(cfg.ChainID),
 			JobRegistryAddr:     cfg.JobRegistryAddress,
+			AckOverlapEnabled:   cfg.AckOverlapEnabled,
+			StreamEnabled:       cfg.OllamaStream,
+			StreamReasoning:     cfg.StreamReasoning,
+			StreamChunkTokens:   cfg.StreamChunkTokens,
+			StreamChunkInterval: cfg.StreamChunkInterval,
 		},
 		nil, // publisher — fallback wires RedisResponsePublisher from redisClient
 		checkpoints,
@@ -464,12 +476,16 @@ func New(cfg *config.Config) (*Service, error) {
 			ecdhKey,
 			jobCounter,
 			logger,
+			// StreamEnabled is deliberately omitted: gatewayResponsePublisher
+			// reports SupportsChunks()==false, so the handler would skip
+			// streaming anyway. See that type's doc comment.
 			pipeline.HandlerConfig{
-				AckTxTimeout:    cfg.AckTxTimeout,
-				BlobTxTimeout:   cfg.BlobTxTimeout,
-				ModelIDToName:   modelIDToName,
-				ChainID:         big.NewInt(cfg.ChainID),
-				JobRegistryAddr: cfg.JobRegistryAddress,
+				AckTxTimeout:      cfg.AckTxTimeout,
+				BlobTxTimeout:     cfg.BlobTxTimeout,
+				ModelIDToName:     modelIDToName,
+				ChainID:           big.NewInt(cfg.ChainID),
+				JobRegistryAddr:   cfg.JobRegistryAddress,
+				AckOverlapEnabled: cfg.AckOverlapEnabled,
 			},
 			gwPublisher,
 			checkpoints,
@@ -559,6 +575,7 @@ func New(cfg *config.Config) (*Service, error) {
 		"maxConcurrentJobs", cfg.MaxConcurrentJobs,
 		"queue", queueName,
 		"ackTxTimeout", cfg.AckTxTimeout.String(),
+		"ackOverlapEnabled", cfg.AckOverlapEnabled,
 		"blobTxTimeout", cfg.BlobTxTimeout.String(),
 		"minExpectedTaskBudget", (cfg.AckTxTimeout + cfg.BlobTxTimeout + 10*time.Second).String(),
 		"stuckNonceThreshold", cfg.StuckNonceThreshold,
@@ -637,6 +654,13 @@ func (s *Service) startMetricsServer() {
 }
 
 // gatewayResponsePublisher publishes responses via the worker-gateway HTTP API.
+//
+// Incremental delivery is not available on this path. The gateway's
+// POST /api/jobs/{jobId}/response handler forwards Sequence and TotalChunks
+// but hardcodes the pub/sub frame's Type to `complete`, so a delta sent
+// through it would reach the consumer as a terminal frame and finalize the
+// message early. Until the gateway can carry a frame type, SupportsChunks
+// returns false and gateway-mode workers keep the single-frame behaviour.
 type gatewayResponsePublisher struct {
 	client  *gw.Client
 	logger  *slog.Logger
@@ -649,14 +673,39 @@ func (p *gatewayResponsePublisher) PublishResponse(
 	correlationID string,
 	signature string,
 	ciphertext []byte,
+	totalFrames uint32,
 ) {
-	if err := p.client.PublishResponse(ctx, jobID, sessionID, correlationID, signature, ciphertext); err != nil {
+	if totalFrames == 0 {
+		totalFrames = 1
+	}
+	if err := p.client.PublishResponse(ctx, jobID, sessionID, correlationID, signature, ciphertext, totalFrames, totalFrames); err != nil {
 		p.logger.Warn("gateway response publish failed (non-fatal)", "jobID", jobID, "error", err)
 		if p.metrics != nil {
 			p.metrics.RedisPublishFailures.Inc()
 		}
 	}
 }
+
+// PublishChunk is unreachable in practice — SupportsChunks() is false, so
+// the handler never builds a chunk streamer for this publisher. It is
+// implemented defensively rather than left to panic if that gating ever
+// changes.
+func (p *gatewayResponsePublisher) PublishChunk(
+	_ context.Context,
+	jobID, _ uint64,
+	_ string,
+	sequence uint32,
+	kind pkgtypes.FrameKind,
+	_ []byte,
+) {
+	p.logger.Warn("gateway publisher cannot emit chunk frames; dropping delta",
+		"jobID", jobID,
+		"sequence", sequence,
+		"kind", kind.Normalize(),
+	)
+}
+
+func (p *gatewayResponsePublisher) SupportsChunks() bool { return false }
 
 // Run starts the heartbeat goroutine and Asynq server (or gateway poll loop),
 // waits for SIGINT/SIGTERM, then gracefully shuts down.

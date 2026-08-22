@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/ecdsa"
 	"fmt"
+	"log/slog"
 	"math/big"
 	"sync"
 	"time"
@@ -34,7 +35,12 @@ var (
 // using the go-ethereum ethclient and the generated pkg/chain/bindings for WorkerRegistry,
 // AIConfig, and JobRegistry.
 type ChainClient struct {
-	ethClient       *ethclient.Client
+	ethClient *ethclient.Client
+	// receiptBackend is what awaitMined polls for receipts. Nil in
+	// production, where it falls back to ethClient; tests that exercise
+	// the post-broadcast half without a live EL inject a stub. Same
+	// pattern as jobTxBackend below.
+	receiptBackend  bind.DeployBackend
 	jobTxBackend    jobTxBackend
 	registry        *bindings.WorkerRegistry
 	aiConfig        *bindings.AIConfig
@@ -261,6 +267,86 @@ func (c *ChainClient) adjustGasPrice(basePrice *big.Int) *big.Int {
 	return adjusted.Div(adjusted, big.NewInt(10000))
 }
 
+// PendingTx is a transaction that has been broadcast but not yet mined.
+// It owns the coordinator's broadcast slot until Wait runs, so the caller
+// MUST call Wait exactly once on every path â€” otherwise the slot is only
+// reclaimed by the coordinator's janitor after maxTokenLifetime, and the
+// other subpool class stays blocked until then.
+type PendingTx struct {
+	client *ChainClient
+	tx     *types.Transaction
+	txName string
+	token  *BroadcastToken
+
+	once    sync.Once
+	waitErr error
+}
+
+// Hash returns the broadcast transaction's hash. Available immediately,
+// before the transaction is mined.
+func (p *PendingTx) Hash() common.Hash {
+	return p.tx.Hash()
+}
+
+// Wait blocks until the transaction is mined with a successful receipt, or
+// ctx is done, and releases the broadcast slot on either path. Idempotent:
+// later calls return the first result without re-querying the chain.
+//
+// ctx bounds only this wait, not the broadcast, and it is not required to
+// be the context the transaction was broadcast with â€” a caller that
+// overlaps other work with the mining time will normally pass a fresh
+// bounded context here.
+func (p *PendingTx) Wait(ctx context.Context) error {
+	p.once.Do(func() {
+		p.waitErr = p.client.awaitMined(ctx, p.txName, p.tx, p.token)
+	})
+	return p.waitErr
+}
+
+// awaitMined is the post-broadcast half of submitPreparedTx: block for the
+// receipt, validate it, and release the coordinator slot.
+func (c *ChainClient) awaitMined(
+	ctx context.Context,
+	txName string,
+	tx *types.Transaction,
+	token *BroadcastToken,
+) error {
+	// The slot is held until the tx leaves the pool â€” mined or errored â€”
+	// because geth reserves a sender across subpools. Releasing at
+	// broadcast instead would let a blob tx in while this one is still
+	// pending and reintroduce "address already reserved".
+	defer token.Done()
+
+	receiptBackend := c.receiptBackend
+	if receiptBackend == nil {
+		receiptBackend = c.ethClient
+	}
+
+	receipt, err := bind.WaitMined(ctx, receiptBackend, tx)
+	if err != nil {
+		// Symmetric with BlobTxSubmitter.SubmitBlobTx: SendTransaction
+		// already succeeded, so the tx is on the wire and the local nonce
+		// has advanced past it. A WaitMined failure (ctx deadline, dead
+		// EL) without a reset here leaves the counter drifting from chain
+		// pending, which is the same cascading-gap failure mode seen on
+		// testnet. Reset forces the next NextNonce() to refetch pending
+		// from chain. Unlike the blob path, no logger is threaded through
+		// ChainClient â€” the chain-refetch on subsequent NextNonce is
+		// currently silent, tracked as a separate observability follow-up.
+		c.nonceMgr.ResetNonce()
+		return fmt.Errorf("wait for %s tx %s: %w", txName, tx.Hash().Hex(), err)
+	}
+	if err := checkReceipt(receipt, txName); err != nil {
+		return c.classifyReceiptRevert(ctx, txName, tx, receipt, err)
+	}
+
+	// A mined receipt means this tx is no longer in the pool. Clear the
+	// stuck tracker â€” future rejections at a new nonce start fresh.
+	c.stuckNonceTracker().Clear()
+
+	return nil
+}
+
 // submitPreparedTx handles transactions with explicit pre-send and post-send phases.
 // If tx construction fails after reserving a nonce but before broadcast, the nonce manager is reset.
 func (c *ChainClient) submitPreparedTx(
@@ -269,6 +355,23 @@ func (c *ChainClient) submitPreparedTx(
 	value *big.Int,
 	build func(opts *bind.TransactOpts) (*types.Transaction, error),
 ) error {
+	pending, err := c.broadcastPreparedTx(ctx, txName, value, build)
+	if err != nil {
+		return err
+	}
+	return pending.Wait(ctx)
+}
+
+// broadcastPreparedTx is the pre-send half of submitPreparedTx: reserve the
+// broadcast slot and a nonce, build, sign, and send. It returns as soon as
+// the transaction is on the wire, leaving the receipt wait to the caller
+// via PendingTx.Wait.
+func (c *ChainClient) broadcastPreparedTx(
+	ctx context.Context,
+	txName string,
+	value *big.Int,
+	build func(opts *bind.TransactOpts) (*types.Transaction, error),
+) (pending *PendingTx, err error) {
 	backend := c.jobTxBackend
 	if backend == nil {
 		backend = c.ethClient
@@ -276,30 +379,41 @@ func (c *ChainClient) submitPreparedTx(
 
 	gasPrice, err := backend.SuggestGasPrice(ctx)
 	if err != nil {
-		return fmt.Errorf("suggest gas price: %w", err)
+		return nil, fmt.Errorf("suggest gas price: %w", err)
 	}
 
 	// Enter the coordinator's legacy lane before reserving a nonce. This
 	// blocks only if the BLOB lane has pending txs (cross-subpool exclusion
 	// required by geth's sender reservation). Same-class callers run in
-	// parallel — geth's legacypool orders them by nonce.
+	// parallel â€” geth's legacypool orders them by nonce.
 	coordinator := c.broadcastCoordinator()
 	token, err := coordinator.Enter(ctx, ClassLegacy)
 	if err != nil {
-		return fmt.Errorf("wait for %s broadcast slot: %w", txName, err)
+		return nil, fmt.Errorf("wait for %s broadcast slot: %w", txName, err)
 	}
-	// Token.Done is idempotent, so deferring on every exit path is safe.
-	defer token.Done()
+	// Ownership of the slot transfers to the returned PendingTx. Until
+	// that value exists, every exit path has to release it here or the
+	// blob lane stays blocked. Abandon is idempotent.
+	defer func() {
+		if pending == nil {
+			token.Abandon()
+		}
+	}()
 
 	auth, err := bind.NewKeyedTransactorWithChainID(c.signingKey, c.chainID)
 	if err != nil {
-		return fmt.Errorf("create transactor: %w", err)
+		return nil, fmt.Errorf("create transactor: %w", err)
 	}
 
 	nonce, err := c.nonceMgr.NextNonce(ctx)
 	if err != nil {
-		return fmt.Errorf("nonce manager: %w", err)
+		return nil, fmt.Errorf("nonce manager: %w", err)
 	}
+	// The nonce is a lease. Release it on every exit path, reporting whether
+	// it reached the network, so a peer's reset cannot re-seed the counter
+	// while this one is still mid-broadcast.
+	nonceConsumed := false
+	defer func() { c.nonceMgr.ReleaseNonce(nonce, nonceConsumed) }()
 
 	auth.Context = ctx
 	auth.Nonce = new(big.Int).SetUint64(nonce)
@@ -309,18 +423,39 @@ func (c *ChainClient) submitPreparedTx(
 
 	tx, err := build(auth)
 	if err != nil {
-		c.nonceMgr.ResetNonce()
-		return fmt.Errorf("%s transaction: %w", txName, err)
+		return nil, fmt.Errorf("%s transaction: %w", txName, err)
 	}
 
 	if err := ctx.Err(); err != nil {
-		c.nonceMgr.ResetNonce()
-		return fmt.Errorf("broadcast %s tx: %w", txName, err)
+		return nil, fmt.Errorf("broadcast %s tx: %w", txName, err)
 	}
 
-	if err := backend.SendTransaction(ctx, tx); err != nil {
+	sendErr := backend.SendTransaction(ctx, tx)
+
+	// A stale local counter is recoverable in place. Failing the job instead
+	// hands it to Asynq, which retries the whole pipeline 30 seconds later -
+	// by far the largest latency event this worker can produce. Observed
+	// repeatedly as "nonce too low: next nonce N, tx nonce N-2".
+	if sendErr != nil && IsNonceDesyncError(sendErr) {
+		if retryTx, retryNonce, ok := c.resendWithFreshNonce(ctx, backend, auth, build, nonce); ok {
+			slog.Warn("resent tx after stale local nonce",
+				"tx", txName,
+				"staleNonce", tx.Nonce(),
+				"retryNonce", retryNonce,
+			)
+			tx, nonce, sendErr = retryTx, retryNonce, nil
+		}
+	}
+
+	if err := sendErr; err != nil {
+		// A definite rejection means the tx never entered the pool, so the
+		// nonce is genuinely free. An ambiguous failure might still land, so
+		// the nonce has to be treated as spent - handing it back and reusing
+		// it would produce two txs at the same nonce.
 		if ShouldResetNonceOnSendError(err) {
 			c.nonceMgr.ResetNonce()
+		} else {
+			nonceConsumed = true
 		}
 		// Stuck-nonce detection (Hazard B): record "address already
 		// reserved" hits at this nonce into the shared tracker. The
@@ -331,7 +466,7 @@ func (c *ChainClient) submitPreparedTx(
 		// the next blob broadcast's decision.
 		//
 		// Under the SubpoolCoordinator, IsAlreadyReservedError in
-		// normal flow is an anomaly — the coordinator should have
+		// normal flow is an anomaly â€” the coordinator should have
 		// prevented cross-subpool contention. A hit here suggests an
 		// orphaned blob token in the coordinator (previous pipeline
 		// crashed between Send and release). The tracker's per-nonce
@@ -339,36 +474,54 @@ func (c *ChainClient) submitPreparedTx(
 		if IsAlreadyReservedError(err) {
 			c.stuckNonceTracker().Record(tx.Nonce())
 		}
-		return fmt.Errorf("send %s tx: %w", txName, err)
+		return nil, fmt.Errorf("send %s tx: %w", txName, err)
 	}
 
-	// Broadcast succeeded — record the hash on the token so janitor
+	// Broadcast succeeded â€” record the hash on the token so janitor
 	// eviction logs can identify stuck entries by tx hash.
+	nonceConsumed = true
 	token.Registered(tx.Hash())
 
-	receipt, err := bind.WaitMined(ctx, c.ethClient, tx)
+	return &PendingTx{
+		client: c,
+		tx:     tx,
+		txName: txName,
+		token:  token,
+	}, nil
+}
+
+// resendWithFreshNonce re-seeds the nonce manager and re-sends once after a
+// nonce desync. On success it returns the new tx and nonce, and the caller
+// takes ownership of that lease; the old one is handed back here. On failure
+// the caller keeps its original lease and nothing has changed.
+func (c *ChainClient) resendWithFreshNonce(
+	ctx context.Context,
+	backend jobTxBackend,
+	auth *bind.TransactOpts,
+	build func(*bind.TransactOpts) (*types.Transaction, error),
+	staleNonce uint64,
+) (*types.Transaction, uint64, bool) {
+	c.nonceMgr.ResetNonce()
+
+	freshNonce, err := c.nonceMgr.NextNonce(ctx)
 	if err != nil {
-		// Symmetric with BlobTxSubmitter.SubmitBlobTx: SendTransaction
-		// already succeeded, so the tx is on the wire and the local nonce
-		// has advanced past it. A WaitMined failure (ctx deadline, dead
-		// EL) without a reset here leaves the counter drifting from chain
-		// pending, which is the same cascading-gap failure mode seen on
-		// testnet. Reset forces the next NextNonce() to refetch pending
-		// from chain. Unlike the blob path, no logger is threaded through
-		// ChainClient — the chain-refetch on subsequent NextNonce is
-		// currently silent, tracked as a separate observability follow-up.
-		c.nonceMgr.ResetNonce()
-		return fmt.Errorf("wait for %s tx %s: %w", txName, tx.Hash().Hex(), err)
+		return nil, 0, false
 	}
-	if err := checkReceipt(receipt, txName); err != nil {
-		return c.classifyReceiptRevert(ctx, txName, tx, receipt, err)
+	auth.Nonce = new(big.Int).SetUint64(freshNonce)
+
+	tx, err := build(auth)
+	if err != nil {
+		c.nonceMgr.ReleaseNonce(freshNonce, false)
+		return nil, 0, false
+	}
+	if err := backend.SendTransaction(ctx, tx); err != nil {
+		c.nonceMgr.ReleaseNonce(freshNonce, false)
+		return nil, 0, false
 	}
 
-	// A mined receipt means this tx is no longer in the pool. Clear the
-	// stuck tracker — future rejections at a new nonce start fresh.
-	c.stuckNonceTracker().Clear()
-
-	return nil
+	// The stale nonce was never accepted by the pool, so hand it back.
+	c.nonceMgr.ReleaseNonce(staleNonce, false)
+	return tx, freshNonce, true
 }
 
 // requireJobRegistry returns an error if the jobRegistry binding is nil.
@@ -380,7 +533,8 @@ func (c *ChainClient) requireJobRegistry() error {
 	return nil
 }
 
-// AcknowledgeJob submits an acknowledgeJob transaction for the given job ID.
+// AcknowledgeJob submits an acknowledgeJob transaction for the given job ID
+// and blocks until it is mined.
 func (c *ChainClient) AcknowledgeJob(ctx context.Context, jobID uint64) error {
 	if err := c.requireJobRegistry(); err != nil {
 		return err
@@ -388,6 +542,34 @@ func (c *ChainClient) AcknowledgeJob(ctx context.Context, jobID uint64) error {
 	return c.submitPreparedTx(ctx, "AcknowledgeJob", nil, func(opts *bind.TransactOpts) (*types.Transaction, error) {
 		return c.jobRegistry.AcknowledgeJob(opts, new(big.Int).SetUint64(jobID))
 	})
+}
+
+// AcknowledgeJobAsync broadcasts an acknowledgeJob transaction and returns
+// once it is on the wire, without waiting for it to mine. It returns the tx
+// hash and a join function that blocks until the tx is mined with receipt
+// status 1.
+//
+// The caller MUST invoke the join function exactly once, even on paths that
+// no longer care about the result: the broadcast slot for this signing key
+// is held until it runs. ctx bounds the broadcast; the context passed to
+// the join function bounds the wait, and the two may differ.
+//
+// The func-typed return (rather than *PendingTx) keeps the consuming
+// package free of any dependency on this one â€” see pipeline.AsyncAckClient.
+func (c *ChainClient) AcknowledgeJobAsync(
+	ctx context.Context,
+	jobID uint64,
+) (common.Hash, func(context.Context) error, error) {
+	if err := c.requireJobRegistry(); err != nil {
+		return common.Hash{}, nil, err
+	}
+	pending, err := c.broadcastPreparedTx(ctx, "AcknowledgeJob", nil, func(opts *bind.TransactOpts) (*types.Transaction, error) {
+		return c.jobRegistry.AcknowledgeJob(opts, new(big.Int).SetUint64(jobID))
+	})
+	if err != nil {
+		return common.Hash{}, nil, err
+	}
+	return pending.Hash(), pending.Wait, nil
 }
 
 // CompleteJob submits a completeJob transaction with a single bytes32 response
@@ -459,7 +641,7 @@ func (c *ChainClient) HasJobCompleted(ctx context.Context, jobID uint64) (bool, 
 }
 
 // sessionStatusActive matches the Solidity enum JobRegistry.SessionStatus.Active (index 0).
-// Source: contracts/src/interfaces/IJobRegistry.sol — enum SessionStatus { Active, ... }
+// Source: contracts/src/interfaces/IJobRegistry.sol â€” enum SessionStatus { Active, ... }
 const sessionStatusActive uint8 = 0
 
 // GetSessionEncWorkerKey retrieves the current encrypted worker key for a session

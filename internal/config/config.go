@@ -48,6 +48,49 @@ type Config struct {
 	OllamaURL     string
 	OllamaTimeout time.Duration
 
+	// OllamaStream selects stream=true inference. When true the worker
+	// publishes incremental `chunk` frames as tokens arrive, collapsing
+	// time-to-first-token from full generation time to ~1s. The terminal
+	// `complete` frame and the whole on-chain settlement path are
+	// unaffected either way — see pipeline.JobHandler.
+	//
+	// OllamaKeepAlive rides in the request body as `keep_alive`, so it
+	// warms every Ollama instance the worker talks to (including
+	// third-party hardware) with no operator action. "-1" pins the model
+	// in memory; Ollama's default unloads after 5 idle minutes.
+	//
+	// OllamaNumPredict and OllamaNumCtx populate the request `options`
+	// object. NumPredict bounds a runaway generation so it cannot blow
+	// the whole OllamaTimeout budget. NumCtx of 0 means "unset" — leave
+	// the model's own default in place.
+	//
+	// OllamaThink rides in the request body as `think`, enabling or
+	// disabling the hidden reasoning channel on models that have one. It
+	// defaults to off because the worker transmits only the answer:
+	// thinking tokens are generated, charged to the consumer, and then
+	// discarded. They also compete with the answer for OllamaNumPredict,
+	// and a model that exhausts that budget mid-thought returns nothing
+	// at all — which settles on chain as a zero-byte response.
+	OllamaStream     bool
+	OllamaKeepAlive  string
+	OllamaNumPredict int
+	OllamaNumCtx     int
+	OllamaThink      bool
+
+	// Token-stream coalescing. A chunk frame is published when either
+	// StreamChunkTokens deltas or StreamChunkInterval have accumulated,
+	// whichever comes first. Batching matters because the relay enforces
+	// a per-consumer rate limit (~1000 messages/minute by default); at
+	// ~10 tok/s the defaults below emit roughly 1-4 frames/second.
+	StreamChunkTokens   int
+	StreamChunkInterval time.Duration
+
+	// StreamReasoning forwards a reasoning model's chain of thought to the
+	// consumer on its own frame kind. Without it those tokens are generated,
+	// paid for, and discarded: one measured job produced 962 tokens and
+	// surfaced roughly 320, leaving the user on a spinner for the rest.
+	StreamReasoning bool
+
 	// Beacon API (CL node)
 	BeaconAPIURL string
 
@@ -59,6 +102,19 @@ type Config struct {
 	BlobFetchRetries    int
 	SessionKeyFile      string
 	ReceiptPollInterval time.Duration
+
+	// AckOverlapEnabled lets stage 1 return as soon as the acknowledge
+	// tx is broadcast, so stages 2-6 (blob fetch through inference) run
+	// during the block the ack is mining in instead of after it. The
+	// confirmation is joined before the response is published and before
+	// settlement, so a job can still never complete on an unacknowledged
+	// ack — see pipeline.JobHandler. When false, stage 1 blocks on
+	// WaitMined exactly as it did before overlap existed.
+	//
+	// The confirmation stays bounded by AckTxTimeout, which must remain
+	// under the contract's submit-time ack deadline
+	// (block.timestamp + AIConfig.getAckTimeout()).
+	AckOverlapEnabled bool
 
 	// RedisPublishTimeout bounds stage 7 (redis_publish): a single
 	// PUBLISH on the session response channel. Stage 7 is non-fatal but
@@ -170,6 +226,7 @@ func Load() (*Config, error) {
 		SessionKeyFile:         envOrDefault("SESSION_KEY_FILE", "data/session-keys.enc"),
 		WorkerGatewayURL:       os.Getenv("WORKER_GATEWAY_URL"),
 		MetricsListenAddr:      envOrDefault("WORKER_METRICS_ADDR", "127.0.0.1:9101"),
+		OllamaKeepAlive:        envOrDefault("OLLAMA_KEEP_ALIVE", "-1"),
 		LogLevel:               envOrDefault("LOG_LEVEL", "info"),
 		LogFormat:              envOrDefault("LOG_FORMAT", "json"),
 	}
@@ -288,6 +345,18 @@ func Load() (*Config, error) {
 	cfg.MaxConcurrentJobs = parseInt("MAX_CONCURRENT_JOBS", 2, &errs)
 	cfg.BlobFetchRetries = parseInt("BLOB_FETCH_RETRIES", 3, &errs)
 
+	cfg.AckOverlapEnabled = parseBool("ACK_OVERLAP_ENABLED", true, &errs)
+
+	// Token streaming. OLLAMA_NUM_CTX defaults to 0 = "leave unset";
+	// every other knob has a live default.
+	cfg.OllamaStream = parseBool("OLLAMA_STREAM", true, &errs)
+	cfg.OllamaNumPredict = parseInt("OLLAMA_NUM_PREDICT", 1024, &errs)
+	cfg.OllamaNumCtx = parseInt("OLLAMA_NUM_CTX", 0, &errs)
+	cfg.OllamaThink = parseBool("OLLAMA_THINK", false, &errs)
+	cfg.StreamChunkTokens = parseInt("STREAM_CHUNK_TOKENS", 8, &errs)
+	cfg.StreamChunkInterval = parseDuration("STREAM_CHUNK_INTERVAL", "250ms", &errs)
+	cfg.StreamReasoning = parseBool("STREAM_REASONING", true, &errs)
+
 	// Stuck-nonce recovery config
 	cfg.StuckNonceThreshold = parseInt("WORKER_STUCK_NONCE_THRESHOLD", 5, &errs)
 	cfg.StuckNonceMaxBumps = parseInt("WORKER_STUCK_NONCE_MAX_BUMPS", 3, &errs)
@@ -384,6 +453,21 @@ func (c *Config) Validate() []string {
 	}
 	if c.RedisPublishTimeout <= 0 {
 		errs = append(errs, "REDIS_PUBLISH_TIMEOUT must be positive")
+	}
+	// num_predict accepts Ollama's sentinels -1 (unlimited) and -2 (fill
+	// context); 0 would ask for an empty generation, which is never
+	// intended and would silently produce blank responses.
+	if c.OllamaNumPredict == 0 || c.OllamaNumPredict < -2 {
+		errs = append(errs, fmt.Sprintf("OLLAMA_NUM_PREDICT must be positive, -1 (unlimited) or -2 (fill context), got %d", c.OllamaNumPredict))
+	}
+	if c.OllamaNumCtx < 0 {
+		errs = append(errs, "OLLAMA_NUM_CTX must be >= 0 (0 leaves the model default)")
+	}
+	if c.StreamChunkTokens <= 0 {
+		errs = append(errs, "STREAM_CHUNK_TOKENS must be positive")
+	}
+	if c.StreamChunkInterval <= 0 {
+		errs = append(errs, "STREAM_CHUNK_INTERVAL must be positive")
 	}
 	if c.LogFormat != "json" && c.LogFormat != "text" {
 		errs = append(errs, fmt.Sprintf("LOG_FORMAT: must be \"json\" or \"text\", got %q", c.LogFormat))

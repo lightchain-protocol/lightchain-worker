@@ -38,7 +38,11 @@ func TestBlobTxSubmitter_ResetNonceOnSignFailure(t *testing.T) {
 	_, err := submitter.SubmitBlobTx(context.Background(), []byte("ciphertext"))
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "sign blob tx")
-	assert.Equal(t, 1, nonceMgr.resetCalls)
+	// A sign failure never reaches the network. The nonce is handed back
+	// rather than re-seeding the whole counter, which would be unsafe while
+	// sibling jobs hold nonces of their own.
+	assert.Equal(t, 1, nonceMgr.releasedUnused, "unused nonce must be returned")
+	assert.Equal(t, 0, nonceMgr.resetCalls, "no blind reset on a pre-send failure")
 }
 
 func TestBlobTxSubmitter_ResetNonceOnPreBroadcastSendFailure(t *testing.T) {
@@ -641,12 +645,19 @@ func TestBlobTxSubmitter_BlocksOnExternalLegacy(t *testing.T) {
 var _ BlobSubmitter = (*BlobTxSubmitter)(nil)
 
 type mockNonceManager struct {
-	next       uint64
-	resetCalls int
+	next           uint64
+	resetCalls     int
+	releasedUnused int
 }
 
 func (m *mockNonceManager) NextNonce(context.Context) (uint64, error) {
 	return m.next, nil
+}
+
+func (m *mockNonceManager) ReleaseNonce(_ uint64, consumed bool) {
+	if !consumed {
+		m.releasedUnused++
+	}
 }
 
 func (m *mockNonceManager) ResetNonce() {
