@@ -609,6 +609,8 @@ func TestValidate_JobRegistryZeroAddress(t *testing.T) {
 
 func TestLoad_DeadlineGuardDefaults(t *testing.T) {
 	validEnv(t)
+	t.Setenv("WORKER_KEYSTORE_PATH", "/tmp/keystore.json")
+	t.Setenv("WORKER_KEYSTORE_PASSWORD", "secret")
 
 	cfg, err := Load()
 	require.NoError(t, err)
@@ -621,6 +623,8 @@ func TestLoad_DeadlineGuardDefaults(t *testing.T) {
 
 func TestLoad_DeadlineGuardOverrides(t *testing.T) {
 	validEnv(t)
+	t.Setenv("WORKER_KEYSTORE_PATH", "/tmp/keystore.json")
+	t.Setenv("WORKER_KEYSTORE_PASSWORD", "secret")
 	t.Setenv("DEADLINE_GUARD_ENABLED", "false")
 	t.Setenv("DEADLINE_SETTLE_RESERVE", "40s")
 	t.Setenv("DEADLINE_COMPLETION_RESERVE", "20s")
