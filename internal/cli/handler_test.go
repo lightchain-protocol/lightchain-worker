@@ -124,13 +124,13 @@ func TestRegister_Success(t *testing.T) {
 	}
 
 	h := &Handler{
-		Client:     mock,
-		WorkerAddr: testAddr,
-		ModelIDs:   [][32]byte{model1},
-		ModelNames: []string{"llama3-8b"},
+		Client:      mock,
+		WorkerAddr:  testAddr,
+		ModelIDs:    [][32]byte{model1},
+		ModelNames:  []string{"llama3-8b"},
 		LoadECDHKey: func(_, _ string) (*ecdh.PrivateKey, error) { return key, nil },
-		Out:        &buf,
-		Logger:     testLogger(),
+		Out:         &buf,
+		Logger:      testLogger(),
 	}
 
 	err := h.Register(context.Background())
@@ -213,12 +213,12 @@ func TestRegister_ChainError(t *testing.T) {
 	}
 
 	h := &Handler{
-		Client:     mock,
-		WorkerAddr: testAddr,
-		ModelIDs:   [][32]byte{model1},
+		Client:      mock,
+		WorkerAddr:  testAddr,
+		ModelIDs:    [][32]byte{model1},
 		LoadECDHKey: func(_, _ string) (*ecdh.PrivateKey, error) { return key, nil },
-		Out:        &bytes.Buffer{},
-		Logger:     testLogger(),
+		Out:         &bytes.Buffer{},
+		Logger:      testLogger(),
 	}
 
 	err := h.Register(context.Background())
@@ -361,11 +361,11 @@ func TestStatus_Registered_KeyMatch(t *testing.T) {
 	}
 
 	h := &Handler{
-		Client:     mock,
-		WorkerAddr: testAddr,
+		Client:      mock,
+		WorkerAddr:  testAddr,
 		LoadECDHKey: func(_, _ string) (*ecdh.PrivateKey, error) { return key, nil },
-		Out:        &buf,
-		Logger:     testLogger(),
+		Out:         &buf,
+		Logger:      testLogger(),
 	}
 
 	err := h.Status(context.Background())
@@ -391,11 +391,11 @@ func TestStatus_Registered_KeyMismatch(t *testing.T) {
 	}
 
 	h := &Handler{
-		Client:     mock,
-		WorkerAddr: testAddr,
+		Client:      mock,
+		WorkerAddr:  testAddr,
 		LoadECDHKey: func(_, _ string) (*ecdh.PrivateKey, error) { return localKey, nil },
-		Out:        &buf,
-		Logger:     testLogger(),
+		Out:         &buf,
+		Logger:      testLogger(),
 	}
 
 	err := h.Status(context.Background())

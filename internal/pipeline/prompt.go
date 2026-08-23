@@ -17,7 +17,7 @@ type promptEnvelope struct {
 	// Version is 1 for the first envelope format. Its presence is what
 	// distinguishes an envelope from a prompt that merely happens to be
 	// valid JSON.
-	Version int `json:"v"`
+	Version int    `json:"v"`
 	Text    string `json:"text"`
 	// Images are base64-encoded, without a data: prefix, in the form Ollama
 	// expects. They ride on the final user turn.

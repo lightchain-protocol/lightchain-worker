@@ -23,8 +23,8 @@ type rpcCodeDataError struct {
 	data string
 }
 
-func (e *rpcCodeDataError) Error() string         { return e.msg }
-func (e *rpcCodeDataError) ErrorCode() int        { return e.code }
+func (e *rpcCodeDataError) Error() string          { return e.msg }
+func (e *rpcCodeDataError) ErrorCode() int         { return e.code }
 func (e *rpcCodeDataError) ErrorData() interface{} { return e.data }
 
 // fakeCaller records the CallMsg passed to CallContract so we can

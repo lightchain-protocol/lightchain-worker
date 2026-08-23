@@ -155,7 +155,6 @@ func TestNewTokenCoalescer_NonPositiveConfigFallsBackToDefaults(t *testing.T) {
 	assert.Equal(t, defaultStreamChunkInterval, c.maxInterval)
 }
 
-
 // --- multi-kind streaming ---
 
 // capturingPublisher records every chunk frame the streamer emits, in order,

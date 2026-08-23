@@ -134,13 +134,13 @@ type Metrics struct {
 	HeartbeatLastEmit prometheus.Gauge
 
 	// Release subsystem.
-	ReleasePending             prometheus.Gauge   // current count of pending jobs awaiting settlement
-	ReleaseReleasedTotal       prometheus.Counter // jobs successfully released (cumulative)
-	ReleaseFailedTotal         prometheus.Counter // per-job release failures (post-fallback)
-	ReleaseDroppedTotal        *prometheus.CounterVec // labels: reason (terminal_state | foreign_worker | resolved_zero_escrow)
-	ReleasePauseEventsTotal    prometheus.Counter // batch reverts classified as pause-class
-	ReleaseLastSuccessTimestamp prometheus.Gauge  // unix seconds of last successful release tx
-	ReleaseReconcileLastBlock  prometheus.Gauge   // last block number reconciled
+	ReleasePending              prometheus.Gauge       // current count of pending jobs awaiting settlement
+	ReleaseReleasedTotal        prometheus.Counter     // jobs successfully released (cumulative)
+	ReleaseFailedTotal          prometheus.Counter     // per-job release failures (post-fallback)
+	ReleaseDroppedTotal         *prometheus.CounterVec // labels: reason (terminal_state | foreign_worker | resolved_zero_escrow)
+	ReleasePauseEventsTotal     prometheus.Counter     // batch reverts classified as pause-class
+	ReleaseLastSuccessTimestamp prometheus.Gauge       // unix seconds of last successful release tx
+	ReleaseReconcileLastBlock   prometheus.Gauge       // last block number reconciled
 
 	// modelAllowlist gates the {model} label. Captured at construction so
 	// each *Metrics is isolated from any other (parallel tests, multiple

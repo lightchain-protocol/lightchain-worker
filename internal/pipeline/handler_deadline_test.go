@@ -517,7 +517,7 @@ func TestBuildConversationHistory_PlainPromptsUnchanged(t *testing.T) {
 	sessionKey := testSessionKey(t)
 
 	cases := map[string]string{
-		"plain text":           "just a plain question",
+		"plain text":                   "just a plain question",
 		"JSON that is not an envelope": `{"question":"is this an envelope?"}`,
 	}
 	for name, plaintext := range cases {

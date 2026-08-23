@@ -24,9 +24,9 @@ type Metrics interface {
 // Drop reasons used by the scheduler. Kept as constants so dashboards
 // can pin exact label values.
 const (
-	DropReasonTerminalState     = "terminal_state"
-	DropReasonForeignWorker     = "foreign_worker"
-	DropReasonResolvedZeroFee   = "resolved_zero_escrow"
+	DropReasonTerminalState   = "terminal_state"
+	DropReasonForeignWorker   = "foreign_worker"
+	DropReasonResolvedZeroFee = "resolved_zero_escrow"
 )
 
 // noopMetrics is the silent default. callMetrics() returns this when
