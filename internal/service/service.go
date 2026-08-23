@@ -36,6 +36,7 @@ import (
 	"github.com/lightchain/worker/internal/pipeline"
 	"github.com/lightchain/worker/internal/registration"
 	"github.com/lightchain/worker/internal/release"
+	"github.com/lightchain/worker/internal/voice"
 )
 
 // startupHeartbeatTimeout is the maximum time allowed for the initial heartbeat
@@ -412,6 +413,21 @@ func New(cfg *config.Config) (*Service, error) {
 		releaseScheduler.SetMetrics(releaseMetrics)
 	}
 
+	// Voice sidecar client (whisper STT / Kokoro TTS). Built once and
+	// shared by both handlers; installed via SetVoiceEngine so the pipeline
+	// constructor stays unchanged. Nil when both features are off, which
+	// leaves every voice path inert.
+	var voiceEngine pipeline.VoiceEngine
+	if cfg.STTEnabled || cfg.TTSEnabled {
+		voiceEngine = voice.New(cfg.STTSidecarURL, cfg.TTSSidecarURL, cfg.STTTimeout, cfg.TTSTimeout)
+		logger.Info("voice sidecars configured",
+			"sttEnabled", cfg.STTEnabled,
+			"sttURL", cfg.STTSidecarURL,
+			"ttsEnabled", cfg.TTSEnabled,
+			"ttsURL", cfg.TTSSidecarURL,
+		)
+	}
+
 	// Job pipeline handler
 	handler := pipeline.NewJobHandler(
 		chainClient,
@@ -440,6 +456,11 @@ func New(cfg *config.Config) (*Service, error) {
 			SettleReserve:        cfg.SettleReserve,
 			CompletionReserve:    cfg.CompletionReserve,
 			MinInferenceBudget:   cfg.MinInferenceBudget,
+			STTEnabled:           cfg.STTEnabled,
+			TTSEnabled:           cfg.TTSEnabled,
+			TTSVoice:             cfg.TTSVoice,
+			TTSMaxChars:          cfg.TTSMaxChars,
+			TTSTimeout:           cfg.TTSTimeout,
 		},
 		nil, // publisher — fallback wires RedisResponsePublisher from redisClient
 		checkpoints,
@@ -447,6 +468,9 @@ func New(cfg *config.Config) (*Service, error) {
 		metrics.DeliveryAsynq,
 	)
 	handler.SetReleaseTracker(releaseTracker)
+	if voiceEngine != nil {
+		handler.SetVoiceEngine(voiceEngine)
+	}
 
 	// --- Gateway mode: skip Asynq and direct Redis heartbeat ---
 	if cfg.WorkerGatewayURL != "" {
@@ -498,6 +522,16 @@ func New(cfg *config.Config) (*Service, error) {
 				SettleReserve:        cfg.SettleReserve,
 				CompletionReserve:    cfg.CompletionReserve,
 				MinInferenceBudget:   cfg.MinInferenceBudget,
+				// Voice: STT works in gateway mode (it runs before
+				// inference, independent of the publisher). TTS stays
+				// inert here because gatewayResponsePublisher reports
+				// SupportsChunks()==false, so there is no streamer to
+				// carry the audio frame - the pipeline logs and skips.
+				STTEnabled:  cfg.STTEnabled,
+				TTSEnabled:  cfg.TTSEnabled,
+				TTSVoice:    cfg.TTSVoice,
+				TTSMaxChars: cfg.TTSMaxChars,
+				TTSTimeout:  cfg.TTSTimeout,
 			},
 			gwPublisher,
 			checkpoints,
@@ -505,6 +539,9 @@ func New(cfg *config.Config) (*Service, error) {
 			metrics.DeliveryGateway,
 		)
 		gwHandler.SetReleaseTracker(releaseTracker)
+		if voiceEngine != nil {
+			gwHandler.SetVoiceEngine(voiceEngine)
+		}
 
 		logger.Info("worker service initialized (gateway mode)",
 			"address", workerAddr.Hex(),

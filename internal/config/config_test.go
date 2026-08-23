@@ -29,6 +29,9 @@ var allEnvKeys = []string{
 	"BLOB_FETCH_RETRIES", "RECEIPT_POLL_INTERVAL", "REDIS_PUBLISH_TIMEOUT",
 	"SHUTDOWN_TIMEOUT",
 	"LIGHTCHAIN_DRAIN_TTL", "LIGHTCHAIN_DRAIN_SLACK",
+	"STT_ENABLED", "STT_SIDECAR_URL", "STT_TIMEOUT",
+	"TTS_ENABLED", "TTS_SIDECAR_URL", "TTS_VOICE",
+	"TTS_MAX_CHARS", "TTS_TIMEOUT",
 	"LOG_LEVEL", "LOG_FORMAT",
 }
 
@@ -656,4 +659,85 @@ func TestValidate_DeadlineGuardConstraints(t *testing.T) {
 	}
 	assert.Contains(t, combined, "DEADLINE_SETTLE_RESERVE")
 	assert.Contains(t, combined, "DEADLINE_COMPLETION_RESERVE")
+}
+
+// Voice sidecar gates: both features default off, so a stock worker is
+// bit-identical to pre-voice behavior and never dials a sidecar.
+func TestLoad_VoiceDefaults(t *testing.T) {
+	validEnv(t)
+	t.Setenv("WORKER_KEYSTORE_PATH", "/tmp/keystore.json")
+	t.Setenv("WORKER_KEYSTORE_PASSWORD", "secret")
+
+	cfg, err := Load()
+	require.NoError(t, err)
+	assert.False(t, cfg.STTEnabled, "STT must default to off")
+	assert.False(t, cfg.TTSEnabled, "TTS must default to off")
+	assert.Equal(t, "http://127.0.0.1:8100", cfg.STTSidecarURL)
+	assert.Equal(t, "http://127.0.0.1:8101", cfg.TTSSidecarURL)
+	assert.Equal(t, 10*time.Second, cfg.STTTimeout)
+	assert.Equal(t, 20*time.Second, cfg.TTSTimeout)
+	assert.Equal(t, "af_heart", cfg.TTSVoice)
+	assert.Equal(t, 4000, cfg.TTSMaxChars)
+	assert.Empty(t, cfg.Validate())
+}
+
+func TestLoad_VoiceOverrides(t *testing.T) {
+	validEnv(t)
+	t.Setenv("WORKER_KEYSTORE_PATH", "/tmp/keystore.json")
+	t.Setenv("WORKER_KEYSTORE_PASSWORD", "secret")
+	t.Setenv("STT_ENABLED", "true")
+	t.Setenv("STT_SIDECAR_URL", "http://10.0.0.3:9000")
+	t.Setenv("STT_TIMEOUT", "15s")
+	t.Setenv("TTS_ENABLED", "true")
+	t.Setenv("TTS_SIDECAR_URL", "http://10.0.0.3:9001")
+	t.Setenv("TTS_VOICE", "am_michael")
+	t.Setenv("TTS_MAX_CHARS", "8000")
+	t.Setenv("TTS_TIMEOUT", "30s")
+
+	cfg, err := Load()
+	require.NoError(t, err)
+	assert.True(t, cfg.STTEnabled)
+	assert.Equal(t, "http://10.0.0.3:9000", cfg.STTSidecarURL)
+	assert.Equal(t, 15*time.Second, cfg.STTTimeout)
+	assert.True(t, cfg.TTSEnabled)
+	assert.Equal(t, "http://10.0.0.3:9001", cfg.TTSSidecarURL)
+	assert.Equal(t, "am_michael", cfg.TTSVoice)
+	assert.Equal(t, 8000, cfg.TTSMaxChars)
+	assert.Equal(t, 30*time.Second, cfg.TTSTimeout)
+	assert.Empty(t, cfg.Validate())
+}
+
+// An enabled feature with an unparseable URL is a startup-fatal
+// misconfiguration, not a runtime surprise on the first voice request.
+func TestValidate_VoiceRequiresParseableURL(t *testing.T) {
+	validEnv(t)
+	t.Setenv("STT_ENABLED", "true")
+	t.Setenv("STT_SIDECAR_URL", "not-a-url")
+	t.Setenv("TTS_ENABLED", "true")
+	t.Setenv("TTS_SIDECAR_URL", "ftp://sidecar:8801")
+
+	cfg, err := Load()
+	require.NoError(t, err)
+
+	combined := ""
+	for _, e := range cfg.Validate() {
+		combined += e + " "
+	}
+	assert.Contains(t, combined, "STT_SIDECAR_URL")
+	assert.Contains(t, combined, "TTS_SIDECAR_URL")
+}
+
+// Disabled features skip URL validation entirely: the default loopback
+// URLs are never dialed and must not block startup.
+func TestValidate_VoiceDisabledSkipsURLChecks(t *testing.T) {
+	validEnv(t)
+	t.Setenv("WORKER_KEYSTORE_PATH", "/tmp/keystore.json")
+	t.Setenv("WORKER_KEYSTORE_PASSWORD", "secret")
+	t.Setenv("STT_SIDECAR_URL", "not-a-url")
+	t.Setenv("TTS_TIMEOUT", "0s")
+
+	cfg, err := Load()
+	require.NoError(t, err)
+	assert.Empty(t, cfg.Validate(),
+		"voice constraints must not fire while both features are disabled")
 }

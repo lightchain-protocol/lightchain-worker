@@ -4,6 +4,7 @@ package config
 import (
 	"fmt"
 	"math/big"
+	"net/url"
 	"os"
 	"strings"
 	"time"
@@ -115,6 +116,35 @@ type Config struct {
 	SettleReserve        time.Duration
 	CompletionReserve    time.Duration
 	MinInferenceBudget   time.Duration
+
+	// Voice I/O via local sidecars (whisper STT, Kokoro TTS). Both default
+	// off; each additionally requires the consumer to opt in per request
+	// via the prompt envelope (v2) voice fields.
+	//
+	// STTEnabled (STT_ENABLED) lets audio prompts be transcribed by the
+	// sidecar at STTSidecarURL before inference. The transcript is merged
+	// into the prompt text; it is derived context, not settled content.
+	//
+	// TTSEnabled (TTS_ENABLED) lets an opted-in response be rendered to
+	// speech and streamed to the consumer as `audio` frames (raw PCM s16le
+	// 24 kHz chunks bracketed by JSON descriptors). The audio never enters
+	// the settlement ciphertext. TTSVoice (default "af_heart") is the
+	// worker default when the envelope does not name one. TTSMaxChars
+	// truncates the synthesized text (0 = no limit; the settled text
+	// answer is unaffected either way; the sidecar itself rejects text
+	// over 4000 chars).
+	//
+	// Both URLs are required to be parseable http(s) URLs when the
+	// matching feature is enabled. The timeouts bound one sidecar call
+	// each and feed the deadline-guard budget check for voice work.
+	STTEnabled    bool
+	STTSidecarURL string
+	STTTimeout    time.Duration
+	TTSEnabled    bool
+	TTSSidecarURL string
+	TTSVoice      string
+	TTSMaxChars   int
+	TTSTimeout    time.Duration
 
 	// Beacon API (CL node)
 	BeaconAPIURL string
@@ -388,6 +418,18 @@ func Load() (*Config, error) {
 	cfg.CompletionReserve = parseDuration("DEADLINE_COMPLETION_RESERVE", "12s", &errs)
 	cfg.MinInferenceBudget = parseDuration("DEADLINE_MIN_INFERENCE_BUDGET", "10s", &errs)
 
+	// Voice I/O (whisper STT / Kokoro TTS sidecars). Both default off; each
+	// also requires per-request opt-in via the prompt envelope (v2). Default
+	// URLs match provisioning/worker/voice-sidecars.md (loopback-only).
+	cfg.STTEnabled = parseBool("STT_ENABLED", false, &errs)
+	cfg.STTSidecarURL = envOrDefault("STT_SIDECAR_URL", "http://127.0.0.1:8100")
+	cfg.STTTimeout = parseDuration("STT_TIMEOUT", "10s", &errs)
+	cfg.TTSEnabled = parseBool("TTS_ENABLED", false, &errs)
+	cfg.TTSSidecarURL = envOrDefault("TTS_SIDECAR_URL", "http://127.0.0.1:8101")
+	cfg.TTSVoice = envOrDefault("TTS_VOICE", "af_heart")
+	cfg.TTSMaxChars = parseInt("TTS_MAX_CHARS", 4000, &errs)
+	cfg.TTSTimeout = parseDuration("TTS_TIMEOUT", "20s", &errs)
+
 	// Stuck-nonce recovery config
 	cfg.StuckNonceThreshold = parseInt("WORKER_STUCK_NONCE_THRESHOLD", 5, &errs)
 	cfg.StuckNonceMaxBumps = parseInt("WORKER_STUCK_NONCE_MAX_BUMPS", 3, &errs)
@@ -515,6 +557,25 @@ func (c *Config) Validate() []string {
 				c.SettleReserve, c.CompletionReserve))
 		}
 	}
+	if c.STTEnabled {
+		if err := validateSidecarURL("STT_SIDECAR_URL", c.STTSidecarURL); err != nil {
+			errs = append(errs, err.Error())
+		}
+		if c.STTTimeout <= 0 {
+			errs = append(errs, "STT_TIMEOUT must be positive")
+		}
+	}
+	if c.TTSEnabled {
+		if err := validateSidecarURL("TTS_SIDECAR_URL", c.TTSSidecarURL); err != nil {
+			errs = append(errs, err.Error())
+		}
+		if c.TTSTimeout <= 0 {
+			errs = append(errs, "TTS_TIMEOUT must be positive")
+		}
+		if c.TTSMaxChars < 0 {
+			errs = append(errs, "TTS_MAX_CHARS must be >= 0 (0 = no limit)")
+		}
+	}
 	if c.LogFormat != "json" && c.LogFormat != "text" {
 		errs = append(errs, fmt.Sprintf("LOG_FORMAT: must be \"json\" or \"text\", got %q", c.LogFormat))
 	}
@@ -637,6 +698,17 @@ func envOrDefault(key, defaultVal string) string {
 		return v
 	}
 	return defaultVal
+}
+
+// validateSidecarURL requires a parseable http(s) URL with a host. Only
+// consulted when the matching voice feature is enabled - a disabled
+// sidecar's URL is never dialed, so it is not validated.
+func validateSidecarURL(key, raw string) error {
+	u, err := url.Parse(raw)
+	if err != nil || u.Host == "" || (u.Scheme != "http" && u.Scheme != "https") {
+		return fmt.Errorf("%s: must be a parseable http(s) URL, got %q", key, raw)
+	}
+	return nil
 }
 
 func parseDuration(key, defaultVal string, errs *[]string) time.Duration {

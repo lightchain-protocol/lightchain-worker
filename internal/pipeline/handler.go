@@ -161,6 +161,26 @@ type HandlerConfig struct {
 	// left is aborted before inference. Zero falls back to
 	// defaultMinInferenceBudget.
 	MinInferenceBudget time.Duration
+
+	// Voice I/O via local sidecars (whisper STT, Kokoro TTS). Both default
+	// off and additionally require an installed VoiceEngine (see
+	// SetVoiceEngine) and per-request opt-in fields in the prompt envelope
+	// (v2). See pipeline/voice.go for the settlement posture.
+	//
+	// STTEnabled lets audio prompts be transcribed before inference.
+	// TTSEnabled lets an opted-in response be rendered to speech and
+	// streamed to the consumer as `audio` frames (PCM chunks bracketed by
+	// JSON descriptors); the audio never enters the settlement ciphertext.
+	// TTSVoice is the worker default when the envelope does not name a
+	// voice. TTSMaxChars truncates the synthesized text (the settled text
+	// answer is unaffected). TTSTimeout bounds one synthesis call; zero
+	// falls back to 20 s. It also feeds the deadline budget check together
+	// with a fixed stream margin.
+	STTEnabled  bool
+	TTSEnabled  bool
+	TTSVoice    string
+	TTSMaxChars int
+	TTSTimeout  time.Duration
 }
 
 // ResponsePublisher publishes encrypted responses for real-time delivery.
@@ -247,6 +267,11 @@ type JobHandler struct {
 	// settle the job after the dispute window. Failure to write is
 	// non-fatal â€” the periodic reconciler picks up missed writes.
 	releaseTracker ReleaseTracker
+	// voiceEngine is optional. When set (via SetVoiceEngine) and the
+	// matching cfg gate is on, stage 5 can transcribe an audio prompt
+	// (STT) and stage 6b can deliver a spoken rendering of the response
+	// (TTS). Nil leaves every voice path inert.
+	voiceEngine VoiceEngine
 	// keyFetchGroup coalesces concurrent cache-miss derivations for the same
 	// session so that N parallel jobs trigger exactly one chain RPC. Only
 	// getOrDeriveSessionKey uses it; refreshSessionKey deliberately bypasses
@@ -923,6 +948,15 @@ func (h *JobHandler) runInferencePipeline(
 	}
 	defer infCancel()
 
+	// Voice input: an audio prompt is transcribed by the STT sidecar and
+	// the transcript merged into the envelope text. Runs under the clamped
+	// inference context so a slow sidecar cannot push the job past its
+	// settlement window. Failure classifications (no-retry on bad audio vs
+	// retryable transport errors) live in maybeTranscribeAudio.
+	if err := h.maybeTranscribeAudio(infCtx, logger, &envelope); err != nil {
+		return nil, 0, err
+	}
+
 	var history []ollama.ChatMessage
 	if len(p.PriorJobIDs) > 0 {
 		var hErr error
@@ -1009,6 +1043,15 @@ func (h *JobHandler) runInferencePipeline(
 		"ciphertextBytes", len(ciphertext),
 		"durationMs", d.Milliseconds(),
 	)
+
+	// Voice output (stage 6b): when the consumer opted in, synthesize the
+	// response text and stream the PCM to the consumer as `audio` frames
+	// (raw chunks bracketed by JSON header/final descriptors). Best-effort:
+	// any failure logs and skips, never fails the job. Runs before the
+	// return so the audio frames are counted in streamer.frames() and the
+	// terminal frame's TotalChunks stays honest. The settlement ciphertext
+	// above is untouched: audio is delivered, not settled.
+	h.maybeDeliverAudio(ctx, logger, streamer, response, envelope, guard)
 
 	return ciphertext, streamer.frames(), nil
 }
