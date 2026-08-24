@@ -145,6 +145,9 @@ type chunkStreamer struct {
 	// started is when generation began, so the first published chunk can
 	// report time to first token.
 	started time.Time
+	// firstChunkAt is when the first chunk frame (any kind) went out; zero
+	// until then. Feeds the TTFT metric via ttft().
+	firstChunkAt time.Time
 	// sawText records whether any visible-answer frame has gone out, so
 	// TTFT is reported against the answer rather than against reasoning
 	// the user may have collapsed.
@@ -164,6 +167,7 @@ func (h *JobHandler) newChunkStreamer(
 	p JobPayload,
 	sessionKey []byte,
 	allowed bool,
+	infClient InferenceClient,
 ) *chunkStreamer {
 	if !allowed || !h.cfg.StreamEnabled {
 		return nil
@@ -171,7 +175,7 @@ func (h *JobHandler) newChunkStreamer(
 	if h.responsePublisher == nil || !h.responsePublisher.SupportsChunks() {
 		return nil
 	}
-	client, ok := h.ollamaClient.(StreamingInferenceClient)
+	client, ok := infClient.(StreamingInferenceClient)
 	if !ok {
 		return nil
 	}
@@ -250,24 +254,30 @@ type generationStats struct {
 	PromptEvalMs    int64   `json:"promptEvalMs"`
 	EvalMs          int64   `json:"evalMs"`
 	TotalMs         int64   `json:"totalMs"`
+	// AppliedMaxTokens is the num_predict cap the job actually ran under.
+	// It lets a consumer (or auditor) verify a paid Max job was served at
+	// the raised cap — the anti-fraud anchor for heat tiers. Zero means the
+	// worker could not report it and the field is omitted.
+	AppliedMaxTokens int `json:"appliedMaxTokens,omitempty"`
 }
 
 // recordStats publishes the model's own measurements on their own frame kind.
 // Best-effort and nil-safe: a response that reached the user without its
 // throughput badge is a cosmetic loss, not a failed job.
-func (s *chunkStreamer) recordStats(st ollama.StreamStats) {
+func (s *chunkStreamer) recordStats(st ollama.StreamStats, appliedMaxTokens int) {
 	if s == nil || st.EvalTokens == 0 {
 		return
 	}
 	payload, err := json.Marshal(generationStats{
-		PromptTokens:    st.PromptTokens,
-		EvalTokens:      st.EvalTokens,
-		ThinkingBytes:   st.ThinkingBytes,
-		TokensPerSecond: math.Round(st.TokensPerSecond()*10) / 10,
-		LoadMs:          st.LoadDuration.Milliseconds(),
-		PromptEvalMs:    st.PromptEvalDuration.Milliseconds(),
-		EvalMs:          st.EvalDuration.Milliseconds(),
-		TotalMs:         st.TotalDuration.Milliseconds(),
+		PromptTokens:     st.PromptTokens,
+		EvalTokens:       st.EvalTokens,
+		ThinkingBytes:    st.ThinkingBytes,
+		TokensPerSecond:  math.Round(st.TokensPerSecond()*10) / 10,
+		LoadMs:           st.LoadDuration.Milliseconds(),
+		PromptEvalMs:     st.PromptEvalDuration.Milliseconds(),
+		EvalMs:           st.EvalDuration.Milliseconds(),
+		TotalMs:          st.TotalDuration.Milliseconds(),
+		AppliedMaxTokens: appliedMaxTokens,
 	})
 	if err != nil {
 		return
@@ -305,6 +315,16 @@ func (s *chunkStreamer) frames() uint32 {
 	return s.seq
 }
 
+// ttft returns the time from generation start to the first published chunk
+// frame (any kind). ok=false when streaming was inactive or no chunk ever
+// went out — batch-path jobs simply have no TTFT to observe.
+func (s *chunkStreamer) ttft() (time.Duration, bool) {
+	if s == nil || s.firstChunkAt.IsZero() {
+		return 0, false
+	}
+	return s.firstChunkAt.Sub(s.started), true
+}
+
 // publish encrypts one coalesced batch and emits it as the next chunk
 // frame. Always returns nil: incremental delivery is best-effort in exactly
 // the same way stage 7 is, and a publish problem must never abort a
@@ -328,6 +348,7 @@ func (s *chunkStreamer) publish(kind pkgtypes.FrameKind, batch string) error {
 	if s.seq == 1 {
 		// First frame of any kind - the moment the spinner stops and the
 		// user sees something happening.
+		s.firstChunkAt = time.Now()
 		s.logger.Info("stage 5: first chunk published",
 			"stage", "inference",
 			"path", "ttft",

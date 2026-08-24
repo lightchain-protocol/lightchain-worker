@@ -274,7 +274,7 @@ func TestChunkStreamer_RecordStatsEmitsItsOwnFrame(t *testing.T) {
 		PromptTokens: 7,
 		EvalTokens:   40,
 		EvalDuration: time.Second,
-	})
+	}, 8192)
 
 	require.Len(t, pub.frames, 1)
 	assert.Equal(t, pkgtypes.FrameKindStats, pub.frames[0].kind)
@@ -284,6 +284,19 @@ func TestChunkStreamer_RecordStatsEmitsItsOwnFrame(t *testing.T) {
 	assert.Equal(t, 40, got.EvalTokens)
 	assert.Equal(t, 7, got.PromptTokens)
 	assert.InDelta(t, 40.0, got.TokensPerSecond, 0.01)
+	assert.Equal(t, 8192, got.AppliedMaxTokens, "the applied cap is the anti-fraud audit anchor")
+}
+
+// appliedMaxTokens=0 means "unknown" and must stay out of the wire payload
+// (omitempty) rather than publishing a misleading zero cap.
+func TestChunkStreamer_RecordStatsOmitsUnknownMaxTokens(t *testing.T) {
+	t.Parallel()
+
+	s, pub := newTestStreamer(t)
+	s.recordStats(ollama.StreamStats{EvalTokens: 4, EvalDuration: time.Second}, 0)
+
+	require.Len(t, pub.frames, 1)
+	assert.NotContains(t, pub.frames[0].body, "appliedMaxTokens")
 }
 
 // A generation that produced nothing has no throughput worth reporting.
@@ -291,6 +304,30 @@ func TestChunkStreamer_RecordStatsSkipsEmptyGeneration(t *testing.T) {
 	t.Parallel()
 
 	s, pub := newTestStreamer(t)
-	s.recordStats(ollama.StreamStats{})
+	s.recordStats(ollama.StreamStats{}, 0)
 	assert.Empty(t, pub.frames)
+}
+
+// TTFT is measured from generation start to the first published frame and
+// is absent when no frame ever went out (and on a nil streamer).
+func TestChunkStreamer_TTFT(t *testing.T) {
+	t.Parallel()
+
+	var nilStreamer *chunkStreamer
+	if _, ok := nilStreamer.ttft(); ok {
+		t.Error("nil streamer must report no TTFT")
+	}
+
+	s, _ := newTestStreamer(t)
+	if _, ok := s.ttft(); ok {
+		t.Error("no chunks published yet: ttft must report ok=false")
+	}
+
+	require.NoError(t, s.Add(pkgtypes.FrameKindText, "hello"))
+	require.NoError(t, s.FlushAll())
+
+	ttft, ok := s.ttft()
+	require.True(t, ok)
+	assert.GreaterOrEqual(t, ttft, time.Duration(0))
+	assert.Less(t, ttft, time.Minute, "TTFT should track the first chunk, not the flush")
 }

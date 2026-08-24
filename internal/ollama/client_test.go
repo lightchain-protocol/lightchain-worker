@@ -572,3 +572,49 @@ func TestErrEmptyGeneration_WrapsSentinel(t *testing.T) {
 	assert.NoError(t, errEmptyGeneration(5, 0))
 	assert.False(t, errors.Is(fmt.Errorf("boom"), ErrEmptyGeneration))
 }
+
+// WithOverrides must merge onto a copy: listed knobs change, everything else
+// (keep_alive, think, the knobs not named) carries over, and the shared base
+// client is never mutated. This is the mechanism per-model MODEL_OPTIONS
+// enforcement rides on.
+func TestWithOverrides_MergesOntoCopy(t *testing.T) {
+	base := NewOllamaClientWithOptions("http://unused", 5*time.Second, ClientOptions{
+		KeepAlive:  "-1",
+		NumPredict: 1024,
+		NumCtx:     4096,
+		Think:      ThinkSetting(false),
+	})
+
+	temp := 0.7
+	overridden := base.WithOverrides(func(o *ClientOptions) {
+		o.NumPredict = 8192
+		o.Temperature = &temp
+	})
+
+	assert.Equal(t, 8192, overridden.opts.NumPredict, "override applied")
+	assert.Equal(t, 4096, overridden.opts.NumCtx, "unlisted knob carries over")
+	assert.Equal(t, "-1", overridden.opts.KeepAlive, "keep_alive carries over")
+	require.NotNil(t, overridden.opts.Think)
+	assert.False(t, *overridden.opts.Think, "think carries over")
+	require.NotNil(t, overridden.opts.Temperature)
+	assert.InDelta(t, 0.7, *overridden.opts.Temperature, 1e-9)
+
+	// The base client is untouched — a standard-tier job started after a Max
+	// job must not inherit its cap.
+	assert.Equal(t, 1024, base.opts.NumPredict)
+	assert.Nil(t, base.opts.Temperature)
+}
+
+// Options exposes the knobs actually sent on the wire so audit surfaces
+// (stage-5 log fields, stats-frame appliedMaxTokens) report the truth.
+func TestOptions_ReportsEffectiveKnobs(t *testing.T) {
+	client := NewOllamaClientWithOptions("http://unused", 5*time.Second, ClientOptions{
+		NumPredict: 6144,
+	})
+	assert.Equal(t, 6144, client.Options().NumPredict)
+	assert.Equal(t, 0, client.Options().NumCtx)
+
+	overridden := client.WithOverrides(func(o *ClientOptions) { o.NumPredict = 8192 })
+	assert.Equal(t, 8192, overridden.Options().NumPredict)
+	assert.Equal(t, 6144, client.Options().NumPredict)
+}

@@ -46,6 +46,12 @@ const (
 	DeliveryAsynq   = "asynq"
 	DeliveryGateway = "gateway"
 
+	// Warm — the {warm} label on worker_job_ttft_seconds. Sourced from the
+	// model's own LoadDuration report (≈0 means the weights were already
+	// resident), never inferred from latency.
+	WarmTrue  = "true"
+	WarmFalse = "false"
+
 	// Stage names — must match the slog "stage" attribute used in
 	// pipeline/handler.go, so log-based and metric-based diagnostics can
 	// be cross-referenced by stage name.
@@ -107,9 +113,23 @@ const (
 // because inference latency is bimodal — short responses cluster around
 // 1-3s and long responses around 10-60s. Exponential factor=3 would give
 // only 5 buckets in the entire 1-60s band, producing poor p95 estimates.
+//
+// TTFTBuckets cover the first-chunk latency band from a warm 50 ms to a
+// cold-load 30 s (DO-2 heat-tier sprint, item 2). HeadroomBuckets include
+// negative bounds so a late-but-accepted completion lands in a visible
+// bucket instead of +Inf (item 5: a negative sample is itself an alarm).
 var (
-	StageBuckets = []float64{.005, .01, .025, .05, .1, .25, .5, 1, 2.5, 5, 10, 30, 60, 120}
-	JobBuckets   = []float64{.1, .25, .5, 1, 2.5, 5, 10, 30, 60, 120, 300}
+	StageBuckets     = []float64{.005, .01, .025, .05, .1, .25, .5, 1, 2.5, 5, 10, 30, 60, 120}
+	JobBuckets       = []float64{.1, .25, .5, 1, 2.5, 5, 10, 30, 60, 120, 300}
+	TTFTBuckets      = []float64{.05, .1, .25, .5, 1, 2.5, 5, 10, 30}
+	QueueWaitBuckets = []float64{.05, .1, .25, .5, 1, 2.5, 5, 10, 30}
+	// TokensPerSecondBuckets span the fleet's measured decode rates, from a
+	// loaded big model (~10 tok/s) to a warm small one (~200 tok/s).
+	TokensPerSecondBuckets = []float64{1, 2.5, 5, 10, 15, 25, 50, 100, 200}
+	// OutputTokenBuckets follow the per-tier generation caps: standard
+	// models sit under 4096, Max aliases reach 8192.
+	OutputTokenBuckets = []float64{16, 64, 128, 256, 512, 1024, 2048, 4096, 8192}
+	HeadroomBuckets    = []float64{-30, -10, 0, 5, 10, 15, 30, 60, 90, 120}
 )
 
 // Metrics owns a Prometheus registry and all worker collectors. Not a
@@ -119,11 +139,21 @@ type Metrics struct {
 	Registry *prometheus.Registry
 
 	// Histograms
-	StageDuration    *prometheus.HistogramVec // labels: stage, model, cache, delivery, outcome
+	StageDuration    *prometheus.HistogramVec // labels: stage, model, tier, cache, delivery, outcome
 	JobTotalDuration *prometheus.HistogramVec // labels: cache, delivery, outcome (no model — cardinality)
 
+	// Heat-tier per-job histograms (DO-2 sprint items 2 and 5). All carry
+	// the {tier} label derived from the model name via TierForModel so
+	// Standard vs Max latency/throughput distributions are separable
+	// before any tier flag ships.
+	JobTTFT             *prometheus.HistogramVec // labels: tier, model, warm, delivery
+	JobTokensPerSecond  *prometheus.HistogramVec // labels: tier, model
+	JobOutputTokens     *prometheus.HistogramVec // labels: tier, model
+	JobQueueWait        *prometheus.HistogramVec // labels: tier, model
+	JobDeadlineHeadroom *prometheus.HistogramVec // labels: tier, model
+
 	// Counters
-	JobsTotal            *prometheus.CounterVec // labels: outcome, reason, model, delivery
+	JobsTotal            *prometheus.CounterVec // labels: outcome, reason, model, tier, delivery
 	CheckpointEvents     *prometheus.CounterVec // labels: event
 	SessionKeyEvents     *prometheus.CounterVec // labels: path
 	RedisPublishFailures prometheus.Counter
@@ -174,9 +204,9 @@ func New(modelAllowlist []string) *Metrics {
 
 		StageDuration: f.NewHistogramVec(prometheus.HistogramOpts{
 			Name:    "worker_pipeline_stage_duration_seconds",
-			Help:    "Per-stage duration of the inference pipeline. cache=hit indicates the stage was short-circuited by a checkpoint cache.",
+			Help:    "Per-stage duration of the inference pipeline. cache=hit indicates the stage was short-circuited by a checkpoint cache. tier derives from the model name via the -max suffix rule.",
 			Buckets: StageBuckets,
-		}, []string{"stage", "model", "cache", "delivery", "outcome"}),
+		}, []string{"stage", "model", "tier", "cache", "delivery", "outcome"}),
 
 		JobTotalDuration: f.NewHistogramVec(prometheus.HistogramOpts{
 			Name:    "worker_job_total_duration_seconds",
@@ -184,10 +214,40 @@ func New(modelAllowlist []string) *Metrics {
 			Buckets: JobBuckets,
 		}, []string{"cache", "delivery", "outcome"}),
 
+		JobTTFT: f.NewHistogramVec(prometheus.HistogramOpts{
+			Name:    "worker_job_ttft_seconds",
+			Help:    "Time from inference-call start to the first streamed chunk. Only observed on streaming jobs. warm=true when the model reported ~zero load duration (weights already resident).",
+			Buckets: TTFTBuckets,
+		}, []string{"tier", "model", "warm", "delivery"}),
+
+		JobTokensPerSecond: f.NewHistogramVec(prometheus.HistogramOpts{
+			Name:    "worker_job_tokens_per_second",
+			Help:    "Decode throughput reported by the model (eval tokens / eval duration). The 0-on-cached case is never observed.",
+			Buckets: TokensPerSecondBuckets,
+		}, []string{"tier", "model"}),
+
+		JobOutputTokens: f.NewHistogramVec(prometheus.HistogramOpts{
+			Name:    "worker_job_output_tokens",
+			Help:    "Generated (eval) token count per job. Per-tier token distributions feed the Max pricing review.",
+			Buckets: OutputTokenBuckets,
+		}, []string{"tier", "model"}),
+
+		JobQueueWait: f.NewHistogramVec(prometheus.HistogramOpts{
+			Name:    "worker_job_queue_wait_seconds",
+			Help:    "Time from job pickup (processJob entry) to inference start. Includes stages 1-4, so it is an upper bound on true queue wait. Not observed on checkpoint hits.",
+			Buckets: QueueWaitBuckets,
+		}, []string{"tier", "model"}),
+
+		JobDeadlineHeadroom: f.NewHistogramVec(prometheus.HistogramOpts{
+			Name:    "worker_job_deadline_headroom_seconds",
+			Help:    "On-chain completion deadline minus completion time, observed after a successful completeJob. Negative samples are late-but-accepted completions and are themselves an alarm.",
+			Buckets: HeadroomBuckets,
+		}, []string{"tier", "model"}),
+
 		JobsTotal: f.NewCounterVec(prometheus.CounterOpts{
 			Name: "worker_jobs_total",
-			Help: "Total jobs processed by terminal outcome. reason is empty on success.",
-		}, []string{"outcome", "reason", "model", "delivery"}),
+			Help: "Total jobs processed by terminal outcome. reason is empty on success. tier derives from the model name via the -max suffix rule.",
+		}, []string{"outcome", "reason", "model", "tier", "delivery"}),
 
 		CheckpointEvents: f.NewCounterVec(prometheus.CounterOpts{
 			Name: "worker_checkpoint_events_total",
@@ -338,17 +398,22 @@ type StageRecorder struct {
 	m        *Metrics
 	stage    string
 	model    string
+	tier     string
 	delivery string
 	start    time.Time
 }
 
 // StartStage begins a stage observation. Call End once with the resolved
-// outcome and cache state to record the histogram sample.
+// outcome and cache state to record the histogram sample. The tier label is
+// derived from the model name here so call sites cannot diverge from the
+// suffix rule.
 func (m *Metrics) StartStage(stage, model, delivery string) *StageRecorder {
+	tier, _ := TierForModel(model)
 	return &StageRecorder{
 		m:        m,
 		stage:    stage,
 		model:    model,
+		tier:     tier,
 		delivery: delivery,
 		start:    time.Now(),
 	}
@@ -363,7 +428,7 @@ func (r *StageRecorder) End(outcome, cache string) time.Duration {
 		return d
 	}
 	r.m.StageDuration.
-		WithLabelValues(r.stage, r.model, cache, r.delivery, outcome).
+		WithLabelValues(r.stage, r.model, r.tier, cache, r.delivery, outcome).
 		Observe(d.Seconds())
 	return d
 }

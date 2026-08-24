@@ -280,6 +280,13 @@ func (c *OllamaClient) WithOverrides(mutate func(*ClientOptions)) *OllamaClient 
 	return &next
 }
 
+// Options returns the client's current per-request knobs. Read-only access
+// for audit surfaces (stage-5 log fields, the stats frame's appliedMaxTokens)
+// that must report the values actually sent on the wire.
+func (c *OllamaClient) Options() ClientOptions {
+	return c.opts
+}
+
 // keepAlive renders the configured keep_alive for the request body. Ollama
 // accepts either a duration string carrying a unit ("30m") or a bare number of
 // seconds, where -1 pins the model indefinitely. A bare number sent as a JSON

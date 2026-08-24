@@ -20,7 +20,7 @@ var allEnvKeys = []string{
 	"REDIS_URL", "REDIS_PASSWORD",
 	"HEARTBEAT_INTERVAL", "OLLAMA_URL", "OLLAMA_TIMEOUT",
 	"OLLAMA_STREAM", "OLLAMA_KEEP_ALIVE", "OLLAMA_NUM_PREDICT", "OLLAMA_NUM_CTX",
-	"OLLAMA_THINK",
+	"OLLAMA_THINK", "MODEL_OPTIONS",
 	"STREAM_CHUNK_TOKENS", "STREAM_CHUNK_INTERVAL",
 	"DEADLINE_GUARD_ENABLED", "DEADLINE_SETTLE_RESERVE",
 	"DEADLINE_COMPLETION_RESERVE", "DEADLINE_MIN_INFERENCE_BUDGET",
@@ -740,4 +740,124 @@ func TestValidate_VoiceDisabledSkipsURLChecks(t *testing.T) {
 	require.NoError(t, err)
 	assert.Empty(t, cfg.Validate(),
 		"voice constraints must not fire while both features are disabled")
+}
+
+// MODEL_OPTIONS is the heat-tier enforcement surface: a Max alias carries
+// its token cap here and a typo must fail startup loudly, because a silent
+// no-op would serve a paid Max job at the standard budget (fraud-by-config).
+func TestLoad_ModelOptions_UnsetIsNil(t *testing.T) {
+	validEnv(t)
+	cfg, err := Load()
+	require.NoError(t, err)
+	assert.Nil(t, cfg.ModelOptions)
+}
+
+func TestLoad_ModelOptions_ParsesAliasEntries(t *testing.T) {
+	validEnv(t)
+	t.Setenv("SUPPORTED_MODELS", "agentworld-35b,agentworld-35b-max")
+	// The exact production string for worker-6 (tier-catalog.json
+	// string_match_verification.canonical_strings).
+	t.Setenv("MODEL_OPTIONS", "agentworld-35b-max:num_predict=8192")
+
+	cfg, err := Load()
+	require.NoError(t, err)
+	require.Len(t, cfg.ModelOptions, 1)
+	opts, ok := cfg.ModelOptions["agentworld-35b-max"]
+	require.True(t, ok)
+	assert.Equal(t, 8192, opts.NumPredict)
+	assert.Equal(t, 0, opts.NumCtx, "num_ctx omitted: worker-6 ruling keeps the process default")
+	assert.Nil(t, opts.Temperature)
+}
+
+func TestLoad_ModelOptions_MultiEntryAndAllKeys(t *testing.T) {
+	validEnv(t)
+	t.Setenv("SUPPORTED_MODELS", "llama3-8b,mistral-7b")
+	t.Setenv("MODEL_OPTIONS", "llama3-8b:num_predict=2048,num_ctx=8192,temperature=0.7;mistral-7b:num_predict=-1")
+
+	cfg, err := Load()
+	require.NoError(t, err)
+	require.Len(t, cfg.ModelOptions, 2)
+
+	llama := cfg.ModelOptions["llama3-8b"]
+	assert.Equal(t, 2048, llama.NumPredict)
+	assert.Equal(t, 8192, llama.NumCtx)
+	require.NotNil(t, llama.Temperature)
+	assert.InDelta(t, 0.7, *llama.Temperature, 1e-9)
+
+	mistral := cfg.ModelOptions["mistral-7b"]
+	assert.Equal(t, -1, mistral.NumPredict, "Ollama's unlimited sentinel survives")
+}
+
+// Every malformed shape is a startup failure. These are the fraud-by-config
+// guards: none of these may silently degrade to default behavior.
+func TestLoad_ModelOptions_ValidationFailures(t *testing.T) {
+	cases := []struct {
+		name    string
+		value   string
+		wantErr string
+	}{
+		{"typo model not in SUPPORTED_MODELS", "mistral-7b-MAX:num_predict=8192", "not in SUPPORTED_MODELS"},
+		{"unknown model entirely", "qwen2.5-7b:num_predict=100", "not in SUPPORTED_MODELS"},
+		{"unknown option key", "llama3-8b:top_p=0.9", "unknown option key"},
+		{"missing pairs", "llama3-8b", "malformed entry"},
+		{"missing value", "llama3-8b:num_predict=", "malformed option"},
+		{"missing key", "llama3-8b:=1024", "malformed option"},
+		{"duplicate model entry", "llama3-8b:num_predict=100;llama3-8b:num_ctx=4096", "duplicate entry"},
+		{"duplicate key in entry", "llama3-8b:num_predict=100,num_predict=200", "duplicate key"},
+		{"num_predict zero", "llama3-8b:num_predict=0", "num_predict must be positive"},
+		{"num_predict below sentinels", "llama3-8b:num_predict=-3", "num_predict must be positive"},
+		{"num_predict non-integer", "llama3-8b:num_predict=eightk", "num_predict must be positive"},
+		{"num_ctx zero is the unset sentinel", "llama3-8b:num_ctx=0", "num_ctx must be positive"},
+		{"num_ctx negative", "llama3-8b:num_ctx=-1", "num_ctx must be positive"},
+		{"temperature above range", "llama3-8b:temperature=2.5", "temperature must be"},
+		{"temperature negative", "llama3-8b:temperature=-0.1", "temperature must be"},
+		{"temperature non-float", "llama3-8b:temperature=hot", "temperature must be"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			validEnv(t)
+			t.Setenv("MODEL_OPTIONS", tc.value)
+			_, err := Load()
+			require.Error(t, err, "MODEL_OPTIONS=%q must fail startup", tc.value)
+			assert.Contains(t, err.Error(), tc.wantErr)
+		})
+	}
+}
+
+// The two production alias caps must satisfy the tier-catalog admission
+// rule: maxTokens / measuredP50TokPerSec + 5s variance margin must fit the
+// 93s effective generation window (120s completion timeout - 25s settle
+// reserve - ~2s pre-inference). Measured rates are from
+// provisioning/tier-catalog.json (measuredAt 2026-08-23); if either alias
+// cap is raised, re-measure and update both files together.
+func TestLoad_ModelOptions_AliasCapsFitDeadlineWindow(t *testing.T) {
+	const effectiveWindowSeconds = 93.0
+	const varianceMarginSeconds = 5.0
+
+	cases := []struct {
+		modelOptionsEnv string // the exact production worker.env string
+		alias           string
+		wantCap         int
+		measuredP50     float64 // tok/s, tier-catalog.json measurementSamples
+	}{
+		{"agentworld-35b-max:num_predict=8192", "agentworld-35b-max", 8192, 199.1},
+		{"gpt-oss-20b-max:num_predict=6144", "gpt-oss-20b-max", 6144, 159.7},
+	}
+	for _, tc := range cases {
+		t.Run(tc.alias, func(t *testing.T) {
+			validEnv(t)
+			t.Setenv("SUPPORTED_MODELS", tc.alias)
+			t.Setenv("MODEL_OPTIONS", tc.modelOptionsEnv)
+
+			cfg, err := Load()
+			require.NoError(t, err)
+			cap := cfg.ModelOptions[tc.alias].NumPredict
+			require.Equal(t, tc.wantCap, cap,
+				"alias cap drifted from tier-catalog.json — update both together")
+
+			decodeSeconds := float64(cap) / tc.measuredP50
+			assert.LessOrEqual(t, decodeSeconds+varianceMarginSeconds, effectiveWindowSeconds,
+				"full-cap decode at the measured p50 rate no longer fits the deadline window")
+		})
+	}
 }

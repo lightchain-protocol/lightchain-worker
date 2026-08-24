@@ -59,6 +59,16 @@ type StreamingInferenceClient interface {
 	ChatStream(ctx context.Context, model string, messages []ollama.ChatMessage, h ollama.StreamHandlers) (string, ollama.StreamStats, error)
 }
 
+// overridingInferenceClient is the optional per-job override extension of
+// InferenceClient, satisfied by *ollama.OllamaClient. When cfg.ModelOptions
+// has an entry for the job's model, stage 5 runs on a WithOverrides copy
+// instead of the shared client. A client without it logs a warning and runs
+// unoverridden — production always wires *ollama.OllamaClient, so the
+// fallback exists for tests and hypothetical alternative clients.
+type overridingInferenceClient interface {
+	WithOverrides(mutate func(*ollama.ClientOptions)) *ollama.OllamaClient
+}
+
 // JobExecutionClient submits job lifecycle transactions on-chain.
 type JobExecutionClient interface {
 	AcknowledgeJob(ctx context.Context, jobID uint64) error
@@ -141,6 +151,13 @@ type HandlerConfig struct {
 	// values fall back to the tokenCoalescer defaults.
 	StreamChunkTokens   int
 	StreamChunkInterval time.Duration
+
+	// ModelOptions maps an Ollama tag to per-model generation-option
+	// overrides (config MODEL_OPTIONS; heat-tier enforcement). At stage 5 a
+	// job for a listed model runs on a WithOverrides copy of the inference
+	// client; models without an entry use the shared client unchanged, so
+	// an empty map reproduces pre-override request bodies byte for byte.
+	ModelOptions map[string]ollama.ClientOptions
 
 	// DeadlineGuardEnabled turns on the on-chain deadline guard: the
 	// pipeline reads job.deadline at pickup, before inference, and before
@@ -354,6 +371,49 @@ func (h *JobHandler) modelLabel(modelID string) string {
 		return metrics.ModelUnknown
 	}
 	return h.metrics.NormalizeModel(name)
+}
+
+// inferenceClientFor returns the inference client stage 5 must use for
+// modelName plus the effective per-request options that client will send.
+//
+// When cfg.ModelOptions has an entry for the model (heat-tier Max aliases),
+// the job runs on a WithOverrides copy carrying only the listed knobs; every
+// other model gets the shared client untouched, so without MODEL_OPTIONS the
+// request bodies are byte-identical to before. The returned options feed the
+// stage-5 audit log fields and the stats frame's appliedMaxTokens; they are
+// zero when the client cannot report them (non-Ollama test doubles).
+func (h *JobHandler) inferenceClientFor(logger *slog.Logger, modelName string) (InferenceClient, ollama.ClientOptions, bool) {
+	report := func(c InferenceClient) ollama.ClientOptions {
+		if oc, ok := c.(interface{ Options() ollama.ClientOptions }); ok {
+			return oc.Options()
+		}
+		return ollama.ClientOptions{}
+	}
+
+	override, ok := h.cfg.ModelOptions[modelName]
+	if !ok {
+		return h.ollamaClient, report(h.ollamaClient), false
+	}
+	oc, ok := h.ollamaClient.(overridingInferenceClient)
+	if !ok {
+		logger.Warn("MODEL_OPTIONS entry configured but the inference client cannot apply overrides; running with process defaults",
+			"stage", "inference",
+			"model", modelName,
+		)
+		return h.ollamaClient, report(h.ollamaClient), false
+	}
+	client := oc.WithOverrides(func(o *ollama.ClientOptions) {
+		if override.NumPredict != 0 {
+			o.NumPredict = override.NumPredict
+		}
+		if override.NumCtx != 0 {
+			o.NumCtx = override.NumCtx
+		}
+		if override.Temperature != nil {
+			o.Temperature = override.Temperature
+		}
+	})
+	return client, client.Options(), true
 }
 
 // RedisResponsePublisher publishes responses directly to Redis pub/sub.
@@ -590,6 +650,7 @@ func (h *JobHandler) processJob(ctx context.Context, p JobPayload) (err error) {
 
 	jobStart := time.Now()
 	model := h.modelLabel(p.ModelID)
+	tier, _ := metrics.TierForModel(model)
 	delivery := h.delivery
 	// cacheState reflects whether the dominant inference path was skipped.
 	// Promoted to "hit" below if ckpt.HasCiphertext returns true.
@@ -598,7 +659,7 @@ func (h *JobHandler) processJob(ctx context.Context, p JobPayload) (err error) {
 	defer func() {
 		if r := recover(); r != nil {
 			h.metrics.JobsTotal.WithLabelValues(
-				metrics.OutcomePanic, metrics.ReasonPanic, model, delivery,
+				metrics.OutcomePanic, metrics.ReasonPanic, model, tier, delivery,
 			).Inc()
 			h.metrics.JobTotalDuration.WithLabelValues(
 				cacheState, delivery, metrics.OutcomePanic,
@@ -609,7 +670,7 @@ func (h *JobHandler) processJob(ctx context.Context, p JobPayload) (err error) {
 		}
 		outcome := metrics.OutcomeFor(err)
 		reason := metrics.ClassifyError(err)
-		h.metrics.JobsTotal.WithLabelValues(outcome, reason, model, delivery).Inc()
+		h.metrics.JobsTotal.WithLabelValues(outcome, reason, model, tier, delivery).Inc()
 		h.metrics.JobTotalDuration.WithLabelValues(
 			cacheState, delivery, outcome,
 		).Observe(time.Since(jobStart).Seconds())
@@ -701,7 +762,7 @@ func (h *JobHandler) processJob(ctx context.Context, p JobPayload) (err error) {
 		// answer. Suppress the deltas; the terminal frame is skipped
 		// below by the same flag.
 		producedCiphertext, streamed, infErr := h.runInferencePipeline(
-			ctx, logger, p, blobData, model, delivery, !ckpt.Delivered, guard,
+			ctx, logger, p, blobData, model, tier, delivery, !ckpt.Delivered, guard, jobStart,
 		)
 		if infErr != nil {
 			err = infErr
@@ -805,6 +866,17 @@ func (h *JobHandler) processJob(ctx context.Context, p JobPayload) (err error) {
 		"durationMs", d.Milliseconds(),
 	)
 
+	// Deadline headroom (DO-2 item 5): how much of the on-chain completion
+	// window was left when the job settled. Negative samples are
+	// late-but-accepted completions and are themselves an alarm. One extra
+	// eth_call per completed job; the guard fails open on read errors.
+	if guard != nil {
+		if deadline, _, ok := guard.read(ctx, logger, "deadline_headroom"); ok {
+			h.metrics.JobDeadlineHeadroom.WithLabelValues(tier, model).
+				Observe(time.Until(deadline).Seconds())
+		}
+	}
+
 	// Mark the job as eligible for the release scheduler. Best-effort:
 	// completedAt here is wall-clock time. The reconciler later overwrites
 	// it with the authoritative on-chain Job.completedAt, and the
@@ -875,9 +947,10 @@ func (h *JobHandler) runInferencePipeline(
 	logger *slog.Logger,
 	p JobPayload,
 	blobData []byte,
-	model, delivery string,
+	model, tier, delivery string,
 	streamDeltas bool,
 	guard *deadlineGuard,
+	jobStart time.Time,
 ) ([]byte, uint32, error) {
 	// Stage 3: Get session key (cache miss â†’ chain fetch â†’ store)
 	rec := h.metrics.StartStage(metrics.StageSessionKey, model, delivery)
@@ -930,6 +1003,12 @@ func (h *JobHandler) runInferencePipeline(
 		return nil, 0, fmt.Errorf("stage 5 (resolve model): %w", err)
 	}
 
+	// Per-model generation-option overrides (MODEL_OPTIONS). Without an
+	// entry for this model, infClient IS the shared client and behavior is
+	// unchanged; effectiveOpts reports what will actually be sent, for the
+	// stage-5 audit fields and the stats frame.
+	infClient, effectiveOpts, overrideApplied := h.inferenceClientFor(logger, modelName)
+
 	envelope, err := decodePrompt(prompt)
 	if err != nil {
 		return nil, 0, fmt.Errorf("stage 5 (decode prompt): %w", err)
@@ -970,10 +1049,15 @@ func (h *JobHandler) runInferencePipeline(
 		}
 	}
 
-	streamer := h.newChunkStreamer(infCtx, logger, p, sessionKey, streamDeltas)
+	streamer := h.newChunkStreamer(infCtx, logger, p, sessionKey, streamDeltas, infClient)
+
+	// Queue wait (DO-2 item 2): job pickup to inference start. This includes
+	// stages 1-4, so it upper-bounds true queue wait; on retries it measures
+	// the re-run of those stages. Checkpoint hits skip this path entirely.
+	h.metrics.JobQueueWait.WithLabelValues(tier, model).Observe(time.Since(jobStart).Seconds())
 
 	rec = h.metrics.StartStage(metrics.StageInference, model, delivery)
-	logger.Info("stage 5 starting",
+	startAttrs := []any{
 		"stage", "inference",
 		"model", modelName,
 		"promptBytes", envelope.bytes(),
@@ -981,8 +1065,21 @@ func (h *JobHandler) runInferencePipeline(
 		"historyTurns", len(history),
 		"streaming", streamer != nil,
 		"reasoning", h.cfg.StreamReasoning,
-	)
-	response, stats, err := h.runInference(infCtx, logger, modelName, envelope, history, streamer)
+	}
+	if overrideApplied {
+		// Audit trail: the exact generation knobs this job runs under. A
+		// paid Max job must show its raised cap here; absence of these
+		// fields on a -max model means enforcement silently did not apply.
+		startAttrs = append(startAttrs,
+			"numPredict", effectiveOpts.NumPredict,
+			"numCtx", effectiveOpts.NumCtx,
+		)
+		if effectiveOpts.Temperature != nil {
+			startAttrs = append(startAttrs, "temperature", *effectiveOpts.Temperature)
+		}
+	}
+	logger.Info("stage 5 starting", startAttrs...)
+	response, stats, err := h.runInference(infCtx, logger, infClient, modelName, envelope, history, streamer)
 	if err != nil {
 		rec.End(metrics.OutcomeError, metrics.CacheMiss)
 		var wrapped error
@@ -1021,7 +1118,27 @@ func (h *JobHandler) runInferencePipeline(
 	// Hand the model's own measurements to the consumer alongside the
 	// answer. Ollama reports these on its terminal object and the worker
 	// used to drop them, so the UI had no way to show tokens or throughput.
-	streamer.recordStats(stats)
+	// appliedMaxTokens is the anti-fraud audit anchor: the token cap this
+	// job actually ran under.
+	streamer.recordStats(stats, effectiveOpts.NumPredict)
+
+	// Heat-tier per-job metrics (DO-2 item 2): one block, all four. TTFT is
+	// only observable on the streaming path (nil-safe: batch jobs skip it);
+	// throughput and output tokens guard the 0-on-cached case. Warmth comes
+	// from the model's own load report, never from latency.
+	if ttft, ok := streamer.ttft(); ok {
+		warm := metrics.WarmFalse
+		if stats.LoadDuration <= 0 {
+			warm = metrics.WarmTrue
+		}
+		h.metrics.JobTTFT.WithLabelValues(tier, model, warm, delivery).Observe(ttft.Seconds())
+	}
+	if tps := stats.TokensPerSecond(); tps > 0 {
+		h.metrics.JobTokensPerSecond.WithLabelValues(tier, model).Observe(tps)
+	}
+	if stats.EvalTokens > 0 {
+		h.metrics.JobOutputTokens.WithLabelValues(tier, model).Observe(float64(stats.EvalTokens))
+	}
 
 	// Stage 6: Encrypt response.
 	//
@@ -1063,6 +1180,7 @@ func (h *JobHandler) runInferencePipeline(
 func (h *JobHandler) runInference(
 	ctx context.Context,
 	logger *slog.Logger,
+	client InferenceClient,
 	modelName string,
 	prompt promptEnvelope,
 	history []ollama.ChatMessage,
@@ -1074,9 +1192,9 @@ func (h *JobHandler) runInference(
 			err  error
 		)
 		if len(history) > 0 || len(prompt.Images) > 0 {
-			text, err = h.ollamaClient.Chat(ctx, modelName, chatMessages(history, prompt))
+			text, err = client.Chat(ctx, modelName, chatMessages(history, prompt))
 		} else {
-			text, err = h.ollamaClient.Generate(ctx, modelName, prompt.Text)
+			text, err = client.Generate(ctx, modelName, prompt.Text)
 		}
 		return text, ollama.StreamStats{}, err
 	}

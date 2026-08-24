@@ -6,6 +6,7 @@ import (
 	"math/big"
 	"net/url"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 
@@ -13,6 +14,7 @@ import (
 	"github.com/ethereum/go-ethereum/crypto"
 
 	"github.com/lightchain/worker/internal/metrics"
+	"github.com/lightchain/worker/internal/ollama"
 )
 
 // Config holds all worker sidecar configuration parsed from environment variables.
@@ -77,6 +79,24 @@ type Config struct {
 	OllamaNumPredict int
 	OllamaNumCtx     int
 	OllamaThink      bool
+
+	// ModelOptions holds per-model generation-option overrides parsed from
+	// MODEL_OPTIONS. Grammar:
+	//
+	//	MODEL_OPTIONS="name:key=value,key=value;name2:key=value"
+	//
+	// where every name must appear verbatim in SUPPORTED_MODELS and the
+	// allowed keys are num_predict, num_ctx, temperature. Only the named
+	// fields are overridden per job (via OllamaClient.WithOverrides); every
+	// other model and every unspecified knob keeps the process-wide default,
+	// so an unset MODEL_OPTIONS reproduces request bodies byte for byte.
+	//
+	// This is the heat-tier enforcement mechanism (tier-catalog.json
+	// "worker_enforcement"): a Max alias such as agentworld-35b-max carries
+	// num_predict=<maxTokens> here, and a typo'd model name or out-of-range
+	// value is a startup failure, not a silent no-op — fraud-by-config must
+	// fail loudly.
+	ModelOptions map[string]ollama.ClientOptions
 
 	// Token-stream coalescing. A chunk frame is published when either
 	// StreamChunkTokens deltas or StreamChunkInterval have accumulated,
@@ -412,6 +432,12 @@ func Load() (*Config, error) {
 	cfg.StreamChunkInterval = parseDuration("STREAM_CHUNK_INTERVAL", "250ms", &errs)
 	cfg.StreamReasoning = parseBool("STREAM_REASONING", true, &errs)
 
+	// Per-model generation-option overrides (heat-tier enforcement). Parsed
+	// against the already-loaded SUPPORTED_MODELS so an unknown name fails
+	// at startup — a typo here would silently serve a paid Max job at the
+	// standard budget.
+	cfg.ModelOptions = parseModelOptions(os.Getenv("MODEL_OPTIONS"), cfg.SupportedModels, &errs)
+
 	// On-chain deadline guard. Defaults match pipeline's fallback reserves.
 	cfg.DeadlineGuardEnabled = parseBool("DEADLINE_GUARD_ENABLED", true, &errs)
 	cfg.SettleReserve = parseDuration("DEADLINE_SETTLE_RESERVE", "25s", &errs)
@@ -698,6 +724,108 @@ func envOrDefault(key, defaultVal string) string {
 		return v
 	}
 	return defaultVal
+}
+
+// parseModelOptions parses the MODEL_OPTIONS grammar
+// "name:key=value,key=value;name2:..." into per-model ClientOptions
+// overrides. Only the named knobs are set in each entry; everything else
+// stays at the process-wide default when the override is applied.
+//
+// Every failure appends to errs and returns nil — a malformed MODEL_OPTIONS
+// is a startup error, never a partially-applied map. Rules:
+//   - every name must match a SUPPORTED_MODELS entry verbatim;
+//   - keys are limited to num_predict, num_ctx, temperature;
+//   - num_predict follows the OLLAMA_NUM_PREDICT rule (positive, -1, or -2);
+//   - num_ctx must be positive (0 is the "unset" sentinel, so writing it
+//     explicitly is a typo);
+//   - temperature must parse as a float in [0, 2];
+//   - duplicate model entries or duplicate keys within an entry are errors.
+func parseModelOptions(raw string, supported []string, errs *[]string) map[string]ollama.ClientOptions {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return nil
+	}
+
+	known := make(map[string]struct{}, len(supported))
+	for _, m := range supported {
+		known[m] = struct{}{}
+	}
+
+	out := make(map[string]ollama.ClientOptions)
+	for _, entry := range strings.Split(raw, ";") {
+		entry = strings.TrimSpace(entry)
+		if entry == "" {
+			continue
+		}
+		name, pairs, found := strings.Cut(entry, ":")
+		name = strings.TrimSpace(name)
+		if !found || name == "" || strings.TrimSpace(pairs) == "" {
+			*errs = append(*errs, fmt.Sprintf("MODEL_OPTIONS: malformed entry %q (want name:key=value,...)", entry))
+			continue
+		}
+		if _, ok := known[name]; !ok {
+			*errs = append(*errs, fmt.Sprintf("MODEL_OPTIONS: model %q is not in SUPPORTED_MODELS", name))
+			continue
+		}
+		if _, dup := out[name]; dup {
+			*errs = append(*errs, fmt.Sprintf("MODEL_OPTIONS: duplicate entry for model %q", name))
+			continue
+		}
+
+		var opts ollama.ClientOptions
+		seen := map[string]struct{}{}
+		entryOK := true
+		for _, pair := range strings.Split(pairs, ",") {
+			key, value, found := strings.Cut(strings.TrimSpace(pair), "=")
+			if !found || key == "" || value == "" {
+				*errs = append(*errs, fmt.Sprintf("MODEL_OPTIONS: %s: malformed option %q (want key=value)", name, pair))
+				entryOK = false
+				continue
+			}
+			if _, dup := seen[key]; dup {
+				*errs = append(*errs, fmt.Sprintf("MODEL_OPTIONS: %s: duplicate key %q", name, key))
+				entryOK = false
+				continue
+			}
+			seen[key] = struct{}{}
+			switch key {
+			case "num_predict":
+				v, err := strconv.Atoi(value)
+				if err != nil || v == 0 || v < -2 {
+					*errs = append(*errs, fmt.Sprintf("MODEL_OPTIONS: %s: num_predict must be positive, -1 (unlimited) or -2 (fill context), got %q", name, value))
+					entryOK = false
+					continue
+				}
+				opts.NumPredict = v
+			case "num_ctx":
+				v, err := strconv.Atoi(value)
+				if err != nil || v <= 0 {
+					*errs = append(*errs, fmt.Sprintf("MODEL_OPTIONS: %s: num_ctx must be positive, got %q", name, value))
+					entryOK = false
+					continue
+				}
+				opts.NumCtx = v
+			case "temperature":
+				v, err := strconv.ParseFloat(value, 64)
+				if err != nil || v < 0 || v > 2 {
+					*errs = append(*errs, fmt.Sprintf("MODEL_OPTIONS: %s: temperature must be a float in [0, 2], got %q", name, value))
+					entryOK = false
+					continue
+				}
+				opts.Temperature = &v
+			default:
+				*errs = append(*errs, fmt.Sprintf("MODEL_OPTIONS: %s: unknown option key %q (allowed: num_predict, num_ctx, temperature)", name, key))
+				entryOK = false
+			}
+		}
+		if entryOK {
+			out[name] = opts
+		}
+	}
+	if len(*errs) > 0 {
+		return nil
+	}
+	return out
 }
 
 // validateSidecarURL requires a parseable http(s) URL with a host. Only

@@ -452,6 +452,7 @@ func New(cfg *config.Config) (*Service, error) {
 			StreamReasoning:      cfg.StreamReasoning,
 			StreamChunkTokens:    cfg.StreamChunkTokens,
 			StreamChunkInterval:  cfg.StreamChunkInterval,
+			ModelOptions:         cfg.ModelOptions,
 			DeadlineGuardEnabled: cfg.DeadlineGuardEnabled,
 			SettleReserve:        cfg.SettleReserve,
 			CompletionReserve:    cfg.CompletionReserve,
@@ -514,6 +515,9 @@ func New(cfg *config.Config) (*Service, error) {
 				ChainID:           big.NewInt(cfg.ChainID),
 				JobRegistryAddr:   cfg.JobRegistryAddress,
 				AckOverlapEnabled: cfg.AckOverlapEnabled,
+				// MODEL_OPTIONS applies in gateway mode too: tier caps are
+				// generation parameters, independent of the delivery channel.
+				ModelOptions: cfg.ModelOptions,
 				// The deadline guard matters just as much in gateway mode:
 				// the gateway retries failed jobs with its own backoff, and
 				// every guard abort is cheap (pre-inference), so the
