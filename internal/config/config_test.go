@@ -861,3 +861,78 @@ func TestLoad_ModelOptions_AliasCapsFitDeadlineWindow(t *testing.T) {
 		})
 	}
 }
+
+// The full production MODEL_OPTIONS sets — one per live worker, every
+// advertised model at its post-redeploy catalogue cap (tier-catalog.json
+// genesis_seed + tier_aliases; residency-contract.json for the per-worker
+// model assignment). These strings are pinned verbatim so a config edit
+// without a matching catalogue change fails loudly here.
+func TestLoad_ModelOptions_ProductionWorkerSets(t *testing.T) {
+	cases := []struct {
+		worker          string
+		supportedModels string
+		modelOptions    string
+		wantCaps        map[string]int
+	}{
+		{
+			worker:          "worker-1",
+			supportedModels: "llama3-8b,gpt-oss-20b",
+			modelOptions:    "llama3-8b:num_predict=4096;gpt-oss-20b:num_predict=4096",
+			wantCaps:        map[string]int{"llama3-8b": 4096, "gpt-oss-20b": 4096},
+		},
+		{
+			worker:          "worker-2",
+			supportedModels: "qwen3-8b,qwen3-vl-8b,gemma4-12b",
+			modelOptions:    "qwen3-8b:num_predict=2048;qwen3-vl-8b:num_predict=2048;gemma4-12b:num_predict=2048",
+			wantCaps:        map[string]int{"qwen3-8b": 2048, "qwen3-vl-8b": 2048, "gemma4-12b": 2048},
+		},
+		{
+			worker:          "worker-3",
+			supportedModels: "devstral-24b,gpt-oss-20b,qwen3-coder-30b,gpt-oss-20b-max",
+			modelOptions:    "devstral-24b:num_predict=4096;gpt-oss-20b:num_predict=4096;qwen3-coder-30b:num_predict=4096;gpt-oss-20b-max:num_predict=6144",
+			wantCaps: map[string]int{
+				"devstral-24b": 4096, "gpt-oss-20b": 4096, "qwen3-coder-30b": 4096,
+				"gpt-oss-20b-max": 6144,
+			},
+		},
+		{
+			worker:          "worker-5",
+			supportedModels: "deepseek-r1-32b,qwen3.6-27b,gemma4-26b,mistral-small-24b",
+			modelOptions:    "deepseek-r1-32b:num_predict=3000;qwen3.6-27b:num_predict=4096;gemma4-26b:num_predict=4096;mistral-small-24b:num_predict=4096",
+			wantCaps: map[string]int{
+				// r1-32b carries the R7-fixed 3000 cap: 4096 at the measured
+				// 40.3 tok/s is ~107 s of decode — over the 93 s window.
+				"deepseek-r1-32b": 3000, "qwen3.6-27b": 4096, "gemma4-26b": 4096,
+				"mistral-small-24b": 4096,
+			},
+		},
+		{
+			worker:          "worker-6",
+			supportedModels: "qwen3.8-27b,ornith-1.5-35b,agentworld-35b,kat-coder-32b,lfm2.5-8b,agentworld-35b-max",
+			modelOptions:    "qwen3.8-27b:num_predict=4096;ornith-1.5-35b:num_predict=4096;agentworld-35b:num_predict=4096;kat-coder-32b:num_predict=4096;lfm2.5-8b:num_predict=2048;agentworld-35b-max:num_predict=8192",
+			wantCaps: map[string]int{
+				"qwen3.8-27b": 4096, "ornith-1.5-35b": 4096, "agentworld-35b": 4096,
+				"kat-coder-32b": 4096, "lfm2.5-8b": 2048, "agentworld-35b-max": 8192,
+			},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.worker, func(t *testing.T) {
+			validEnv(t)
+			t.Setenv("SUPPORTED_MODELS", tc.supportedModels)
+			t.Setenv("MODEL_OPTIONS", tc.modelOptions)
+
+			cfg, err := Load()
+			require.NoError(t, err, "%s production MODEL_OPTIONS must parse", tc.worker)
+			require.Len(t, cfg.ModelOptions, len(tc.wantCaps),
+				"every advertised model on %s must carry its catalogue cap", tc.worker)
+			for model, want := range tc.wantCaps {
+				opts, ok := cfg.ModelOptions[model]
+				require.True(t, ok, "%s missing MODEL_OPTIONS entry", model)
+				assert.Equal(t, want, opts.NumPredict,
+					"%s cap drifted from tier-catalog.json — update both together", model)
+				assert.Equal(t, 0, opts.NumCtx, "num_ctx stays at the process default (per-worker ruling)")
+			}
+		})
+	}
+}
