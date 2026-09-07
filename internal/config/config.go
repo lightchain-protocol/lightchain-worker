@@ -171,6 +171,13 @@ type Config struct {
 	TTSEnabled    bool
 	TTSSidecarURL string
 	TTSVoice      string
+	// SpeechModelName (SPEECH_MODEL_NAME) is the model whose jobs settle
+	// audio instead of text. A job for it skips the language model entirely
+	// and its answer is a base64 MP3 of the prompt read aloud. Empty
+	// disables the path, so a worker that has not opted in treats the name
+	// like any other model and fails to resolve it, which is correct: it
+	// cannot serve one.
+	SpeechModelName string
 	TTSMaxChars   int
 	TTSTimeout    time.Duration
 
@@ -483,6 +490,9 @@ func Load() (*Config, error) {
 	cfg.TTSEnabled = parseBool("TTS_ENABLED", false, &errs)
 	cfg.TTSSidecarURL = envOrDefault("TTS_SIDECAR_URL", "http://127.0.0.1:8101")
 	cfg.TTSVoice = envOrDefault("TTS_VOICE", "af_heart")
+	// Defaults to the name the deployed consumer already submits, so a
+	// worker enabling voice serves read-aloud without extra configuration.
+	cfg.SpeechModelName = envOrDefault("SPEECH_MODEL_NAME", "tts-piper")
 	cfg.TTSMaxChars = parseInt("TTS_MAX_CHARS", 4000, &errs)
 	cfg.TTSTimeout = parseDuration("TTS_TIMEOUT", "20s", &errs)
 

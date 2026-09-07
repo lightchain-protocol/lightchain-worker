@@ -198,6 +198,9 @@ type HandlerConfig struct {
 	STTEnabled  bool
 	TTSEnabled  bool
 	TTSVoice    string
+	// SpeechModelName is the model whose jobs settle audio rather than
+	// text. Empty leaves the speech path inert.
+	SpeechModelName string
 	TTSMaxChars int
 	TTSTimeout  time.Duration
 	SearchMaxResults    int
@@ -1327,6 +1330,17 @@ func (h *JobHandler) runInference(
 	history []ollama.ChatMessage,
 	streamer *chunkStreamer,
 ) (string, ollama.StreamStats, error) {
+	// A speech job's answer IS the recording, so it never reaches a language
+	// model: no Ollama call, no history, no streaming. Producing the audio
+	// here rather than special-casing the caller means stages 6-8 encrypt,
+	// blob and settle it byte for byte the way they settle a sentence.
+	//
+	// Distinct from the TTS_ENABLED path, which reads an ordinary answer
+	// aloud over audio frames and settles nothing.
+	if h.cfg.SpeechModelName != "" && modelName == h.cfg.SpeechModelName {
+		return h.runSpeechJob(ctx, logger, prompt.Text)
+	}
+
 	if streamer == nil {
 		var (
 			text string

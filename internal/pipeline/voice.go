@@ -10,7 +10,8 @@ package pipeline
 //     derived context, NOT settled content - it is re-derivable from the
 //     blob but not bit-deterministic across whisper versions. The response
 //     hash continues to cover model output text only.
-//   - Output: synthesized audio never enters the stage-6 settlement
+//   - Output: on the READ-ALOUD path (TTS_ENABLED, an ordinary answer voiced
+//     on request) synthesized audio never enters the stage-6 settlement
 //     ciphertext (text-only invariant, unchanged). It streams to the
 //     consumer as `audio` frames - delivered, not settled. Wiring audio
 //     into the settlement commitment is contract-side scope (the Phase-2
@@ -19,11 +20,20 @@ package pipeline
 //     content hash over the delivered PCM bytes in the terminal audio
 //     descriptor; it is not yet committed on-chain.
 //
-// Delivery mechanism: audio rides chunk frames, not a DA blob. PCM s16le
-// at 24 kHz is ~48 KB/s, so anything over ~2.6 s of speech exceeds the
-// 126,972-byte blob cap; frames have no such constraint, arrive
-// incrementally (first audio ~0.9 s into synthesis), and reuse the exact
-// channel the consumer already demultiplexes.
+//   - The SPEECH-MODEL path (a job whose modelId is SPEECH_MODEL_NAME) is
+//     the deliberate exception: the consumer asked for that model precisely
+//     because it wants the answer to BE the recording, so the audio is the
+//     settled content and stages 6-8 commit it like any other answer. This
+//     does not weaken the invariant above - it is a different job type, not
+//     a read-aloud that leaked into settlement.
+//
+// Delivery mechanism differs accordingly. Read-aloud audio rides chunk
+// frames, not a DA blob: PCM s16le at 24 kHz is ~48 KB/s, so anything over
+// ~2.6 s of speech exceeds the 126,972-byte blob cap; frames have no such
+// constraint, arrive incrementally (first audio ~0.9 s into synthesis), and
+// reuse the exact channel the consumer already demultiplexes. A speech job
+// has to fit that cap, which is why it settles compressed MP3 rather than
+// raw PCM and why the sidecar drops bitrate to make it fit.
 
 import (
 	"context"
@@ -40,6 +50,7 @@ import (
 
 	pkgtypes "github.com/lightchain/pkg/types"
 
+	"github.com/lightchain/worker/internal/ollama"
 	"github.com/lightchain/worker/internal/voice"
 )
 
@@ -62,7 +73,22 @@ type VoiceEngine interface {
 	// the stream. Per the sidecar contract the stream may end early
 	// without an error; a missing audioFinal frame marks truncation.
 	Synthesize(ctx context.Context, text, voiceName string) (stream io.ReadCloser, err error)
+	// SynthesizeSettled returns one complete MP3 of the whole utterance,
+	// bounded to maxBytes, for a job whose settled answer IS the audio.
+	// truncated reports that the text did not fit even at the sidecar's
+	// lowest bitrate.
+	SynthesizeSettled(ctx context.Context, text, voiceName string, maxBytes int) (audio []byte, truncated bool, err error)
 }
+
+// SettledAudioMaxBytes is the largest MP3 a speech job can settle.
+//
+// The answer rides ONE EIP-4844 blob (pkg/blob MaxBlobPayloadSize = 4096×31−4
+// = 126,972 bytes) and the consumer decodes it as base64, which inflates it by
+// 4/3. Leaving room for the AES-GCM overhead lands here. The sidecar lowers
+// bitrate to fit rather than refusing, so this bounds file size and not speech
+// length directly — but it is why a speech job cannot voice an arbitrarily
+// long answer, and why the audio-frame path exists for ones that are.
+const SettledAudioMaxBytes = 92_000
 
 // SetVoiceEngine installs the voice sidecar engine after construction.
 // Service wiring calls this once before Run when STT or TTS is enabled;
@@ -403,4 +429,60 @@ func (g *deadlineGuard) voiceBudgetOK(ctx context.Context, logger *slog.Logger, 
 		return false
 	}
 	return true
+}
+
+// runSpeechJob turns a speech job's prompt into its settled answer: a
+// base64-encoded MP3 of the prompt read aloud.
+//
+// Base64 rather than raw bytes because the settled answer travels the same
+// text-shaped path as every other answer — encrypted, blobbed, hashed into
+// completeJob, and handed to the consumer on the terminal frame — and the
+// consumer decodes it straight into an <audio> element.
+//
+// Returns empty stats: there are no eval tokens or tokens-per-second to
+// report for a job that never touched a language model, and inventing them
+// would corrupt the heat-tier metrics.
+func (h *JobHandler) runSpeechJob(
+	ctx context.Context,
+	logger *slog.Logger,
+	text string,
+) (string, ollama.StreamStats, error) {
+	if h.voiceEngine == nil {
+		// Config error, not a transient one: this worker advertises the
+		// speech model on-chain and cannot serve it. Fail loudly rather
+		// than settling silence.
+		return "", ollama.StreamStats{}, fmt.Errorf(
+			"stage 5 (speech): no voice engine configured; set TTS_ENABLED and TTS_SIDECAR_URL")
+	}
+
+	spoken := strings.TrimSpace(text)
+	if spoken == "" {
+		return "", ollama.StreamStats{}, fmt.Errorf("stage 5 (speech): nothing to read")
+	}
+
+	voiceName := h.cfg.TTSVoice
+	if voiceName == "" {
+		voiceName = "af_heart"
+	}
+
+	start := time.Now()
+	audio, truncated, err := h.voiceEngine.SynthesizeSettled(
+		ctx, spoken, voiceName, SettledAudioMaxBytes)
+	if err != nil {
+		return "", ollama.StreamStats{}, fmt.Errorf("stage 5 (speech): %w", err)
+	}
+
+	logger.Info("stage 5 complete (speech)",
+		"stage", "inference",
+		"path", "speech_model",
+		"voice", voiceName,
+		"chars", len(spoken),
+		"audioBytes", len(audio),
+		// Worth an explicit field: a truncated reading is a correct job with
+		// an incomplete answer, which is invisible from the audio alone.
+		"truncated", truncated,
+		"durationMs", time.Since(start).Milliseconds(),
+	)
+
+	return base64.StdEncoding.EncodeToString(audio), ollama.StreamStats{}, nil
 }

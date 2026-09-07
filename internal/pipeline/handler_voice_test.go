@@ -25,6 +25,8 @@ import (
 	"github.com/stretchr/testify/require"
 
 	pkgcrypto "github.com/lightchain/pkg/crypto"
+
+	"github.com/lightchain/worker/internal/ollama"
 	pkgtypes "github.com/lightchain/pkg/types"
 	"github.com/lightchain/worker/internal/metrics"
 	"github.com/lightchain/worker/internal/voice"
@@ -42,6 +44,7 @@ func discardLogger() *slog.Logger {
 type mockVoiceEngine struct {
 	transcribeFn func(ctx context.Context, audio []byte, format string) (string, error)
 	synthesizeFn func(ctx context.Context, text, voiceName string) (io.ReadCloser, error)
+	settledFn    func(ctx context.Context, text, voiceName string, maxBytes int) ([]byte, bool, error)
 
 	mu           sync.Mutex
 	transcribes  int
@@ -50,6 +53,25 @@ type mockVoiceEngine struct {
 	lastVoice    string
 	lastFormat   string
 	lastAudioLen int
+	settleds     int
+	lastMaxBytes int
+}
+
+// SynthesizeSettled backs the speech-model path, whose answer is the audio
+// itself. A nil settledFn panics like the others: a test that reaches this
+// unexpectedly should fail loudly rather than settle an empty recording.
+func (m *mockVoiceEngine) SynthesizeSettled(
+	ctx context.Context,
+	text, voiceName string,
+	maxBytes int,
+) ([]byte, bool, error) {
+	m.mu.Lock()
+	m.settleds++
+	m.lastText = text
+	m.lastVoice = voiceName
+	m.lastMaxBytes = maxBytes
+	m.mu.Unlock()
+	return m.settledFn(ctx, text, voiceName, maxBytes)
 }
 
 func (m *mockVoiceEngine) Transcribe(ctx context.Context, audio []byte, format string) (string, error) {
@@ -78,6 +100,29 @@ type voiceTestRig struct {
 	submitter *mockBlobSubmitter
 	rc        *redis.Client
 	session   []byte
+	// settledBlob is the stage-8a payload: the exact bytes committed on
+	// chain, which for a speech job is the audio answer.
+	settledBlob []byte
+	// settledBlobRef points at the closure variable the submitter writes,
+	// so the answer can be read immediately after the job rather than only
+	// at cleanup.
+	settledBlobRef *[]byte
+}
+
+// decryptSettledAnswer returns the plaintext the job settled — what the
+// consumer will decrypt from the terminal frame and the blob alike.
+func (r *voiceTestRig) decryptSettledAnswer(t *testing.T) (string, error) {
+	t.Helper()
+	blob := r.settledBlob
+	if r.settledBlobRef != nil && len(*r.settledBlobRef) > 0 {
+		blob = *r.settledBlobRef
+	}
+	require.NotEmpty(t, blob, "no blob was submitted")
+	plain, err := pkgcrypto.Decrypt(r.session, blob)
+	if err != nil {
+		return "", err
+	}
+	return string(plain), nil
 }
 
 func newVoiceTestRig(t *testing.T, promptPlaintext string, cfg HandlerConfig, inf InferenceClient, engine *mockVoiceEngine) *voiceTestRig {
@@ -99,7 +144,9 @@ func newVoiceTestRig(t *testing.T, promptPlaintext string, cfg HandlerConfig, in
 	fetcher := &mockBlobFetcher{fetchFn: func(_ context.Context, _ common.Hash, _ uint64) ([]byte, error) {
 		return promptCiphertext, nil
 	}}
+	var settled []byte
 	submitter := &mockBlobSubmitter{submitFn: func(_ context.Context, data []byte) ([][32]byte, error) {
+		settled = append([]byte(nil), data...)
 		return [][32]byte{{0x77}}, nil
 	}}
 
@@ -130,7 +177,12 @@ nil,
 	if engine != nil {
 		handler.SetVoiceEngine(engine)
 	}
-	return &voiceTestRig{handler: handler, engine: engine, submitter: submitter, rc: rc, session: sessionKey}
+	rig := &voiceTestRig{handler: handler, engine: engine, submitter: submitter, rc: rc, session: sessionKey}
+	// settled is filled by the submitter closure during the run, so the rig
+	// reads it back through a pointer rather than a value copied at build.
+	t.Cleanup(func() { rig.settledBlob = settled })
+	rig.settledBlobRef = &settled
+	return rig
 }
 
 func runVoiceJob(t *testing.T, rig *voiceTestRig) error {
@@ -623,4 +675,92 @@ func TestEmitArtifact_RejectsInvalid(t *testing.T) {
 
 	// Nil streamer is a silent skip (batch mode), not an error.
 	assert.NoError(t, emitArtifact(nil, "genui", "schema", json.RawMessage(`{}`)))
+}
+
+// --- speech model: the job whose settled answer IS the recording ----------
+
+// fatalInference fails the test if the language model is reached at all. A
+// speech job must never call one: doing so would settle a spoken sentence
+// instead of the audio, and burn a generation the consumer did not ask for.
+type fatalInference struct{ t *testing.T }
+
+func (f fatalInference) Generate(context.Context, string, string) (string, error) {
+	f.t.Fatal("speech job reached Generate; it must skip the language model")
+	return "", nil
+}
+
+func (f fatalInference) Chat(context.Context, string, []ollama.ChatMessage) (string, error) {
+	f.t.Fatal("speech job reached Chat; it must skip the language model")
+	return "", nil
+}
+
+func TestSpeechModel_SettlesAudioAndSkipsInference(t *testing.T) {
+	mp3 := []byte("\xff\xfbID3 fake mp3 payload")
+	engine := &mockVoiceEngine{
+		settledFn: func(_ context.Context, _, _ string, _ int) ([]byte, bool, error) {
+			return mp3, false, nil
+		},
+	}
+
+	rig := newVoiceTestRig(t, "read me aloud",
+		HandlerConfig{SpeechModelName: "tts-piper", TTSVoice: "af_heart",
+			ModelIDToName: map[string]string{"llama3-8b": "tts-piper"}},
+		fatalInference{t}, engine)
+	require.NoError(t, runVoiceJob(t, rig))
+
+	assert.Equal(t, 1, rig.engine.settleds, "the speech path must be taken")
+	assert.Equal(t, "read me aloud", rig.engine.lastText)
+	assert.Equal(t, "af_heart", rig.engine.lastVoice)
+	assert.Equal(t, SettledAudioMaxBytes, rig.engine.lastMaxBytes,
+		"the blob budget must reach the sidecar, or an oversized answer fails at stage 8a")
+}
+
+func TestSpeechModel_SettledAnswerIsBase64OfTheAudio(t *testing.T) {
+	mp3 := []byte{0xff, 0xfb, 0x10, 0x00, 0x42, 0x99}
+	engine := &mockVoiceEngine{
+		settledFn: func(_ context.Context, _, _ string, _ int) ([]byte, bool, error) {
+			return mp3, false, nil
+		},
+	}
+
+	rig := newVoiceTestRig(t, "hello",
+		HandlerConfig{SpeechModelName: "tts-piper",
+			ModelIDToName: map[string]string{"llama3-8b": "tts-piper"}}, fatalInference{t}, engine)
+	require.NoError(t, runVoiceJob(t, rig))
+
+	// The consumer decodes the settled answer straight into an <audio>
+	// element, so the exact encoding is a wire contract, not an internal
+	// detail.
+	got, err := rig.decryptSettledAnswer(t)
+	require.NoError(t, err)
+	decoded, err := base64.StdEncoding.DecodeString(got)
+	require.NoError(t, err, "settled answer must be valid base64")
+	assert.Equal(t, mp3, decoded)
+}
+
+func TestSpeechModel_FailsLoudlyWithoutAVoiceEngine(t *testing.T) {
+	// The worker advertises this model on-chain. Settling silence would look
+	// like a successful job to everyone including the consumer.
+	rig := newVoiceTestRig(t, "hello",
+		HandlerConfig{SpeechModelName: "tts-piper",
+			ModelIDToName: map[string]string{"llama3-8b": "tts-piper"}}, fatalInference{t}, nil)
+
+	err := runVoiceJob(t, rig)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "no voice engine configured")
+}
+
+func TestSpeechModel_OtherModelsAreUnaffected(t *testing.T) {
+	engine := &mockVoiceEngine{}
+	ol := &mockOllama{generateFn: func(context.Context, string, string) (string, error) {
+		return "an ordinary answer", nil
+	}}
+
+	// Same worker, different model: the language model still runs and the
+	// speech sidecar is never touched.
+	rig := newVoiceTestRig(t, "hello",
+		HandlerConfig{SpeechModelName: "some-other-speech-model"}, ol, engine)
+	require.NoError(t, runVoiceJob(t, rig))
+
+	assert.Equal(t, 0, rig.engine.settleds)
 }
