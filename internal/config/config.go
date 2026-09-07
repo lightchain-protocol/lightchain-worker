@@ -170,6 +170,12 @@ type Config struct {
 	// JobWatcher uses to reconstruct a session's prior job IDs for conversation
 	// history. Defaults to 50000.
 	SortitionHistoryLookbackBlocks uint64
+	// SortitionSessionLookbackBlocks is how far behind its persisted cursor the
+	// SessionWatcher re-scans on its first pass after a start, so requests it had
+	// discovered but not yet been eligible for are not forgotten by a restart.
+	// Cover the longest a request stays Open (consumer-api default expiry 1 h:
+	// 1800 blocks at 2 s slots, 600 at 6 s). Defaults to 2000; 0 disables.
+	SortitionSessionLookbackBlocks uint64
 	// SortitionSessionRetryLimit bounds how many passes the JobWatcher retries
 	// a job whose session is not Active before giving up and skipping it, so
 	// one session that never returns to Active cannot wedge the watcher and
@@ -365,6 +371,7 @@ func Load() (*Config, error) {
 	cfg.SortitionPollInterval = parseDuration("SORTITION_POLL_INTERVAL", "4s", &errs)
 	cfg.SortitionConfirmations = parseUint64("SORTITION_CONFIRMATIONS", 0, &errs)
 	cfg.SortitionHistoryLookbackBlocks = parseUint64("SORTITION_HISTORY_LOOKBACK_BLOCKS", 50000, &errs)
+	cfg.SortitionSessionLookbackBlocks = parseUint64("SORTITION_SESSION_LOOKBACK_BLOCKS", 2000, &errs)
 	cfg.SortitionSessionRetryLimit = parseInt("SORTITION_SESSION_RETRY_LIMIT", 10, &errs)
 
 	if len(errs) > 0 {
