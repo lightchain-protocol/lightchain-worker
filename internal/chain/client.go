@@ -968,3 +968,77 @@ func (c *ChainClient) GetRequestInfo(ctx context.Context, reqID uint64) (Request
 	}
 	return RequestInfo{Status: r.Status, Expiry: r.Expiry, Worker: r.Worker}, nil
 }
+
+// --- Read-only helpers used by the operator CLI preflight ---
+
+// ChainID returns the chain id reported by the RPC endpoint (eth_chainId).
+func (c *ChainClient) ChainID(ctx context.Context) (*big.Int, error) {
+	id, err := c.ethClient.ChainID(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("ChainID: %w", err)
+	}
+	return id, nil
+}
+
+// Balance returns the native-token balance of addr at the latest block.
+func (c *ChainClient) Balance(ctx context.Context, addr common.Address) (*big.Int, error) {
+	bal, err := c.ethClient.BalanceAt(ctx, addr, nil)
+	if err != nil {
+		return nil, fmt.Errorf("BalanceAt %s: %w", addr.Hex(), err)
+	}
+	return bal, nil
+}
+
+// IsWorkerSuspended reports whether the worker is currently serving a suspension cooldown.
+func (c *ChainClient) IsWorkerSuspended(ctx context.Context, worker common.Address) (bool, error) {
+	v, err := c.registry.IsWorkerSuspended(&bind.CallOpts{Context: ctx}, worker)
+	if err != nil {
+		return false, fmt.Errorf("IsWorkerSuspended %s: %w", worker.Hex(), err)
+	}
+	return v, nil
+}
+
+// GetOffenseCount returns the worker's recorded offense count.
+func (c *ChainClient) GetOffenseCount(ctx context.Context, worker common.Address) (*big.Int, error) {
+	v, err := c.registry.GetOffenseCount(&bind.CallOpts{Context: ctx}, worker)
+	if err != nil {
+		return nil, fmt.Errorf("GetOffenseCount %s: %w", worker.Hex(), err)
+	}
+	return v, nil
+}
+
+// GetWorkerStake returns the worker's currently staked amount in wei.
+func (c *ChainClient) GetWorkerStake(ctx context.Context, worker common.Address) (*big.Int, error) {
+	v, err := c.registry.GetWorkerStake(&bind.CallOpts{Context: ctx}, worker)
+	if err != nil {
+		return nil, fmt.Errorf("GetWorkerStake %s: %w", worker.Hex(), err)
+	}
+	return v, nil
+}
+
+// IsModelWhitelisted reports whether the model id may be registered by workers.
+func (c *ChainClient) IsModelWhitelisted(ctx context.Context, modelID [32]byte) (bool, error) {
+	v, err := c.registry.IsModelWhitelisted(&bind.CallOpts{Context: ctx}, modelID)
+	if err != nil {
+		return false, fmt.Errorf("IsModelWhitelisted: %w", err)
+	}
+	return v, nil
+}
+
+// IsModelEnabled reports whether AIConfig currently enables the model.
+func (c *ChainClient) IsModelEnabled(ctx context.Context, modelID [32]byte) (bool, error) {
+	v, err := c.aiConfig.IsModelEnabled(&bind.CallOpts{Context: ctx}, modelID)
+	if err != nil {
+		return false, fmt.Errorf("IsModelEnabled: %w", err)
+	}
+	return v, nil
+}
+
+// WorkerSupportsModel reports whether the worker has added the model on-chain.
+func (c *ChainClient) WorkerSupportsModel(ctx context.Context, worker common.Address, modelID [32]byte) (bool, error) {
+	v, err := c.registry.WorkerSupportsModel(&bind.CallOpts{Context: ctx}, worker, modelID)
+	if err != nil {
+		return false, fmt.Errorf("WorkerSupportsModel %s: %w", worker.Hex(), err)
+	}
+	return v, nil
+}

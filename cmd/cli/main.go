@@ -15,15 +15,18 @@
 //	undrain     Reverse drain — restore worker eligibility
 //	deregister  Deregister worker and withdraw stake
 //	status      Check on-chain registration status
+//	preflight   Read-only go-live checks (RPC, registration, stake, models, gateway, Ollama, beacon)
 package main
 
 import (
 	"context"
+	"crypto/ecdh"
 	"crypto/ecdsa"
 	"flag"
 	"fmt"
 	"log/slog"
 	"os"
+	"slices"
 	"strings"
 	"time"
 
@@ -71,6 +74,8 @@ func main() {
 		runUndrain()
 	case "status":
 		runStatus()
+	case "preflight":
+		runPreflight()
 	case "balance":
 		runBalance()
 	case "withdraw":
@@ -100,6 +105,8 @@ Commands:
   undrain     Reverse drain — restore worker eligibility
   deregister  Deregister worker and withdraw stake
   status      Check on-chain registration status
+  preflight   Read-only go-live checks: RPC, registration, stake vs on-chain
+              minimum, models, gateway, Ollama, beacon. Exit 1 on any failure.
   balance     Print the worker's accumulated on-chain workerBalance
   withdraw    Drain the worker's workerBalance to the worker address
   release     Reconcile + run one release cycle (settles eligible jobs)
@@ -131,7 +138,12 @@ import-key flags:
   --output <dir>        Directory to write the keystore file (default: ./eth-keystore)
 
 release flags:
-  --reconcile-only      Run reconciler only; do not execute a release cycle`)
+  --reconcile-only      Run reconciler only; do not execute a release cycle
+
+preflight flags:
+  --worker <address>    Inspect this address without a keystore (read-only:
+                        ECDH and gateway auth checks are skipped)
+preflight also reads OLLAMA_URL and BEACON_API_URL when set.`)
 }
 
 func runImportKey() {
@@ -293,6 +305,95 @@ func runStatus() {
 	if err := h.Status(ctx); err != nil {
 		logger.Error("status check failed", "error", err)
 		os.Exit(1)
+	}
+}
+
+func runPreflight() {
+	fs := flag.NewFlagSet("preflight", flag.ExitOnError)
+	workerFlag := fs.String("worker", "", "Inspect this address without loading a keystore (read-only)")
+	if err := fs.Parse(os.Args[2:]); err != nil {
+		quitProcess(1)
+	}
+	readOnly := *workerFlag != ""
+
+	cfg, err := config.LoadRegistration()
+	if err != nil {
+		slog.Error("config load failed", "error", err)
+		quitProcess(1)
+	}
+	errs := cfg.Validate()
+	if readOnly {
+		// No keystore is needed to inspect an address.
+		errs = slices.DeleteFunc(errs, func(e string) bool { return strings.HasPrefix(e, "WORKER_KEYSTORE") })
+	}
+	if len(errs) > 0 {
+		slog.Error("config validation failed", "fields", strings.Join(errs, "; "))
+		quitProcess(1)
+	}
+	logger := newLogger(cfg.LogLevel, cfg.LogFormat)
+
+	var signingKey *ecdsa.PrivateKey
+	var workerAddr common.Address
+	if readOnly {
+		if !common.IsHexAddress(*workerFlag) {
+			logger.Error("--worker must be a hex address", "value", *workerFlag)
+			quitProcess(1)
+		}
+		workerAddr = common.HexToAddress(*workerFlag)
+		// The chain client requires a key but preflight never signs anything.
+		signingKey, err = crypto.GenerateKey()
+		if err != nil {
+			logger.Error("generate ephemeral key", "error", err)
+			quitProcess(1)
+		}
+	} else {
+		signingKey, workerAddr = loadSigningKey(cfg, logger)
+	}
+
+	var modelIDs [][32]byte
+	var modelNames []string
+	if len(cfg.SupportedModels) > 0 {
+		modelIDs, modelNames = parseModels(cfg, logger)
+	}
+
+	chainClient := dialChain(cfg, signingKey, logger)
+	defer chainClient.Close()
+
+	h := &cli.PreflightHandler{
+		Chain:       chainClient,
+		ChainID:     cfg.ChainID,
+		WorkerAddr:  workerAddr,
+		ModelIDs:    modelIDs,
+		ModelNames:  modelNames,
+		ECDHKeyPath: cfg.EncryptionKeystorePath,
+		ECDHPass:    cfg.WorkerKeystorePassword,
+		OllamaURL:   cfg.OllamaURL,
+		BeaconURL:   cfg.BeaconAPIURL,
+		Out:         os.Stdout,
+		Logger:      logger,
+	}
+	if !readOnly {
+		// Load only: preflight must never create the ECDH key as a side effect.
+		h.LoadECDHKey = func(path, pass string) (*ecdh.PrivateKey, error) {
+			if _, err := os.Stat(path); err != nil {
+				return nil, err
+			}
+			return keystore.LoadOrGenerate(path, pass)
+		}
+	}
+	if cfg.WorkerGatewayURL != "" {
+		if readOnly {
+			h.Gateway = &cli.GatewayPing{URL: cfg.WorkerGatewayURL}
+		} else {
+			h.Gateway = gateway.NewClient(cfg.WorkerGatewayURL, signingKey, logger)
+		}
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	if !h.Run(ctx) {
+		quitProcess(1)
 	}
 }
 
