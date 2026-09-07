@@ -47,15 +47,18 @@ const farFuture = ^uint64(0)
 // eligible is a mutable map; tests may flip entries between RunOnce calls to
 // simulate the decaying sortition threshold.
 type mockClaimClient struct {
-	head         chain.HeadInfo
-	requested    []chain.SessionRequestedEvent
-	eligible     map[uint64]bool
-	requestInfos map[uint64]chain.RequestInfo
-	claimed      []uint64
-	claimErr     error
-	requiredCaps map[uint64]*big.Int // absent key → 0 (unconstrained)
-	capsErr      error               // forces GetRequiredCapabilities to fail
-	capsReads    int                 // counts GetRequiredCapabilities calls
+	head           chain.HeadInfo
+	requested      []chain.SessionRequestedEvent
+	eligible       map[uint64]bool
+	requestInfos   map[uint64]chain.RequestInfo
+	claimed        []uint64
+	claimErr       error
+	requiredCaps   map[uint64]*big.Int // absent key → 0 (unconstrained)
+	capsErr        error               // forces GetRequiredCapabilities to fail
+	capsReads      int                 // counts GetRequiredCapabilities calls
+	filterRanges   [][2]uint64         // every [from, to] FilterSessionRequested was asked for
+	filterErr      error               // returned for ranges starting at or below filterErrBelow
+	filterErrBelow uint64
 }
 
 func (m *mockClaimClient) GetRequiredCapabilities(_ context.Context, reqID uint64) (*big.Int, error) {
@@ -74,6 +77,10 @@ func (m *mockClaimClient) Head(_ context.Context) (chain.HeadInfo, error) {
 }
 
 func (m *mockClaimClient) FilterSessionRequested(_ context.Context, from, to uint64) ([]chain.SessionRequestedEvent, error) {
+	m.filterRanges = append(m.filterRanges, [2]uint64{from, to})
+	if m.filterErr != nil && from <= m.filterErrBelow {
+		return nil, m.filterErr
+	}
 	var result []chain.SessionRequestedEvent
 	for _, ev := range m.requested {
 		if ev.BlockNumber >= from && ev.BlockNumber <= to {
@@ -391,4 +398,130 @@ func TestSessionWatcher_CapabilityMaskCachedAcrossPasses(t *testing.T) {
 	require.NoError(t, sw.RunOnce(context.Background()))
 	require.Equal(t, []uint64{1}, mc.claimed)
 	require.Equal(t, 1, mc.capsReads)
+}
+
+// ──────────────────────────────────────────────
+// Restart survival (pending set is memory-only, cursor is not)
+// ──────────────────────────────────────────────
+
+// newSWWithCursor mirrors newSW but uses the caller's CursorStore, so two
+// watchers can share one on-disk cursor the way a restarted process would, and
+// sets the look-back the restarted watcher applies behind that cursor.
+func newSWWithCursor(t *testing.T, mc *mockClaimClient, counter *atomic.Int32, cs *CursorStore, lookback uint64) *SessionWatcher {
+	t.Helper()
+	return NewSessionWatcher(SessionWatcherOpts{
+		Client:         mc,
+		Cursor:         cs,
+		Worker:         common.HexToAddress("0x0000000000000000000000000000000000000001"),
+		JobCounter:     counter,
+		MaxConcurrent:  4,
+		ChunkSize:      5000,
+		Confirmations:  0,
+		Logger:         testLogger(t),
+		LookbackBlocks: lookback,
+	})
+}
+
+// restartedWatcher runs one pass with a first watcher (ineligible, so the
+// request at block 50 stays pending), then builds a second watcher on the same
+// cursor directory — the restarted process — with the given look-back.
+func restartedWatcher(t *testing.T, lookback uint64) (*mockClaimClient, *SessionWatcher, *CursorStore) {
+	t.Helper()
+	var counter atomic.Int32
+	mc := &mockClaimClient{
+		head:      chain.HeadInfo{Number: 100},
+		requested: []chain.SessionRequestedEvent{{ReqID: 1, BlockNumber: 50}},
+		eligible:  map[uint64]bool{1: false},
+	}
+	dir := t.TempDir()
+	cs1, err := NewCursorStore(dir)
+	require.NoError(t, err)
+	first := newSWWithCursor(t, mc, &counter, cs1, lookback)
+	require.NoError(t, first.RunOnce(context.Background()))
+	require.Empty(t, mc.claimed, "ineligible at discovery: no claim")
+	require.Contains(t, first.pending, uint64(1))
+
+	cs2, err := NewCursorStore(dir) // same cursor file, already at 100
+	require.NoError(t, err)
+	mc.eligible[1] = true
+	mc.head = chain.HeadInfo{Number: 110}
+	return mc, newSWWithCursor(t, mc, &counter, cs2, lookback), cs2
+}
+
+// TestSessionWatcher_ReseedsPendingAfterRestart: a request discovered while the
+// worker was still ineligible must survive a process restart. The cursor is
+// persisted but the pending set is not, so a fresh watcher on the same cursor
+// store must look behind the cursor once and pick the still-Open request up.
+func TestSessionWatcher_ReseedsPendingAfterRestart(t *testing.T) {
+	mc, second, cs := restartedWatcher(t, 60) // looks back over [41..100], which covers block 50
+	require.NoError(t, second.RunOnce(context.Background()))
+	require.Equal(t, []uint64{1}, mc.claimed, "restarted watcher must still compete for the request")
+	require.Equal(t, [][2]uint64{{1, 100}, {41, 100}, {101, 110}}, mc.filterRanges,
+		"first watcher's discovery, then the restarted one's look-back and its discovery")
+
+	got, err := cs.Get(cursorSessionRequested)
+	require.NoError(t, err)
+	require.Equal(t, uint64(110), got, "looking back must not regress the cursor")
+}
+
+// The look-back is a bound, not a full rescan: a request older than it is not
+// reseeded (it is expired or claimed by then in practice), and zero disables it.
+func TestSessionWatcher_LookbackIsBounded(t *testing.T) {
+	mc, second, _ := restartedWatcher(t, 10) // [91..100] does not reach block 50
+	require.NoError(t, second.RunOnce(context.Background()))
+	require.Empty(t, mc.claimed, "request behind the look-back window is not reseeded")
+
+	mc, second, _ = restartedWatcher(t, 0)
+	require.NoError(t, second.RunOnce(context.Background()))
+	require.Empty(t, mc.claimed, "zero look-back keeps the old cursor-only behaviour")
+}
+
+// The look-back runs on the first pass only; later passes scan forward from the
+// cursor as before.
+func TestSessionWatcher_LookbackRunsOnce(t *testing.T) {
+	mc, second, cs := restartedWatcher(t, 60)
+	require.NoError(t, second.RunOnce(context.Background()))
+	scans := len(mc.filterRanges)
+
+	// Head unchanged → safeHead == cursor → no discovery range; any filter call
+	// now would be a repeated look-back.
+	require.NoError(t, second.RunOnce(context.Background()))
+	require.Equal(t, scans, len(mc.filterRanges), "no second look-back behind the cursor")
+	got, err := cs.Get(cursorSessionRequested)
+	require.NoError(t, err)
+	require.Equal(t, uint64(110), got, "a pass with no discovery leaves the cursor alone")
+}
+
+// A failing look-back must not wedge the pass: discovery and evaluation still
+// run (the pre-look-back behaviour) and the look-back is retried next pass.
+func TestSessionWatcher_LookbackFailureDoesNotWedgeThePass(t *testing.T) {
+	mc, second, cs := restartedWatcher(t, 70)
+	mc.filterErr, mc.filterErrBelow = errors.New("history pruned"), 100 // look-back ranges fail, [101..] is fine
+	require.NoError(t, second.RunOnce(context.Background()), "the pass degrades instead of failing")
+	got, err := cs.Get(cursorSessionRequested)
+	require.NoError(t, err)
+	require.Equal(t, uint64(110), got, "discovery still ran")
+	require.Empty(t, mc.claimed)
+
+	mc.filterErr = nil
+	require.NoError(t, second.RunOnce(context.Background()))
+	require.Equal(t, []uint64{1}, mc.claimed, "look-back retried once the filter recovers: [41..110] covers block 50")
+}
+
+// A look-back that keeps failing is abandoned after reseedMaxAttempts, so a
+// pruned-history RPC does not cost a filter call and a warning on every pass forever.
+func TestSessionWatcher_LookbackGivesUpAfterMaxAttempts(t *testing.T) {
+	mc, second, _ := restartedWatcher(t, 60)
+	mc.filterRanges = nil
+	mc.filterErr, mc.filterErrBelow = errors.New("history pruned"), 100
+	for i := 0; i < reseedMaxAttempts+2; i++ {
+		require.NoError(t, second.RunOnce(context.Background()))
+	}
+	attempts := 0
+	for _, r := range mc.filterRanges {
+		if r[0] <= 100 { // look-back ranges start at or below the old cursor; discovery starts at 101
+			attempts++
+		}
+	}
+	require.Equal(t, reseedMaxAttempts, attempts, "look-back attempted exactly reseedMaxAttempts times")
 }
