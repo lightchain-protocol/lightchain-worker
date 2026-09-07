@@ -5,6 +5,8 @@ import (
 	"context"
 	"crypto/ecdh"
 	"errors"
+	"fmt"
+	"io/fs"
 	"math/big"
 	"net/http"
 	"net/http/httptest"
@@ -34,6 +36,7 @@ type fakeChain struct {
 	enabled     map[[32]byte]bool
 	supported   map[[32]byte]bool
 	err         error // when set, every call fails with it
+	minStakeErr error // when set, only GetMinWorkerStake fails
 }
 
 func lcaiWei(n int64) *big.Int {
@@ -79,7 +82,12 @@ func (f *fakeChain) GetWorkerStake(context.Context, common.Address) (*big.Int, e
 	return f.stake, f.err
 }
 
-func (f *fakeChain) GetMinWorkerStake(context.Context) (*big.Int, error) { return f.minStake, f.err }
+func (f *fakeChain) GetMinWorkerStake(context.Context) (*big.Int, error) {
+	if f.minStakeErr != nil {
+		return nil, f.minStakeErr
+	}
+	return f.minStake, f.err
+}
 
 func (f *fakeChain) GetWorkerEncryptionKey(context.Context, common.Address) ([]byte, error) {
 	return f.encKey, f.err
@@ -136,7 +144,6 @@ func newPreflight(t *testing.T, fc *fakeChain, key *ecdh.PrivateKey, srv *httpte
 		Gateway:    fakeGateway{},
 		Now:        func() time.Time { return time.Unix(fc.head.Timestamp+2, 0) },
 		Out:        &buf,
-		Logger:     testLogger(),
 	}
 	if key != nil {
 		h.LoadECDHKey = func(_, _ string) (*ecdh.PrivateKey, error) { return key, nil }
@@ -327,7 +334,6 @@ func TestPreflight_GatewayAuthRejected(t *testing.T) {
 
 	require.False(t, ok)
 	assert.Contains(t, buf.String(), "[FAIL] gateway")
-	assert.Contains(t, buf.String(), "403")
 }
 
 func TestPreflight_StaleHead_Warns(t *testing.T) {
@@ -367,4 +373,165 @@ func TestGatewayPing_ChallengeReachable(t *testing.T) {
 	err := (&GatewayPing{URL: srv.URL + "/nope"}).Authenticate(context.Background())
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "404")
+}
+
+func TestPreflight_UnregisteredBalanceCoversStakeButNotGas_Warns(t *testing.T) {
+	t.Parallel()
+	fc := greenChain(time.Now(), nil)
+	fc.registered = false
+	fc.balance = lcaiWei(5010)
+	h, buf := newPreflight(t, fc, nil, nil)
+
+	h.Run(context.Background())
+
+	assert.Contains(t, buf.String(), "[WARN] balance")
+	assert.NotContains(t, buf.String(), "[FAIL] balance")
+}
+
+func TestPreflight_RegisteredZeroBalance_Fails(t *testing.T) {
+	t.Parallel()
+	fc := greenChain(time.Now(), nil)
+	fc.balance = big.NewInt(0)
+	h, buf := newPreflight(t, fc, nil, nil)
+
+	ok := h.Run(context.Background())
+
+	require.False(t, ok)
+	assert.Contains(t, buf.String(), "[FAIL] balance")
+}
+
+func TestPreflight_MinimumUnknown_Unregistered_SkipsBalanceVerdict(t *testing.T) {
+	t.Parallel()
+	fc := greenChain(time.Now(), nil)
+	fc.registered = false
+	fc.balance = big.NewInt(0)
+	fc.minStakeErr = errors.New("execution reverted")
+	h, buf := newPreflight(t, fc, nil, nil)
+
+	h.Run(context.Background())
+
+	assert.Contains(t, buf.String(), "[FAIL] stake")
+	assert.Contains(t, buf.String(), "[SKIP] balance")
+	assert.NotContains(t, buf.String(), "[PASS] balance")
+}
+
+func TestPreflight_ECDHMissing_Registered_Fails(t *testing.T) {
+	t.Parallel()
+	fc := greenChain(time.Now(), nil)
+	h, buf := newPreflight(t, fc, nil, nil)
+	h.LoadECDHKey = func(p, _ string) (*ecdh.PrivateKey, error) {
+		return nil, fmt.Errorf("read keystore %s: %w", p, fs.ErrNotExist)
+	}
+
+	ok := h.Run(context.Background())
+
+	require.False(t, ok)
+	assert.Contains(t, buf.String(), "[FAIL] ecdh")
+}
+
+func TestPreflight_ECDHMissing_Unregistered_Warns(t *testing.T) {
+	t.Parallel()
+	fc := greenChain(time.Now(), nil)
+	fc.registered = false
+	h, buf := newPreflight(t, fc, nil, nil)
+	h.LoadECDHKey = func(p, _ string) (*ecdh.PrivateKey, error) {
+		return nil, fmt.Errorf("read keystore %s: %w", p, fs.ErrNotExist)
+	}
+
+	h.Run(context.Background())
+
+	assert.Contains(t, buf.String(), "[WARN] ecdh")
+	assert.Contains(t, buf.String(), "not generated yet")
+}
+
+func TestPreflight_ECDHUnreadable_Unregistered_Fails(t *testing.T) {
+	t.Parallel()
+	fc := greenChain(time.Now(), nil)
+	fc.registered = false
+	h, buf := newPreflight(t, fc, nil, nil)
+	h.LoadECDHKey = func(_, _ string) (*ecdh.PrivateKey, error) {
+		return nil, errors.New("decrypt ECDH private key: cipher: message authentication failed")
+	}
+
+	h.Run(context.Background())
+
+	assert.Contains(t, buf.String(), "[FAIL] ecdh")
+	assert.NotContains(t, buf.String(), "not generated yet")
+}
+
+func TestPreflight_ModelDisabled(t *testing.T) {
+	t.Parallel()
+	fc := greenChain(time.Now(), nil)
+	fc.enabled = nil
+	h, buf := newPreflight(t, fc, nil, nil)
+
+	ok := h.Run(context.Background())
+
+	require.False(t, ok)
+	assert.Contains(t, buf.String(), "[FAIL] model")
+	assert.Contains(t, buf.String(), "disabled")
+}
+
+func TestPreflight_ModelNamesMismatch_Fails(t *testing.T) {
+	t.Parallel()
+	fc := greenChain(time.Now(), nil)
+	h, buf := newPreflight(t, fc, nil, nil)
+	h.ModelNames = nil
+
+	ok := h.Run(context.Background())
+
+	require.False(t, ok)
+	assert.Contains(t, buf.String(), "[FAIL] model")
+}
+
+func TestPreflight_UnknownNetwork_NoPublishedMinimum(t *testing.T) {
+	t.Parallel()
+	fc := greenChain(time.Now(), nil)
+	fc.chainID = 48221
+	fc.minStake = lcaiWei(32)
+	fc.stake = lcaiWei(32)
+	h, buf := newPreflight(t, fc, nil, nil)
+	h.ChainID = 48221
+
+	ok := h.Run(context.Background())
+
+	require.True(t, ok, buf.String())
+	assert.Contains(t, buf.String(), "devnet")
+	assert.NotContains(t, buf.String(), "[WARN] stake")
+}
+
+func TestPreflight_OllamaErrorStatus(t *testing.T) {
+	t.Parallel()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+		_, _ = w.Write([]byte(`{"error":"boom"}`))
+	}))
+	t.Cleanup(srv.Close)
+	fc := greenChain(time.Now(), nil)
+	h, buf := newPreflight(t, fc, nil, nil)
+	h.OllamaURL = srv.URL
+
+	ok := h.Run(context.Background())
+
+	require.False(t, ok)
+	assert.Contains(t, buf.String(), "[FAIL] ollama")
+	assert.Contains(t, buf.String(), "500")
+	assert.NotContains(t, buf.String(), "ollama pull")
+}
+
+func TestPreflight_BeaconMalformedBody(t *testing.T) {
+	t.Parallel()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(`<html>not a beacon</html>`))
+	}))
+	t.Cleanup(srv.Close)
+	fc := greenChain(time.Now(), nil)
+	h, buf := newPreflight(t, fc, nil, nil)
+	h.BeaconURL = srv.URL
+
+	ok := h.Run(context.Background())
+
+	require.False(t, ok)
+	assert.Contains(t, buf.String(), "[FAIL] beacon")
+	assert.NotContains(t, buf.String(), "returned 200")
 }

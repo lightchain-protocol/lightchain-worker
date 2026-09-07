@@ -20,7 +20,6 @@ package main
 
 import (
 	"context"
-	"crypto/ecdh"
 	"crypto/ecdsa"
 	"flag"
 	"fmt"
@@ -141,9 +140,14 @@ release flags:
   --reconcile-only      Run reconciler only; do not execute a release cycle
 
 preflight flags:
-  --worker <address>    Inspect this address without a keystore (read-only:
-                        ECDH and gateway auth checks are skipped)
-preflight also reads OLLAMA_URL and BEACON_API_URL when set.`)
+  --worker <address>    Inspect this address without a keystore. The ECDH
+                        check is skipped and the gateway check only pings
+                        the challenge endpoint; OLLAMA_URL / BEACON_API_URL
+                        are probed only when set explicitly.
+preflight never writes to disk or chain. Without --worker the gateway
+check performs the normal challenge/response login (a short-lived token
+is minted server-side). OLLAMA_URL and BEACON_API_URL default to the
+sidecar's localhost values.`)
 }
 
 func runImportKey() {
@@ -370,16 +374,19 @@ func runPreflight() {
 		OllamaURL:   cfg.OllamaURL,
 		BeaconURL:   cfg.BeaconAPIURL,
 		Out:         os.Stdout,
-		Logger:      logger,
 	}
-	if !readOnly {
-		// Load only: preflight must never create the ECDH key as a side effect.
-		h.LoadECDHKey = func(path, pass string) (*ecdh.PrivateKey, error) {
-			if _, err := os.Stat(path); err != nil {
-				return nil, err
-			}
-			return keystore.LoadOrGenerate(path, pass)
+	if readOnly {
+		// Inspecting a remote address: the sidecar-default localhost probes
+		// are meaningless unless the operator asked for them.
+		if os.Getenv("OLLAMA_URL") == "" {
+			h.OllamaURL = ""
 		}
+		if os.Getenv("BEACON_API_URL") == "" {
+			h.BeaconURL = ""
+		}
+	} else {
+		// Load only: preflight must never create the ECDH key as a side effect.
+		h.LoadECDHKey = keystore.Load
 	}
 	if cfg.WorkerGatewayURL != "" {
 		if readOnly {
