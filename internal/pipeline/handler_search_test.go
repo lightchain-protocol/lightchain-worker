@@ -17,11 +17,18 @@ import (
 	"github.com/stretchr/testify/require"
 
 	pkgcrypto "github.com/lightchain/pkg/crypto"
+	pkgtypes "github.com/lightchain/pkg/types"
 	"github.com/lightchain/pkg/searchaug"
 	"github.com/lightchain/worker/internal/metrics"
 	"github.com/lightchain/worker/internal/ollama"
 	"github.com/lightchain/worker/internal/search"
 )
+
+// fakeSearcher satisfies search.Searcher and returns a fixed set of sources.
+type fakeSearcher struct {
+	sources []search.Source
+	err     error
+}
 
 // recordingPublisher implements ResponsePublisher and records the wall-clock
 // time at which PublishMetadata is called. This lets ordering tests assert
@@ -43,14 +50,16 @@ func (r *recordingPublisher) PublishMetadata(_ context.Context, _, _ uint64, _ s
 	r.metadataAt = time.Now()
 }
 
-func (r *recordingPublisher) PublishResponse(_ context.Context, _, _ uint64, _, _ string, _ []byte) {
+func (r *recordingPublisher) PublishResponse(_ context.Context, _, _ uint64, _, _ string, _ []byte, _ uint32) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.responseCalled = true
 	r.responseAt = time.Now()
 }
 
-func (r *recordingPublisher) PublishChunk(_ context.Context, _, _ uint64, _ string, seq uint32, _ []byte) {
+func (r *recordingPublisher) SupportsChunks() bool { return true }
+
+func (r *recordingPublisher) PublishChunk(_ context.Context, _, _ uint64, _ string, seq uint32, _ pkgtypes.FrameKind, _ []byte) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.chunkSeqs = append(r.chunkSeqs, seq)
@@ -77,28 +86,6 @@ func (t *trackingOllama) Chat(ctx context.Context, model string, messages []olla
 	t.completedAt = time.Now()
 	t.mu.Unlock()
 	return resp, err
-}
-
-func (t *trackingOllama) GenerateStream(ctx context.Context, model, prompt string, onDelta func(string)) (string, error) {
-	resp, err := t.inner.GenerateStream(ctx, model, prompt, onDelta)
-	t.mu.Lock()
-	t.completedAt = time.Now()
-	t.mu.Unlock()
-	return resp, err
-}
-
-func (t *trackingOllama) ChatStream(ctx context.Context, model string, messages []ollama.ChatMessage, onDelta func(string)) (string, error) {
-	resp, err := t.inner.ChatStream(ctx, model, messages, onDelta)
-	t.mu.Lock()
-	t.completedAt = time.Now()
-	t.mu.Unlock()
-	return resp, err
-}
-
-// fakeSearcher satisfies search.Searcher and returns a fixed set of sources.
-type fakeSearcher struct {
-	sources []search.Source
-	err     error
 }
 
 func (f *fakeSearcher) Search(_ context.Context, _ string, _ int) ([]search.Source, error) {
@@ -202,13 +189,17 @@ func TestStage45_MetadataEmittedAfterInference(t *testing.T) {
 	blobData, err := pkgcrypto.Encrypt(sessionKey, searchaug.EncodePrompt("What is the capital of France?", true))
 	require.NoError(t, err)
 
-	_, err = handler.runInferencePipeline(
+	_, _, err = handler.runInferencePipeline(
 		context.Background(),
 		logger,
 		payload,
 		blobData,
 		"llama3-8b",
+		"",
 		metrics.DeliveryAsynq,
+		false,
+		nil,
+		time.Now(),
 	)
 	require.NoError(t, err)
 
@@ -249,13 +240,9 @@ func TestStage5_StreamsChunks(t *testing.T) {
 	sessionKey := testSessionKey(t)
 	ecdhKey := testECDHKey(t)
 
-	// deltas chosen so exactly two flushes happen:
-	//   delta 1: "Hello, streaming world!!" = 24 bytes → buffer reaches threshold (>=24) → mid-stream flush (seq=1)
-	//   delta 2: "Done" = 4 bytes → buffer = 4, below threshold, not flushed mid-stream
-	//   after loop: flushChunk() fires on the remaining 4-byte remainder → final flush (seq=2)
-	// This exercises both the threshold flush path AND the final-remainder flush path.
-	deltas := []string{"Hello, streaming world!!", "Done"}
-	gen := &fakeStreamInference{deltas: deltas}
+	// One frame per token: StreamChunkTokens=1 makes the coalescer flush on
+	// every delta, so two tokens must surface as two monotonic chunk seqs.
+	gen := &mockStreamingOllama{tokens: []string{"Hello, streaming world!!", "Done"}}
 	rec := &recordingPublisher{}
 
 	chain := &mockChainClient{
@@ -280,8 +267,10 @@ func TestStage5_StreamsChunks(t *testing.T) {
 		nil,
 		testSigningKey(t), ecdhKey, counter, logger,
 		HandlerConfig{
-			AckTxTimeout:  5 * time.Second,
-			BlobTxTimeout: 60 * time.Second,
+			AckTxTimeout:      5 * time.Second,
+			BlobTxTimeout:     60 * time.Second,
+			StreamEnabled:     true,
+			StreamChunkTokens: 1,
 		},
 		rec,
 		nil,
@@ -298,30 +287,34 @@ func TestStage5_StreamsChunks(t *testing.T) {
 	blobData, err := pkgcrypto.Encrypt(sessionKey, []byte("test prompt"))
 	require.NoError(t, err)
 
-	ciphertext, err := handler.runInferencePipeline(
+	ciphertext, _, err := handler.runInferencePipeline(
 		context.Background(),
 		logger,
 		payload,
 		blobData,
 		"llama3-8b",
+		"",
 		metrics.DeliveryAsynq,
+		true,
+		nil,
+		time.Now(),
 	)
 	require.NoError(t, err)
 
-	// Must produce exactly two chunk frames: seq=1 from the mid-stream threshold flush
-	// (buffer reached 24 bytes after delta 1) and seq=2 from the final-remainder flush
+	// Must produce exactly two chunk frames: one per token, because
+	// StreamChunkTokens=1 makes the coalescer flush on every delta.
 	// (the leftover 4 bytes of delta 2 flushed after GenerateStream returns).
 	rec.mu.Lock()
 	seqs := rec.chunkSeqs
 	rec.mu.Unlock()
-	assert.Equal(t, []uint32{1, 2}, seqs, "expected exactly two monotonic chunk seqs: threshold flush then final-remainder flush")
+	assert.Equal(t, []uint32{1, 2}, seqs, "one frame per token: two tokens must surface as two monotonic chunk seqs")
 
 	// Full response ciphertext must decrypt to the concatenated deltas.
 	// Note: non-search job → EncodeResponse returns raw answer bytes → ciphertext
 	// decrypts back to the plain text (legacy format unchanged).
 	plaintext, decErr := pkgcrypto.Decrypt(sessionKey, ciphertext)
 	require.NoError(t, decErr)
-	assert.Equal(t, strings.Join(deltas, ""), string(plaintext))
+	assert.Equal(t, strings.Join(gen.tokens, ""), string(plaintext))
 }
 
 // TestStage6_EmitsEnvelopeForSearchJob asserts that when web search returns
@@ -382,13 +375,17 @@ func TestStage6_EmitsEnvelopeForSearchJob(t *testing.T) {
 	blobData, err := pkgcrypto.Encrypt(sessionKey, searchaug.EncodePrompt("what year is it?", true))
 	require.NoError(t, err)
 
-	ct, err := handler.runInferencePipeline(
+	ct, _, err := handler.runInferencePipeline(
 		context.Background(),
 		logger,
 		payload,
 		blobData,
 		"llama3-8b",
+		"",
 		metrics.DeliveryAsynq,
+		false,
+		nil,
+		time.Now(),
 	)
 	require.NoError(t, err)
 
@@ -457,13 +454,17 @@ func TestStage6_RawAnswerForNonSearchJob(t *testing.T) {
 	blobData, err := pkgcrypto.Encrypt(sessionKey, []byte("hello"))
 	require.NoError(t, err)
 
-	ct, err := handler.runInferencePipeline(
+	ct, _, err := handler.runInferencePipeline(
 		context.Background(),
 		logger,
 		payload,
 		blobData,
 		"llama3-8b",
+		"",
 		metrics.DeliveryAsynq,
+		false,
+		nil,
+		time.Now(),
 	)
 	require.NoError(t, err)
 

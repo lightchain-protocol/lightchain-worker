@@ -225,13 +225,17 @@ func (c *Client) PollJob(ctx context.Context, timeout time.Duration) (*pipeline.
 	return &job, nil
 }
 
-// PublishResponse posts an encrypted response to the gateway for relay delivery.
+// PublishResponse posts an encrypted response to the gateway for relay
+// delivery. sequence and totalChunks populate the pub/sub envelope the
+// gateway builds; the gateway always types that frame as `complete`, so
+// this call is only ever used for the terminal frame.
 func (c *Client) PublishResponse(
 	ctx context.Context,
 	jobID, sessionID uint64,
 	correlationID string,
 	signature string,
 	payload []byte,
+	sequence, totalChunks uint32,
 ) error {
 	if err := c.ensureAuth(ctx); err != nil {
 		return fmt.Errorf("auth: %w", err)
@@ -239,8 +243,8 @@ func (c *Client) PublishResponse(
 
 	body, err := json.Marshal(map[string]interface{}{
 		"sessionId":     sessionID,
-		"seq":           0,
-		"totalChunks":   1,
+		"seq":           sequence,
+		"totalChunks":   totalChunks,
 		"payload":       payload,
 		"signature":     signature,
 		"correlationId": correlationID,

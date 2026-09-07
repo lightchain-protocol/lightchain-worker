@@ -14,14 +14,14 @@ import (
 // pattern as MockRegistrationClient / MockJobExecutionClient. The release
 // scheduler and reconciler use it for unit testing.
 type MockSettlementClient struct {
-	ReleaseJobFn          func(ctx context.Context, jobID uint64) error
-	ReleaseJobsFn         func(ctx context.Context, jobIDs []uint64) error
-	GetJobStateFn         func(ctx context.Context, jobID uint64) (JobStateInfo, error)
-	GetDisputeWindowFn    func(ctx context.Context) (time.Duration, error)
-	WorkerBalanceFn       func(ctx context.Context, worker common.Address) (*big.Int, error)
-	WithdrawFn            func(ctx context.Context) error
-	HeadFn                func(ctx context.Context) (HeadInfo, error)
-	FilterJobCompletedFn  func(ctx context.Context, worker common.Address, fromBlock, toBlock uint64) ([]JobCompletedEvent, error)
+	ReleaseJobFn         func(ctx context.Context, jobID uint64) error
+	ReleaseJobsFn        func(ctx context.Context, jobIDs []uint64) error
+	GetJobStateFn        func(ctx context.Context, jobID uint64) (JobStateInfo, error)
+	GetDisputeWindowFn   func(ctx context.Context) (time.Duration, error)
+	WorkerBalanceFn      func(ctx context.Context, worker common.Address) (*big.Int, error)
+	WithdrawFn           func(ctx context.Context) error
+	HeadFn               func(ctx context.Context) (HeadInfo, error)
+	FilterJobCompletedFn func(ctx context.Context, worker common.Address, fromBlock, toBlock uint64) ([]JobCompletedEvent, error)
 }
 
 func (m *MockSettlementClient) ReleaseJob(ctx context.Context, jobID uint64) error {

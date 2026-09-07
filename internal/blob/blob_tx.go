@@ -28,6 +28,7 @@ type BlobSubmitter = pkgblob.BlobSubmitter
 // reset if reservation fails before the tx is broadcast.
 type NonceManager interface {
 	NextNonce(ctx context.Context) (uint64, error)
+	ReleaseNonce(nonce uint64, consumed bool)
 	ResetNonce()
 }
 
@@ -289,16 +290,21 @@ func (s *BlobTxSubmitter) SubmitBlobTx(ctx context.Context, data []byte) ([][32]
 		return nil, fmt.Errorf("get nonce for blob tx: %w", err)
 	}
 
+	// Lease, as in chain.broadcastPreparedTx. Unused until the tx is about to
+	// go out; past that point treat it as spent, because handing back a nonce
+	// that did reach the pool is the more dangerous of the two mistakes.
+	nonceConsumed := false
+	defer func() { s.nonceMgr.ReleaseNonce(nonce, nonceConsumed) }()
+
 	signedTx, err := s.signBlobTx(payload, nonce, gasTipCap, s.maxGasPrice, big.NewInt(defaultBlobFeeCapWei), signTx)
 	if err != nil {
-		s.nonceMgr.ResetNonce()
 		return nil, fmt.Errorf("sign blob tx: %w", err)
 	}
 	if err := ctx.Err(); err != nil {
-		s.nonceMgr.ResetNonce()
 		return nil, fmt.Errorf("broadcast blob tx: %w", err)
 	}
 
+	nonceConsumed = true
 	if err := s.submitAndWait(ctx, txBackend, signTx, waitMined, signedTx, token, nonce, mutexWaitMs); err != nil {
 		return nil, err
 	}
