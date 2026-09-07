@@ -1,12 +1,13 @@
 package cli
 
 import (
+	"bytes"
 	"context"
-	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
-	"log/slog"
+	"io/fs"
 	"math/big"
 	"net/http"
 	"strings"
@@ -100,9 +101,8 @@ type PreflightHandler struct {
 	BeaconURL string       // "" = skip
 	HTTP      *http.Client // nil = 10 s default
 
-	Now    func() time.Time // nil = time.Now
-	Out    io.Writer
-	Logger *slog.Logger
+	Now func() time.Time // nil = time.Now
+	Out io.Writer
 }
 
 type report struct {
@@ -253,7 +253,7 @@ func (h *PreflightHandler) checkBalance(ctx context.Context, r *report, register
 		return
 	}
 	if minStake == nil {
-		r.pass("balance", "%s", lcai(bal))
+		r.skip("balance", "%s — cannot judge without the on-chain minimum", lcai(bal))
 		return
 	}
 	need := new(big.Int).Add(minStake, buffer)
@@ -273,12 +273,17 @@ func (h *PreflightHandler) checkECDH(ctx context.Context, r *report, registered 
 		return
 	}
 	key, err := h.LoadECDHKey(h.ECDHKeyPath, h.ECDHPass)
-	if err != nil {
-		if registered {
-			r.failf("ecdh", "local key unreadable (%v) — registered sessions cannot be decrypted", err)
-		} else {
-			r.warn("ecdh", "not generated yet (%v) — register creates it", err)
-		}
+	switch {
+	case err == nil:
+	case errors.Is(err, fs.ErrNotExist) && !registered:
+		r.warn("ecdh", "not generated yet at %s — register creates it", h.ECDHKeyPath)
+		return
+	case errors.Is(err, fs.ErrNotExist):
+		r.failf("ecdh", "local key missing at %s but a key is registered on-chain — restore it from backup", h.ECDHKeyPath)
+		return
+	default:
+		// Wrong WORKER_KEYSTORE_PASSWORD or a corrupt file: register would die on it too.
+		r.failf("ecdh", "local key unreadable: %v", err)
 		return
 	}
 	if !registered {
@@ -290,7 +295,7 @@ func (h *PreflightHandler) checkECDH(ctx context.Context, r *report, registered 
 		r.failf("ecdh", "read on-chain key: %v", err)
 		return
 	}
-	if hex.EncodeToString(onChain) != hex.EncodeToString(key.PublicKey().Bytes()) {
+	if !bytes.Equal(onChain, key.PublicKey().Bytes()) {
 		r.failf("ecdh", "on-chain key differs from local keystore %s — sessions encrypted to the on-chain key cannot be served", h.ECDHKeyPath)
 		return
 	}
@@ -300,6 +305,10 @@ func (h *PreflightHandler) checkECDH(ctx context.Context, r *report, registered 
 func (h *PreflightHandler) checkModels(ctx context.Context, r *report, registered bool) {
 	if len(h.ModelIDs) == 0 {
 		r.skip("model", "SUPPORTED_MODELS not set")
+		return
+	}
+	if len(h.ModelNames) != len(h.ModelIDs) {
+		r.failf("model", "internal: %d model ids but %d names from SUPPORTED_MODELS", len(h.ModelIDs), len(h.ModelNames))
 		return
 	}
 	for i, id := range h.ModelIDs {
@@ -362,6 +371,10 @@ func (h *PreflightHandler) checkOllama(ctx context.Context, r *report) {
 		return
 	}
 	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusOK {
+		r.failf("ollama", "%s/api/tags returned %d", h.OllamaURL, resp.StatusCode)
+		return
+	}
 	var tags struct {
 		Models []struct {
 			Name string `json:"name"`
@@ -403,8 +416,12 @@ func (h *PreflightHandler) checkBeacon(ctx context.Context, r *report) {
 			Version string `json:"version"`
 		} `json:"data"`
 	}
-	if resp.StatusCode != http.StatusOK || json.NewDecoder(resp.Body).Decode(&v) != nil {
+	if resp.StatusCode != http.StatusOK {
 		r.failf("beacon", "%s returned %d", h.BeaconURL, resp.StatusCode)
+		return
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&v); err != nil {
+		r.failf("beacon", "%s is not a beacon API (bad /eth/v1/node/version body: %v)", h.BeaconURL, err)
 		return
 	}
 	r.pass("beacon", "%s", v.Data.Version)

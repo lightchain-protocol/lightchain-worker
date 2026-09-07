@@ -38,7 +38,8 @@ type RegistrationConfig struct {
 	WorkerGatewayURL string
 
 	// OllamaURL and BeaconAPIURL are consulted only by the preflight
-	// subcommand; when empty the corresponding probe is skipped.
+	// subcommand. Defaults match the sidecar so preflight probes what the
+	// sidecar will actually dial; preflight --worker blanks them unless set.
 	OllamaURL    string
 	BeaconAPIURL string
 
@@ -79,8 +80,8 @@ func LoadRegistration() (*RegistrationConfig, error) {
 		RPCURL:                 envOrDefault("RPC_URL", "http://localhost:8545"),
 		RedisURL:               os.Getenv("REDIS_URL"),
 		WorkerGatewayURL:       os.Getenv("WORKER_GATEWAY_URL"),
-		OllamaURL:              os.Getenv("OLLAMA_URL"),
-		BeaconAPIURL:           os.Getenv("BEACON_API_URL"),
+		OllamaURL:              envOrDefault("OLLAMA_URL", "http://localhost:11434"),
+		BeaconAPIURL:           envOrDefault("BEACON_API_URL", "http://localhost:3500"),
 		LogLevel:               envOrDefault("LOG_LEVEL", "info"),
 		LogFormat:              envOrDefault("LOG_FORMAT", "json"),
 	}

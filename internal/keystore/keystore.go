@@ -37,7 +37,7 @@ func LoadOrGenerate(path, passphrase string) (*ecdh.PrivateKey, error) {
 		return generate(path, passphrase)
 	}
 
-	return load(path, passphrase)
+	return Load(path, passphrase)
 }
 
 // generate creates a new ECDH key pair, encrypts it, and writes it atomically to path.
@@ -79,8 +79,9 @@ func generate(path, passphrase string) (*ecdh.PrivateKey, error) {
 	return privKey, nil
 }
 
-// load reads and decrypts an existing keystore file.
-func load(path, passphrase string) (*ecdh.PrivateKey, error) {
+// Load reads and decrypts an existing keystore file. A missing file is
+// reported with an error wrapping fs.ErrNotExist; nothing is ever written.
+func Load(path, passphrase string) (*ecdh.PrivateKey, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return nil, fmt.Errorf("read keystore %s: %w", path, err)
@@ -136,7 +137,7 @@ func deriveKey(passphrase string, salt []byte) ([]byte, error) {
 // Using os.CreateTemp avoids race conditions when multiple callers write concurrently.
 func writeAtomic(path string, data []byte) error {
 	dir := filepath.Dir(path)
-	if err := os.MkdirAll(dir, 0700); err != nil {
+	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return fmt.Errorf("create keystore directory: %w", err)
 	}
 
@@ -151,7 +152,7 @@ func writeAtomic(path string, data []byte) error {
 		_ = os.Remove(tmpPath)
 		return fmt.Errorf("write temp keystore: %w", err)
 	}
-	if err := f.Chmod(0600); err != nil {
+	if err := f.Chmod(0o600); err != nil {
 		_ = f.Close()
 		_ = os.Remove(tmpPath)
 		return fmt.Errorf("chmod temp keystore: %w", err)
