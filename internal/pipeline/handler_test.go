@@ -142,20 +142,55 @@ func (m *mockOllama) Chat(ctx context.Context, model string, messages []ollama.C
 	return m.generateFn(ctx, model, messages[len(messages)-1].Content)
 }
 
-func (m *mockOllama) GenerateStream(ctx context.Context, model, prompt string, onDelta func(string)) (string, error) {
-	resp, err := m.Generate(ctx, model, prompt)
-	if err == nil && resp != "" {
-		onDelta(resp)
-	}
-	return resp, err
+// mockStreamingOllama additionally satisfies StreamingInferenceClient by
+// replaying a fixed token list through OnToken. It embeds mockOllama so the
+// batch methods stay available — a test can then assert that the handler
+// took the streaming path by leaving generateFn fatal.
+//
+// thinking, when set, is replayed through OnThinking before the answer, which
+// is the shape a reasoning model produces.
+type mockStreamingOllama struct {
+	mockOllama
+	tokens   []string
+	thinking []string
+	stats    ollama.StreamStats
+	// lastImages records what the handler passed down, so a vision test can
+	// assert the images survived the prompt envelope.
+	lastImages []string
 }
 
-func (m *mockOllama) ChatStream(ctx context.Context, model string, messages []ollama.ChatMessage, onDelta func(string)) (string, error) {
-	resp, err := m.Chat(ctx, model, messages)
-	if err == nil && resp != "" {
-		onDelta(resp)
+func (m *mockStreamingOllama) GenerateStream(_ context.Context, _, _ string, images []string, h ollama.StreamHandlers) (string, ollama.StreamStats, error) {
+	m.lastImages = images
+	return m.replay(h)
+}
+
+func (m *mockStreamingOllama) ChatStream(_ context.Context, _ string, msgs []ollama.ChatMessage, h ollama.StreamHandlers) (string, ollama.StreamStats, error) {
+	if len(msgs) > 0 {
+		m.lastImages = msgs[len(msgs)-1].Images
 	}
-	return resp, err
+	return m.replay(h)
+}
+
+func (m *mockStreamingOllama) replay(h ollama.StreamHandlers) (string, ollama.StreamStats, error) {
+	for _, tok := range m.thinking {
+		if h.OnThinking == nil {
+			continue
+		}
+		if err := h.OnThinking(tok); err != nil {
+			return "", ollama.StreamStats{}, err
+		}
+	}
+	var full strings.Builder
+	for _, tok := range m.tokens {
+		full.WriteString(tok)
+		if h.OnToken == nil {
+			continue
+		}
+		if err := h.OnToken(tok); err != nil {
+			return "", ollama.StreamStats{}, err
+		}
+	}
+	return full.String(), m.stats, nil
 }
 
 // --- Helpers ---
@@ -806,7 +841,9 @@ func TestPublishToRedis_SignsContractCompatibleDigest(t *testing.T) {
 	require.NoError(t, err)
 
 	ciphertext := []byte("ciphertext-for-redis")
-	handler.publishToRedis(ctx, handler.logger, 42, 9, "corr-42", ciphertext)
+	// totalFrames=1: nothing was streamed, so the terminal frame is the
+	// only frame. Sequence and TotalChunks both carry that count.
+	handler.publishToRedis(ctx, handler.logger, 42, 9, "corr-42", ciphertext, 1)
 
 	msg, err := sub.ReceiveMessage(ctx)
 	require.NoError(t, err)
@@ -816,7 +853,7 @@ func TestPublishToRedis_SignsContractCompatibleDigest(t *testing.T) {
 	assert.Equal(t, pkgtypes.MessageTypeComplete, payload.Type)
 	assert.Equal(t, uint64(42), uint64(payload.JobID))
 	assert.Equal(t, uint64(9), uint64(payload.SessionID))
-	assert.Equal(t, uint32(0), payload.Sequence)
+	assert.Equal(t, uint32(1), payload.Sequence)
 	assert.Equal(t, uint32(1), payload.TotalChunks)
 	assert.Equal(t, "corr-42", payload.CorrelationID)
 	assert.Equal(t, ciphertext, payload.Payload)
@@ -861,7 +898,7 @@ func TestPublishToRedis_RespectsRedisPublishTimeout(t *testing.T) {
 	}
 
 	start := time.Now()
-	handler.publishToRedis(context.Background(), handler.logger, 1, 1, "corr", []byte("ct"))
+	handler.publishToRedis(context.Background(), handler.logger, 1, 1, "corr", []byte("ct"), 1)
 	elapsed := time.Since(start)
 
 	// 50ms timeout + scheduling jitter; 1s is generous but well below
@@ -958,6 +995,315 @@ func TestHandleTask_CompleteAlreadyMined_TreatsRetryAsSuccess(t *testing.T) {
 
 	err = handler.HandleTask(context.Background(), asynq.NewTask(TaskTypeJobInference, data))
 	require.NoError(t, err)
+}
+
+// -----------------------------------------------------------------------
+// Token streaming
+// -----------------------------------------------------------------------
+
+// readFrames drains exactly n pub/sub messages off sub and unmarshals them.
+func readFrames(t *testing.T, ctx context.Context, sub *redis.PubSub, n int) []pkgtypes.PubSubMessage {
+	t.Helper()
+	frames := make([]pkgtypes.PubSubMessage, 0, n)
+	for i := 0; i < n; i++ {
+		msg, err := sub.ReceiveMessage(ctx)
+		require.NoError(t, err, "receiving frame %d", i)
+		var frame pkgtypes.PubSubMessage
+		require.NoError(t, json.Unmarshal([]byte(msg.Payload), &frame), "frame %d", i)
+		frames = append(frames, frame)
+	}
+	return frames
+}
+
+// TestHandleTask_Streaming_ChunksThenSingleComplete is the core streaming
+// contract: the consumer sees N `chunk` frames with Sequence 1..N followed
+// by exactly one `complete` frame, and concatenating the decrypted chunk
+// plaintexts reproduces the decrypted full response byte for byte.
+//
+// It also pins the settlement invariants that must survive streaming: the
+// blob submitted in stage 8a is the full-response ciphertext, the terminal
+// frame carries those same bytes, and the terminal signature recovers to
+// the worker's address over the full-ciphertext digest.
+func TestHandleTask_Streaming_ChunksThenSingleComplete(t *testing.T) {
+	t.Parallel()
+	mr := miniredis.RunT(t)
+	rc := redis.NewClient(&redis.Options{Addr: mr.Addr()})
+	t.Cleanup(func() { rc.Close() })
+
+	sessionKey := testSessionKey(t)
+	ecdhKey := testECDHKey(t)
+	signingKey := testSigningKey(t)
+	encSessionKey := encryptSessionKeyForWorker(t, sessionKey, ecdhKey)
+	promptCiphertext := encryptBlob(t, sessionKey, "stream me")
+
+	chainID := big.NewInt(31337)
+	jobRegistryAddr := common.HexToAddress("0x0000000000000000000000000000000000001337")
+
+	// 10 tokens with a 4-token window and an effectively infinite interval
+	// gives a deterministic 4 + 4 + 2 split → 3 chunk frames.
+	tokens := []string{"Str", "eam", "ing ", "is ", "the ", "whole ", "point", " of ", "this", " PR."}
+	var fullResponse string
+	for _, tok := range tokens {
+		fullResponse += tok
+	}
+
+	var submitted []byte
+	chain := &mockChainClient{
+		ackJobFn:          func(_ context.Context, _ uint64) error { return nil },
+		completeJobFn:     func(_ context.Context, _ uint64, _ [32]byte, _ [32]byte) error { return nil },
+		getEncWorkerKeyFn: func(_ context.Context, _ uint64) ([]byte, error) { return encSessionKey, nil },
+	}
+	fetcher := &mockBlobFetcher{fetchFn: func(_ context.Context, _ common.Hash, _ uint64) ([]byte, error) {
+		return promptCiphertext, nil
+	}}
+	submitter := &mockBlobSubmitter{submitFn: func(_ context.Context, data []byte) ([][32]byte, error) {
+		submitted = append([]byte(nil), data...)
+		return [][32]byte{{0x11}}, nil
+	}}
+	inference := &mockStreamingOllama{
+		mockOllama: mockOllama{generateFn: func(_ context.Context, _, _ string) (string, error) {
+			return "", fmt.Errorf("batch Generate must not be called when streaming is enabled")
+		}},
+		tokens: tokens,
+	}
+
+	counter := &atomic.Int32{}
+	logger := slog.New(slog.NewTextHandler(io.Discard, &slog.HandlerOptions{Level: slog.LevelError}))
+	handler := NewJobHandler(
+		chain, fetcher, submitter, newMockKeyStore(), inference,
+		rc, signingKey, ecdhKey, counter, logger,
+		HandlerConfig{
+			AckTxTimeout:        5 * time.Second,
+			BlobTxTimeout:       60 * time.Second,
+			RedisPublishTimeout: 5 * time.Second,
+			ChainID:             chainID,
+			JobRegistryAddr:     jobRegistryAddr,
+			StreamEnabled:       true,
+			StreamChunkTokens:   4,
+			StreamChunkInterval: time.Hour,
+		},
+		nil, // publisher — fallback wires RedisResponsePublisher
+		nil, // checkpoints
+		testMetrics(t),
+		metrics.DeliveryAsynq,
+nil,
+	)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	payload := testPayload(t)
+	sub := rc.Subscribe(ctx, fmt.Sprintf("session:%d:responses", payload.SessionID))
+	t.Cleanup(func() { _ = sub.Close() })
+	_, err := sub.Receive(ctx)
+	require.NoError(t, err)
+
+	data, err := json.Marshal(payload)
+	require.NoError(t, err)
+	require.NoError(t, handler.HandleTask(ctx, asynq.NewTask(TaskTypeJobInference, data)))
+
+	frames := readFrames(t, ctx, sub, 4)
+
+	// Frames 1..N are in-flight chunks: incrementing Sequence from 1,
+	// TotalChunks 0 (unknown mid-generation), and no signature.
+	var reassembled string
+	for i, frame := range frames[:3] {
+		assert.Equal(t, pkgtypes.MessageTypeChunk, frame.Type, "frame %d type", i)
+		assert.Equal(t, uint32(i+1), frame.Sequence, "frame %d sequence", i)
+		assert.Equal(t, uint32(0), frame.TotalChunks,
+			"in-flight chunks must leave TotalChunks unknown")
+		assert.Empty(t, frame.Signature,
+			"chunk frames must be unsigned — there is no on-chain commitment to a delta")
+		assert.Equal(t, payload.CorrelationID, frame.CorrelationID, "frame %d correlationID", i)
+
+		plaintext, decErr := pkgcrypto.Decrypt(sessionKey, frame.Payload)
+		require.NoError(t, decErr, "chunk %d must decrypt standalone under the session key", i)
+		reassembled += string(plaintext)
+	}
+
+	// The terminal frame closes the message: Sequence == TotalChunks ==
+	// total frames published, including itself.
+	final := frames[3]
+	assert.Equal(t, pkgtypes.MessageTypeComplete, final.Type)
+	assert.Equal(t, uint32(4), final.Sequence)
+	assert.Equal(t, uint32(4), final.TotalChunks)
+
+	completePlaintext, err := pkgcrypto.Decrypt(sessionKey, final.Payload)
+	require.NoError(t, err)
+	assert.Equal(t, fullResponse, string(completePlaintext))
+	assert.Equal(t, string(completePlaintext), reassembled,
+		"concatenated chunk plaintexts must equal the full response plaintext")
+
+	// Settlement path: the terminal frame carries the exact bytes anchored
+	// in the blob, and its signature is the contract-compatible EIP-191
+	// evidence over that full ciphertext.
+	assert.Equal(t, submitted, final.Payload,
+		"terminal frame must carry the same ciphertext stage 8a anchored")
+	assert.NotEqual(t, frames[0].Payload, final.Payload)
+
+	expectedDigest, err := responseMismatchDigest(
+		chainID, jobRegistryAddr, payload.JobID, payload.SessionID, final.Payload)
+	require.NoError(t, err)
+	sig, err := hex.DecodeString(strings.TrimPrefix(final.Signature, "0x"))
+	require.NoError(t, err)
+	pubKey, err := crypto.SigToPub(accounts.TextHash(expectedDigest), sig)
+	require.NoError(t, err)
+	assert.Equal(t, crypto.PubkeyToAddress(signingKey.PublicKey), crypto.PubkeyToAddress(*pubKey),
+		"terminal signature must still recover to the worker address")
+}
+
+// TestHandleTask_StreamingDisabled_PublishesSingleCompleteFrame pins the
+// fallback: with StreamEnabled off the pipeline emits exactly one frame,
+// numbered as it was before streaming existed.
+func TestHandleTask_StreamingDisabled_PublishesSingleCompleteFrame(t *testing.T) {
+	t.Parallel()
+	mr := miniredis.RunT(t)
+	rc := redis.NewClient(&redis.Options{Addr: mr.Addr()})
+	t.Cleanup(func() { rc.Close() })
+
+	sessionKey := testSessionKey(t)
+	ecdhKey := testECDHKey(t)
+	encSessionKey := encryptSessionKeyForWorker(t, sessionKey, ecdhKey)
+	promptCiphertext := encryptBlob(t, sessionKey, "no streaming")
+
+	chain := &mockChainClient{
+		ackJobFn:          func(_ context.Context, _ uint64) error { return nil },
+		completeJobFn:     func(_ context.Context, _ uint64, _ [32]byte, _ [32]byte) error { return nil },
+		getEncWorkerKeyFn: func(_ context.Context, _ uint64) ([]byte, error) { return encSessionKey, nil },
+	}
+	fetcher := &mockBlobFetcher{fetchFn: func(_ context.Context, _ common.Hash, _ uint64) ([]byte, error) {
+		return promptCiphertext, nil
+	}}
+	submitter := &mockBlobSubmitter{submitFn: func(_ context.Context, _ []byte) ([][32]byte, error) {
+		return [][32]byte{{0x22}}, nil
+	}}
+	// A streaming-capable client that must never have its stream methods
+	// reached, because config has streaming off.
+	inference := &mockStreamingOllama{
+		mockOllama: mockOllama{generateFn: func(_ context.Context, _, _ string) (string, error) {
+			return "batch answer", nil
+		}},
+		tokens: []string{"should", " not", " stream"},
+	}
+
+	counter := &atomic.Int32{}
+	logger := slog.New(slog.NewTextHandler(io.Discard, &slog.HandlerOptions{Level: slog.LevelError}))
+	handler := NewJobHandler(
+		chain, fetcher, submitter, newMockKeyStore(), inference,
+		rc, testSigningKey(t), ecdhKey, counter, logger,
+		HandlerConfig{
+			AckTxTimeout:        5 * time.Second,
+			BlobTxTimeout:       60 * time.Second,
+			RedisPublishTimeout: 5 * time.Second,
+			ChainID:             big.NewInt(31337),
+			JobRegistryAddr:     common.HexToAddress("0x0000000000000000000000000000000000001337"),
+			StreamEnabled:       false,
+		},
+		nil, nil, testMetrics(t), metrics.DeliveryAsynq,
+nil,
+	)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	payload := testPayload(t)
+	sub := rc.Subscribe(ctx, fmt.Sprintf("session:%d:responses", payload.SessionID))
+	t.Cleanup(func() { _ = sub.Close() })
+	_, err := sub.Receive(ctx)
+	require.NoError(t, err)
+
+	data, err := json.Marshal(payload)
+	require.NoError(t, err)
+	require.NoError(t, handler.HandleTask(ctx, asynq.NewTask(TaskTypeJobInference, data)))
+
+	frames := readFrames(t, ctx, sub, 1)
+	assert.Equal(t, pkgtypes.MessageTypeComplete, frames[0].Type)
+	assert.Equal(t, uint32(1), frames[0].Sequence)
+	assert.Equal(t, uint32(1), frames[0].TotalChunks)
+
+	plaintext, err := pkgcrypto.Decrypt(sessionKey, frames[0].Payload)
+	require.NoError(t, err)
+	assert.Equal(t, "batch answer", string(plaintext))
+}
+
+// TestHandleTask_Streaming_SkippedWhenCheckpointAlreadyDelivered guards the
+// retry path: once a terminal frame has been delivered, a re-run must not
+// replay deltas on top of the answer the user already has.
+func TestHandleTask_Streaming_SkippedWhenCheckpointAlreadyDelivered(t *testing.T) {
+	t.Parallel()
+	mr := miniredis.RunT(t)
+	rc := redis.NewClient(&redis.Options{Addr: mr.Addr()})
+	t.Cleanup(func() { rc.Close() })
+
+	sessionKey := testSessionKey(t)
+	ecdhKey := testECDHKey(t)
+	encSessionKey := encryptSessionKeyForWorker(t, sessionKey, ecdhKey)
+	promptCiphertext := encryptBlob(t, sessionKey, "already delivered")
+
+	// A checkpoint marked delivered but WITHOUT a cached ciphertext is the
+	// only shape that re-runs inference after a delivery. It happens when
+	// the stage-6 ciphertext write failed (oversized or Redis hiccup) while
+	// MarkDelivered succeeded.
+	store := NewCheckpointStore(rc, 2*time.Hour, 10*time.Minute, 256*1024)
+	require.NoError(t, store.MarkDelivered(context.Background(), 42))
+
+	chain := &mockChainClient{
+		ackJobFn:          func(_ context.Context, _ uint64) error { return nil },
+		completeJobFn:     func(_ context.Context, _ uint64, _ [32]byte, _ [32]byte) error { return nil },
+		getEncWorkerKeyFn: func(_ context.Context, _ uint64) ([]byte, error) { return encSessionKey, nil },
+	}
+	fetcher := &mockBlobFetcher{fetchFn: func(_ context.Context, _ common.Hash, _ uint64) ([]byte, error) {
+		return promptCiphertext, nil
+	}}
+	submitter := &mockBlobSubmitter{submitFn: func(_ context.Context, _ []byte) ([][32]byte, error) {
+		return [][32]byte{{0x33}}, nil
+	}}
+	inference := &mockStreamingOllama{
+		mockOllama: mockOllama{generateFn: func(_ context.Context, _, _ string) (string, error) {
+			return "resumed answer", nil
+		}},
+		tokens: []string{"a", "b", "c", "d", "e", "f", "g", "h"},
+	}
+
+	counter := &atomic.Int32{}
+	logger := slog.New(slog.NewTextHandler(io.Discard, &slog.HandlerOptions{Level: slog.LevelError}))
+	handler := NewJobHandler(
+		chain, fetcher, submitter, newMockKeyStore(), inference,
+		rc, testSigningKey(t), ecdhKey, counter, logger,
+		HandlerConfig{
+			AckTxTimeout:        5 * time.Second,
+			BlobTxTimeout:       60 * time.Second,
+			RedisPublishTimeout: 5 * time.Second,
+			ChainID:             big.NewInt(31337),
+			JobRegistryAddr:     common.HexToAddress("0x0000000000000000000000000000000000001337"),
+			StreamEnabled:       true,
+			StreamChunkTokens:   2,
+			StreamChunkInterval: time.Hour,
+		},
+		nil, store, testMetrics(t), metrics.DeliveryAsynq,
+nil,
+	)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	payload := testPayload(t)
+	sub := rc.Subscribe(ctx, fmt.Sprintf("session:%d:responses", payload.SessionID))
+	t.Cleanup(func() { _ = sub.Close() })
+	_, err := sub.Receive(ctx)
+	require.NoError(t, err)
+
+	data, err := json.Marshal(payload)
+	require.NoError(t, err)
+	require.NoError(t, handler.HandleTask(ctx, asynq.NewTask(TaskTypeJobInference, data)))
+
+	// Nothing at all should have been published: chunks are suppressed by
+	// the delivered flag and stage 7 is skipped by the same flag.
+	select {
+	case msg := <-sub.Channel():
+		t.Fatalf("no frame expected after a delivered checkpoint, got %q", msg.Payload)
+	case <-time.After(200 * time.Millisecond):
+	}
 }
 
 // -----------------------------------------------------------------------

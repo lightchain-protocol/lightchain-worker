@@ -26,9 +26,14 @@ func TestNew_RegistersExpectedMetrics(t *testing.T) {
 
 	// Touch every label set so the time series materializes — Prometheus
 	// only exposes a series after the first observation/inc.
-	m.StageDuration.WithLabelValues(StageInference, "llama3.2:3b", CacheMiss, DeliveryAsynq, OutcomeOK).Observe(0.5)
+	m.StageDuration.WithLabelValues(StageInference, "llama3.2:3b", TierStandard, CacheMiss, DeliveryAsynq, OutcomeOK).Observe(0.5)
 	m.JobTotalDuration.WithLabelValues(CacheMiss, DeliveryAsynq, OutcomeOK).Observe(2.0)
-	m.JobsTotal.WithLabelValues(OutcomeOK, "", "llama3.2:3b", DeliveryAsynq).Inc()
+	m.JobTTFT.WithLabelValues(TierMax, "llama3.2:3b", WarmTrue, DeliveryAsynq).Observe(0.8)
+	m.JobTokensPerSecond.WithLabelValues(TierStandard, "llama3.2:3b").Observe(42.5)
+	m.JobOutputTokens.WithLabelValues(TierStandard, "llama3.2:3b").Observe(512)
+	m.JobQueueWait.WithLabelValues(TierStandard, "llama3.2:3b").Observe(1.2)
+	m.JobDeadlineHeadroom.WithLabelValues(TierStandard, "llama3.2:3b").Observe(45)
+	m.JobsTotal.WithLabelValues(OutcomeOK, "", "llama3.2:3b", TierStandard, DeliveryAsynq).Inc()
 	m.CheckpointEvents.WithLabelValues(CheckpointEventMiss).Inc()
 	m.SessionKeyEvents.WithLabelValues(SessionKeyPathCacheHit).Inc()
 	m.RedisPublishFailures.Inc()
@@ -40,6 +45,11 @@ func TestNew_RegistersExpectedMetrics(t *testing.T) {
 	want := []string{
 		"worker_pipeline_stage_duration_seconds",
 		"worker_job_total_duration_seconds",
+		"worker_job_ttft_seconds",
+		"worker_job_tokens_per_second",
+		"worker_job_output_tokens",
+		"worker_job_queue_wait_seconds",
+		"worker_job_deadline_headroom_seconds",
 		"worker_jobs_total",
 		"worker_checkpoint_events_total",
 		"worker_session_key_events_total",
@@ -93,11 +103,50 @@ func TestStartStage_RecordsObservationAndReturnsElapsed(t *testing.T) {
 	if labels["stage"] != StageDecrypt {
 		t.Errorf("stage label = %q, want %q", labels["stage"], StageDecrypt)
 	}
+	if labels["tier"] != TierStandard {
+		t.Errorf("tier label = %q, want %q", labels["tier"], TierStandard)
+	}
 	if labels["outcome"] != OutcomeOK {
 		t.Errorf("outcome label = %q, want %q", labels["outcome"], OutcomeOK)
 	}
 	if labels["cache"] != CacheMiss {
 		t.Errorf("cache label = %q, want %q", labels["cache"], CacheMiss)
+	}
+}
+
+func TestStartStage_DerivesTierFromModelName(t *testing.T) {
+	m := New(testModels)
+
+	m.StartStage(StageInference, "agentworld-35b-max", DeliveryAsynq).End(OutcomeOK, CacheMiss)
+
+	mf := findMetricFamily(t, m.Registry, "worker_pipeline_stage_duration_seconds")
+	labels := firstSeriesLabels(mf)
+	if labels["tier"] != TierMax {
+		t.Errorf("tier label = %q, want %q", labels["tier"], TierMax)
+	}
+}
+
+func TestTierForModel_SuffixRule(t *testing.T) {
+	cases := []struct {
+		in, wantTier, wantBase string
+	}{
+		{"agentworld-35b-max", TierMax, "agentworld-35b"},
+		{"gpt-oss-20b-max", TierMax, "gpt-oss-20b"},
+		{"AgentWorld-35B-MAX", TierMax, "agentworld-35b"}, // case-insensitive
+		{"  gpt-oss-20b-max  ", TierMax, "gpt-oss-20b"},   // whitespace trimmed
+		{"agentworld-35b", TierStandard, "agentworld-35b"},
+		{"llama3.2:3b", TierStandard, "llama3.2:3b"},
+		{"maximus", TierStandard, "maximus"}, // infix, not suffix
+		{"-max", TierMax, ""},                // degenerate but deterministic
+		{ModelUnknown, TierStandard, ModelUnknown},
+		{"", TierStandard, ""},
+	}
+	for _, tc := range cases {
+		tier, base := TierForModel(tc.in)
+		if tier != tc.wantTier || base != tc.wantBase {
+			t.Errorf("TierForModel(%q) = (%q, %q), want (%q, %q)",
+				tc.in, tier, base, tc.wantTier, tc.wantBase)
+		}
 	}
 }
 

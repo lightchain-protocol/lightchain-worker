@@ -477,8 +477,8 @@ func TestScheduler_NextAllowedAttemptGatesTimeTrigger(t *testing.T) {
 
 	chainNow := int64(1_000_000)
 	require.NoError(t, store.AddEligible(ctx, 7, chainNow-2*86400))
-	require.NoError(t, store.SetLastReleaseTs(ctx, chainNow-9*3600))     // far past, time-trigger overdue
-	require.NoError(t, store.SetNextAllowedAttempt(ctx, chainNow+300))   // gate active
+	require.NoError(t, store.SetLastReleaseTs(ctx, chainNow-9*3600))   // far past, time-trigger overdue
+	require.NoError(t, store.SetNextAllowedAttempt(ctx, chainNow+300)) // gate active
 
 	stub := &schedStub{
 		headFn: func() (chain.HeadInfo, error) {

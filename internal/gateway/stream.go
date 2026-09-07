@@ -145,10 +145,12 @@ func (p *StreamPublisher) PublishChunk(
 	jobID, sessionID uint64,
 	correlationID string,
 	sequence uint32,
+	kind pkgtypes.FrameKind,
 	payload []byte,
 ) {
 	ok := p.enqueue(&pkgtypes.PubSubMessage{
 		Type:          pkgtypes.MessageTypeChunk,
+		Kind:          kind.Normalize(),
 		JobID:         pkgtypes.JobID(jobID),
 		SessionID:     pkgtypes.SessionID(sessionID),
 		Sequence:      sequence,
@@ -192,13 +194,18 @@ func (p *StreamPublisher) PublishResponse(
 	correlationID string,
 	signature string,
 	ciphertext []byte,
+	totalFrames uint32,
 ) {
+	if totalFrames == 0 {
+		totalFrames = 1
+	}
 	if p.connected.Load() {
 		ok := p.enqueue(&pkgtypes.PubSubMessage{
 			Type:          pkgtypes.MessageTypeComplete,
+			Sequence:      totalFrames,
+			TotalChunks:   totalFrames,
 			JobID:         pkgtypes.JobID(jobID),
 			SessionID:     pkgtypes.SessionID(sessionID),
-			TotalChunks:   1,
 			Payload:       ciphertext,
 			Signature:     signature,
 			CorrelationID: correlationID,
@@ -208,7 +215,11 @@ func (p *StreamPublisher) PublishResponse(
 			return
 		}
 	}
-	if err := p.client.PublishResponse(ctx, jobID, sessionID, correlationID, signature, ciphertext); err != nil {
+	if err := p.client.PublishResponse(ctx, jobID, sessionID, correlationID, signature, ciphertext, totalFrames, totalFrames); err != nil {
 		p.logger.Warn("gateway response fallback failed (non-fatal)", "jobID", jobID, "error", err)
 	}
 }
+
+// SupportsChunks reports true: the websocket path delivers chunk frames to
+// the consumer, so the handler should do per-chunk encryption for it.
+func (p *StreamPublisher) SupportsChunks() bool { return true }

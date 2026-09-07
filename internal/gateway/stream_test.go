@@ -97,7 +97,7 @@ func TestStreamPublisherSendsChunkOverWS(t *testing.T) {
 		}
 	}
 
-	pub.PublishChunk(ctx, 9, 42, "corr-1", 3, []byte("delta"))
+	pub.PublishChunk(ctx, 9, 42, "corr-1", 3, pkgtypes.FrameKindText, []byte("delta"))
 
 	select {
 	case got := <-fake.frames:
@@ -120,7 +120,7 @@ func TestStreamPublisherCompleteFallsBackToHTTP(t *testing.T) {
 	defer cancel()
 	go pub.Run(ctx)
 
-	pub.PublishResponse(ctx, 9, 42, "corr-1", "0xsig", []byte("ciphertext"))
+	pub.PublishResponse(ctx, 9, 42, "corr-1", "0xsig", []byte("ciphertext"), 1)
 
 	select {
 	case got := <-fake.bulk:

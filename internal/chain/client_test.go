@@ -172,7 +172,11 @@ func TestSubmitPreparedJobTx_ResetNonceOnBuildFailure(t *testing.T) {
 	})
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "AcknowledgeJob transaction")
-	assert.False(t, client.nonceMgr.initialized, "pre-send failure must reset the nonce manager")
+	// A build failure never reaches the network, so the nonce is handed back
+	// and the sequence stays contiguous. This used to force a full re-seed,
+	// which was unsafe while sibling jobs held their own nonces.
+	assert.True(t, client.nonceMgr.initialized, "build failure should not re-seed from chain")
+	assert.Equal(t, uint64(5), client.nonceMgr.pendingNonce, "unused nonce must be returned")
 	assert.Equal(t, 0, client.jobTxBackend.(*mockJobTxBackend).sendCalls)
 }
 
