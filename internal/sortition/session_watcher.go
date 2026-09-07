@@ -14,6 +14,10 @@ import (
 
 const cursorSessionRequested = "session_requested"
 
+// reseedMaxAttempts bounds how many passes retry a failing look-back before the
+// watcher gives it up (a pruned-history RPC would otherwise fail it forever).
+const reseedMaxAttempts = 10
+
 // ClaimClient is the narrow chain interface the SessionWatcher needs.
 // Head returns chain.HeadInfo (not a bare uint64) so the watcher can use
 // head.Number with the same confirmations-guard pattern as the release Reconciler.
@@ -46,8 +50,9 @@ type SessionWatcherOpts struct {
 	// re-scans for SessionRequested events. The pending set lives only in memory,
 	// so without this a restart forgets every request discovered before the
 	// cursor — including ones still waiting out the sortition threshold. Size it
-	// to the longest a request can stay Open (consumer-api default expiry is
-	// 1 h). Zero disables the look-back.
+	// to how long requests stay Open: the consumer-api's default expiry is 1 h,
+	// but callers may request longer, so raise it where they do. Zero disables
+	// the look-back.
 	LookbackBlocks uint64
 }
 
@@ -70,9 +75,10 @@ type SessionWatcher struct {
 	log      *slog.Logger
 	ownCaps  *big.Int
 	lookback uint64
-	// seeded is set once the first pass has re-scanned LookbackBlocks behind the
-	// persisted cursor (see RunOnce, phase 0).
-	seeded bool
+	// seeded is set once the look-back behind the persisted cursor has run, or
+	// has been given up after reseedMaxAttempts failures (see RunOnce, phase 0).
+	seeded      bool
+	reseedTries int
 	// pending maps reqID → its required-capability mask, fetched lazily on first
 	// evaluation (nil = not yet fetched). The mask is immutable per request, so a
 	// successful fetch is cached for every later pass.
@@ -168,12 +174,19 @@ func (w *SessionWatcher) RunOnce(ctx context.Context) error {
 		return err
 	}
 
-	// Phase 0: Reseed — once per process, look behind the cursor.
+	// Phase 0: Reseed — once per process, look behind the cursor. A failure
+	// must not wedge the pass: discovery and evaluation go on as before the
+	// look-back existed, and the look-back is retried on later passes up to
+	// reseedMaxAttempts (the window drifts forward with the cursor meanwhile).
 	if !w.seeded {
 		if err := w.reseed(ctx, cursor); err != nil {
-			return err // seeded stays false: retried next pass
+			w.reseedTries++
+			w.seeded = w.reseedTries >= reseedMaxAttempts
+			w.log.Warn("look-back behind the cursor failed; pass continues without it",
+				"attempt", w.reseedTries, "maxAttempts", reseedMaxAttempts, "givingUp", w.seeded, "error", err)
+		} else {
+			w.seeded = true
 		}
-		w.seeded = true
 	}
 
 	// Phase 1: Discovery — scan new blocks, populate pending.

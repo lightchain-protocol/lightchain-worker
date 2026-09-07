@@ -173,8 +173,9 @@ type Config struct {
 	// SortitionSessionLookbackBlocks is how far behind its persisted cursor the
 	// SessionWatcher re-scans on its first pass after a start, so requests it had
 	// discovered but not yet been eligible for are not forgotten by a restart.
-	// Cover the longest a request stays Open (consumer-api default expiry 1 h:
-	// 1800 blocks at 2 s slots, 600 at 6 s). Defaults to 2000; 0 disables.
+	// Cover how long requests stay Open: the consumer-api default expiry is 1 h
+	// (1800 blocks at 2 s slots, 600 at 6 s); raise it where callers open
+	// requests with longer expiries. Defaults to 2000; 0 disables.
 	SortitionSessionLookbackBlocks uint64
 	// SortitionSessionRetryLimit bounds how many passes the JobWatcher retries
 	// a job whose session is not Active before giving up and skipping it, so
