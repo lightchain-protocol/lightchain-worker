@@ -17,8 +17,8 @@ import (
 	"github.com/stretchr/testify/require"
 
 	pkgcrypto "github.com/lightchain/pkg/crypto"
-	pkgtypes "github.com/lightchain/pkg/types"
 	"github.com/lightchain/pkg/searchaug"
+	pkgtypes "github.com/lightchain/pkg/types"
 	"github.com/lightchain/worker/internal/metrics"
 	"github.com/lightchain/worker/internal/ollama"
 	"github.com/lightchain/worker/internal/search"
@@ -636,4 +636,142 @@ func TestRelayCompleteCiphertext(t *testing.T) {
 		assert.Equal(t, "plain answer", string(plain),
 			"relay complete frame for non-search job must decrypt to the plain answer")
 	})
+}
+
+// TestStage5_ModelReceivesSearchAugmentedPrompt pins the hand-off between
+// stage 4.5 and stage 5: the text the model is asked is the augmented prompt
+// built from the search sources, and a search envelope with search off still
+// unwraps to the bare question. Stage 5 used to decode the raw blob bytes a
+// second time, so the model saw the NUL-prefixed JSON envelope verbatim and
+// the sources never reached it.
+func TestStage5_ModelReceivesSearchAugmentedPrompt(t *testing.T) {
+	t.Parallel()
+
+	const question = "What is the capital of France?"
+	cases := []struct {
+		name   string
+		search bool
+		want   string
+	}{
+		{"search on: augmented prompt", true, searchaug.BuildAugmentedPrompt(searchaug.CurrentTemplateVersion, question, toSearchaugSources(twoSources()))},
+		{"search off: bare question", false, question},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			sessionKey := testSessionKey(t)
+			ecdhKey := testECDHKey(t)
+			encSessionKey := encryptSessionKeyForWorker(t, sessionKey, ecdhKey)
+			blobData, err := pkgcrypto.Encrypt(sessionKey, searchaug.EncodePrompt(question, tc.search))
+			require.NoError(t, err)
+
+			chain := &mockChainClient{
+				ackJobFn:          func(_ context.Context, _ uint64) error { return nil },
+				completeJobFn:     func(_ context.Context, _ uint64, _, _ [32]byte) error { return nil },
+				getEncWorkerKeyFn: func(_ context.Context, _ uint64) ([]byte, error) { return encSessionKey, nil },
+			}
+			fetcher := &mockBlobFetcher{fetchFn: func(_ context.Context, _ common.Hash, _ uint64) ([]byte, error) {
+				return blobData, nil
+			}}
+			submitter := &mockBlobSubmitter{submitFn: func(_ context.Context, _ []byte) ([][32]byte, error) {
+				return [][32]byte{{0x01}}, nil
+			}}
+
+			var (
+				mu  sync.Mutex
+				got string
+			)
+			model := &mockOllama{generateFn: func(_ context.Context, _, prompt string) (string, error) {
+				mu.Lock()
+				got = prompt
+				mu.Unlock()
+				return "Paris", nil
+			}}
+
+			logger := slog.New(slog.NewTextHandler(io.Discard, &slog.HandlerOptions{Level: slog.LevelError}))
+			handler := NewJobHandler(
+				chain, fetcher, submitter, newMockKeyStore(), model,
+				nil,
+				testSigningKey(t), ecdhKey, &atomic.Int32{}, logger,
+				HandlerConfig{
+					AckTxTimeout:     5 * time.Second,
+					BlobTxTimeout:    60 * time.Second,
+					SearchMaxResults: 3,
+				},
+				&recordingPublisher{},
+				nil,
+				testMetrics(t),
+				metrics.DeliveryAsynq,
+				&fakeSearcher{sources: twoSources()},
+			)
+			payload := testPayload(t)
+			ks := newMockKeyStore()
+			ks.keys[payload.SessionID] = sessionKey
+			handler.keyStore = ks
+
+			_, _, err = handler.runInferencePipeline(
+				context.Background(), logger, payload, blobData, "llama3-8b", "",
+				metrics.DeliveryAsynq, false, nil, time.Now(),
+			)
+			require.NoError(t, err)
+
+			mu.Lock()
+			defer mu.Unlock()
+			assert.Equal(t, tc.want, got, "model must be asked the search-processed text, not the raw envelope")
+		})
+	}
+}
+
+// TestBuildConversationHistory_UnwrapsSearchEnvelope: a prior turn that was
+// submitted as a search envelope replays as its question, not as the
+// NUL-prefixed JSON the consumer's blob carried.
+func TestBuildConversationHistory_UnwrapsSearchEnvelope(t *testing.T) {
+	t.Parallel()
+
+	sessionKey := testSessionKey(t)
+	ecdhKey := testECDHKey(t)
+
+	encPrompt, err := pkgcrypto.Encrypt(sessionKey, searchaug.EncodePrompt("prior user question", true))
+	require.NoError(t, err)
+	encResponse := encryptBlob(t, sessionKey, "prior answer")
+
+	promptHash := common.HexToHash("0x0101010101010101010101010101010101010101010101010101010101010101")
+	responseHash := common.HexToHash("0x0202020202020202020202020202020202020202020202020202020202020202")
+
+	chain := &mockChainClient{
+		getJobBlobInfoFn: func(_ context.Context, _ uint64) (common.Hash, common.Hash, uint64, uint64, error) {
+			return promptHash, responseHash, 10, 11, nil
+		},
+	}
+	fetcher := &mockBlobFetcher{fetchFn: func(_ context.Context, hash common.Hash, _ uint64) ([]byte, error) {
+		switch hash {
+		case promptHash:
+			return encPrompt, nil
+		case responseHash:
+			return encResponse, nil
+		default:
+			return nil, fmt.Errorf("unexpected hash %s", hash)
+		}
+	}}
+
+	logger := slog.New(slog.NewTextHandler(io.Discard, &slog.HandlerOptions{Level: slog.LevelError}))
+	handler := NewJobHandler(
+		chain, fetcher, &mockBlobSubmitter{}, newMockKeyStore(),
+		&mockOllama{generateFn: func(_ context.Context, _, _ string) (string, error) { return "", nil }},
+		nil,
+		testSigningKey(t), ecdhKey, &atomic.Int32{}, logger,
+		HandlerConfig{AckTxTimeout: 5 * time.Second, BlobTxTimeout: 60 * time.Second},
+		&recordingPublisher{},
+		nil,
+		testMetrics(t),
+		metrics.DeliveryAsynq,
+		nil,
+	)
+
+	msgs, err := handler.buildConversationHistory(context.Background(), []uint64{99}, sessionKey)
+	require.NoError(t, err)
+	require.Len(t, msgs, 2)
+	assert.Equal(t, "prior user question", msgs[0].Content, "user turn must be the unwrapped question")
+	assert.Equal(t, "prior answer", msgs[1].Content)
 }
