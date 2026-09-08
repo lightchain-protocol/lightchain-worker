@@ -793,6 +793,7 @@ func New(cfg *config.Config) (*Service, error) {
 			PollInterval:    cfg.SortitionPollInterval,
 			Logger:          logger,
 			OwnCapabilities: ownCaps,
+			LookbackBlocks:  cfg.SortitionSessionLookbackBlocks,
 		})
 		jobWatcher = sortition.NewJobWatcher(sortition.JobWatcherOpts{
 			Client:                chainClient,
