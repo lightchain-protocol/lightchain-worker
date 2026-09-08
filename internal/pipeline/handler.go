@@ -1122,7 +1122,11 @@ func (h *JobHandler) runInferencePipeline(
 	// stage-5 audit fields and the stats frame.
 	infClient, effectiveOpts, overrideApplied := h.inferenceClientFor(logger, modelName)
 
-	envelope, err := decodePrompt(prompt)
+	// Decode the search-processed text, not the raw blob: stage 4.5 has
+	// already unwrapped a search envelope (and augmented it when sources
+	// came back), while a multimodal envelope passes through searchaug
+	// untouched and is parsed here as before.
+	envelope, err := decodePrompt([]byte(promptText))
 	if err != nil {
 		return nil, 0, fmt.Errorf("stage 5 (decode prompt): %w", err)
 	}
@@ -2020,12 +2024,18 @@ func (h *JobHandler) buildConversationHistory(
 			// including full base64 image payloads - into the context as
 			// text, where it wastes prompt tokens against num_ctx and the
 			// vision model never sees the image as an image.
-			env, dErr := decodePrompt(promptText)
+			// A search envelope wraps the text the same way it does on the live
+			// turn, so unwrap it before the multimodal decode.
+			plain, _, dErr := searchaug.DecodePrompt(promptText)
+			var env promptEnvelope
+			if dErr == nil {
+				env, dErr = decodePrompt([]byte(plain))
+			}
 			if dErr != nil {
-				// Practically unreachable: stage 5 enforces the same image
-				// limit before a job can complete and land in history. Stay
-				// conservative and keep the raw text rather than drop the
-				// turn.
+				// Practically unreachable: stages 4.5 and 5 reject the same
+				// malformed envelopes before a job can complete and land in
+				// history. Stay conservative and keep the raw text rather
+				// than drop the turn.
 				messages = append(messages, ollama.ChatMessage{Role: "user", Content: string(promptText)})
 			} else {
 				messages = append(messages, ollama.ChatMessage{Role: "user", Content: env.Text, Images: env.Images})
