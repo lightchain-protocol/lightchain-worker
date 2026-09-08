@@ -14,6 +14,10 @@ import (
 
 const cursorSessionRequested = "session_requested"
 
+// reseedMaxAttempts bounds how many passes retry a failing look-back before the
+// watcher gives it up (a pruned-history RPC would otherwise fail it forever).
+const reseedMaxAttempts = 10
+
 // ClaimClient is the narrow chain interface the SessionWatcher needs.
 // Head returns chain.HeadInfo (not a bare uint64) so the watcher can use
 // head.Number with the same confirmations-guard pattern as the release Reconciler.
@@ -42,6 +46,14 @@ type SessionWatcherOpts struct {
 	// Requests requiring bits outside it are skipped instead of burning a doomed
 	// claim tx. Nil is treated as zero (no capabilities).
 	OwnCapabilities *big.Int
+	// LookbackBlocks is how far behind the persisted cursor the first pass
+	// re-scans for SessionRequested events. The pending set lives only in memory,
+	// so without this a restart forgets every request discovered before the
+	// cursor — including ones still waiting out the sortition threshold. Size it
+	// to how long requests stay Open: the consumer-api's default expiry is 1 h,
+	// but callers may request longer, so raise it where they do. Zero disables
+	// the look-back.
+	LookbackBlocks uint64
 }
 
 // SessionWatcher polls the chain for SessionRequested events and claims
@@ -62,6 +74,11 @@ type SessionWatcher struct {
 	interval time.Duration
 	log      *slog.Logger
 	ownCaps  *big.Int
+	lookback uint64
+	// seeded is set once the look-back behind the persisted cursor has run, or
+	// has been given up after reseedMaxAttempts failures (see RunOnce, phase 0).
+	seeded      bool
+	reseedTries int
 	// pending maps reqID → its required-capability mask, fetched lazily on first
 	// evaluation (nil = not yet fetched). The mask is immutable per request, so a
 	// successful fetch is cached for every later pass.
@@ -94,6 +111,7 @@ func NewSessionWatcher(o SessionWatcherOpts) *SessionWatcher {
 		interval: interval,
 		log:      o.Logger,
 		ownCaps:  ownCaps,
+		lookback: o.LookbackBlocks,
 		pending:  make(map[uint64]*big.Int),
 	}
 }
@@ -114,7 +132,13 @@ func (w *SessionWatcher) Start(ctx context.Context) {
 	}
 }
 
-// RunOnce performs one poll pass in two phases.
+// RunOnce performs one poll pass in three phases.
+//
+// Phase 0 — Reseed (first pass only): re-scan LookbackBlocks behind the
+// persisted cursor and add whatever SessionRequested events are there to the
+// pending set, without moving the cursor. The evaluation phase then prunes the
+// ones that are no longer Open. This is what lets a restarted worker keep
+// competing for requests it had discovered but was not yet eligible for.
 //
 // Phase 1 — Discovery: scan cursor+1..safeHead in chunks, add discovered
 // SessionRequested events to the in-memory pending set, and advance the cursor
@@ -148,6 +172,21 @@ func (w *SessionWatcher) RunOnce(ctx context.Context) error {
 	cursor, err := w.cursor.Get(cursorSessionRequested)
 	if err != nil {
 		return err
+	}
+
+	// Phase 0: Reseed — once per process, look behind the cursor. A failure
+	// must not wedge the pass: discovery and evaluation go on as before the
+	// look-back existed, and the look-back is retried on later passes up to
+	// reseedMaxAttempts (the window drifts forward with the cursor meanwhile).
+	if !w.seeded {
+		if err := w.reseed(ctx, cursor); err != nil {
+			w.reseedTries++
+			w.seeded = w.reseedTries >= reseedMaxAttempts
+			w.log.Warn("look-back behind the cursor failed; pass continues without it",
+				"attempt", w.reseedTries, "maxAttempts", reseedMaxAttempts, "givingUp", w.seeded, "error", err)
+		} else {
+			w.seeded = true
+		}
 	}
 
 	// Phase 1: Discovery — scan new blocks, populate pending.
@@ -244,5 +283,36 @@ func (w *SessionWatcher) RunOnce(ctx context.Context) error {
 		// else: not yet eligible — keep in pending for re-evaluation next pass.
 	}
 
+	return nil
+}
+
+// reseed adds every SessionRequested event in the last w.lookback blocks up to
+// and including cursor to the pending set. It never touches the cursor; the
+// evaluation phase drops anything that is no longer Open or has expired.
+func (w *SessionWatcher) reseed(ctx context.Context, cursor uint64) error {
+	if w.lookback == 0 || cursor == 0 {
+		return nil
+	}
+	lo := uint64(1)
+	if cursor > w.lookback {
+		lo = cursor - w.lookback + 1
+	}
+	found := 0
+	for from := lo; from <= cursor; from += w.chunk {
+		to := from + w.chunk - 1
+		if to > cursor {
+			to = cursor
+		}
+		reqs, err := w.c.FilterSessionRequested(ctx, from, to)
+		if err != nil {
+			return err
+		}
+		for _, r := range reqs {
+			w.pending[r.ReqID] = nil // capability mask fetched lazily at evaluation
+		}
+		found += len(reqs)
+	}
+	w.log.Info("reseeded pending session requests from behind the cursor",
+		"fromBlock", lo, "toBlock", cursor, "requests", found)
 	return nil
 }
