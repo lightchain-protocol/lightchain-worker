@@ -11,6 +11,7 @@ import (
 	"io"
 	"log/slog"
 	"math/big"
+	"strings"
 
 	"github.com/ethereum/go-ethereum/common"
 
@@ -99,14 +100,28 @@ func (h *Handler) AddModels(ctx context.Context) error {
 		return fmt.Errorf("ModelNames length %d does not match ModelIDs length %d", len(h.ModelNames), len(h.ModelIDs))
 	}
 
+	// One bad name must not strand the rest: a model the worker already
+	// supports, or one that is not whitelisted, reverts with a custom
+	// error that the RPC returns as a bare "execution reverted". Adding
+	// the remaining models is still the right thing to do, so failures
+	// are collected and reported together.
+	var failed []string
+	added := 0
 	for i, modelID := range h.ModelIDs {
 		if err := h.Client.AddSupportedModel(ctx, modelID); err != nil {
-			return fmt.Errorf("add model %q (index %d): %w", h.ModelNames[i], i, err)
+			h.Logger.Error("add model failed", "model", h.ModelNames[i], "index", i, "error", err)
+			failed = append(failed, fmt.Sprintf("%q: %v", h.ModelNames[i], err))
+			continue
 		}
+		added++
 		h.Logger.Info("model added", "model", h.ModelNames[i])
 	}
 
-	fmt.Fprintf(h.Out, "Added %d models for worker %s\n", len(h.ModelIDs), h.WorkerAddr.Hex())
+	fmt.Fprintf(h.Out, "Added %d of %d models for worker %s\n", added, len(h.ModelIDs), h.WorkerAddr.Hex())
+	if len(failed) > 0 {
+		return fmt.Errorf("%d model(s) not added (run `lightchain-worker preflight` for the per-model reason): %s",
+			len(failed), strings.Join(failed, "; "))
+	}
 	return nil
 }
 
