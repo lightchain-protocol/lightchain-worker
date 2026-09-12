@@ -788,6 +788,25 @@ func TestLoad_ModelOptions_MultiEntryAndAllKeys(t *testing.T) {
 	assert.Equal(t, -1, mistral.NumPredict, "Ollama's unlimited sentinel survives")
 }
 
+// Six of the whitelisted model names carry a colon of their own
+// (gemma4:e2b, gpt-oss:20b/120b, qwen3-vl:8b/30b, qwen3-embedding:0.6b).
+// The name must survive both the SUPPORTED_MODELS split and the
+// MODEL_OPTIONS split, or the worker refuses to start for the very models
+// external operators are most likely to run.
+func TestLoad_ColonInModelName(t *testing.T) {
+	validEnv(t)
+	t.Setenv("SUPPORTED_MODELS", "gemma4:e2b, gpt-oss:20b")
+	t.Setenv("MODEL_OPTIONS", "gemma4:e2b:num_predict=2048;gpt-oss:20b:num_ctx=8192")
+
+	cfg, err := Load()
+	require.NoError(t, err)
+	assert.Equal(t, []string{"gemma4:e2b", "gpt-oss:20b"}, cfg.SupportedModels,
+		"the colon is part of the name — keccak256 of a truncated name is not a whitelisted model id")
+	require.Len(t, cfg.ModelOptions, 2)
+	assert.Equal(t, 2048, cfg.ModelOptions["gemma4:e2b"].NumPredict)
+	assert.Equal(t, 8192, cfg.ModelOptions["gpt-oss:20b"].NumCtx)
+}
+
 // Every malformed shape is a startup failure. These are the fraud-by-config
 // guards: none of these may silently degrade to default behavior.
 func TestLoad_ModelOptions_ValidationFailures(t *testing.T) {

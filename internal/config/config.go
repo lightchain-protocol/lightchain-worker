@@ -726,6 +726,14 @@ func envOrDefault(key, defaultVal string) string {
 	return defaultVal
 }
 
+// cutLast splits s around the last instance of sep, mirroring strings.Cut.
+func cutLast(s string, sep byte) (before, after string, found bool) {
+	if i := strings.LastIndexByte(s, sep); i >= 0 {
+		return s[:i], s[i+1:], true
+	}
+	return s, "", false
+}
+
 // parseModelOptions parses the MODEL_OPTIONS grammar
 // "name:key=value,key=value;name2:..." into per-model ClientOptions
 // overrides. Only the named knobs are set in each entry; everything else
@@ -757,7 +765,12 @@ func parseModelOptions(raw string, supported []string, errs *[]string) map[strin
 		if entry == "" {
 			continue
 		}
-		name, pairs, found := strings.Cut(entry, ":")
+		// Split at the LAST colon: several whitelisted model names carry
+		// one of their own (gemma4:e2b, gpt-oss:20b, qwen3-vl:8b), while
+		// option keys never do. Cutting at the first colon would parse
+		// "gemma4:e2b:num_predict=2048" as the model "gemma4" and refuse
+		// to start.
+		name, pairs, found := cutLast(entry, ':')
 		name = strings.TrimSpace(name)
 		if !found || name == "" || strings.TrimSpace(pairs) == "" {
 			*errs = append(*errs, fmt.Sprintf("MODEL_OPTIONS: malformed entry %q (want name:key=value,...)", entry))

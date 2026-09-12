@@ -253,7 +253,7 @@ func TestAddModels_Success(t *testing.T) {
 	err := h.AddModels(context.Background())
 	require.NoError(t, err)
 	assert.Equal(t, 2, addCount)
-	assert.Contains(t, buf.String(), "Added 2 models")
+	assert.Contains(t, buf.String(), "Added 2 of 2 models")
 }
 
 func TestAddModels_NoModels(t *testing.T) {
@@ -273,30 +273,36 @@ func TestAddModels_NoModels(t *testing.T) {
 func TestAddModels_PartialFailure(t *testing.T) {
 	t.Parallel()
 
+	// The first model reverts — a misspelled or not-yet-whitelisted name.
+	// The rest must still be attempted, or one bad entry silently strands
+	// every model behind it.
 	addCount := 0
 	mock := &mockRegClient{
 		addSupportedModelFn: func(_ context.Context, _ [32]byte) error {
 			addCount++
-			if addCount == 2 {
-				return errors.New("tx reverted")
+			if addCount == 1 {
+				return errors.New("execution reverted")
 			}
 			return nil
 		},
 	}
 
+	var buf bytes.Buffer
 	h := &Handler{
 		Client:     mock,
 		WorkerAddr: testAddr,
 		ModelIDs:   [][32]byte{model1, model2},
 		ModelNames: []string{"llama3-8b", "mistral-7b"},
-		Out:        &bytes.Buffer{},
+		Out:        &buf,
 		Logger:     testLogger(),
 	}
 
 	err := h.AddModels(context.Background())
 	require.Error(t, err)
-	assert.Contains(t, err.Error(), "mistral-7b")
-	assert.Contains(t, err.Error(), "index 1")
+	assert.Equal(t, 2, addCount, "a failing model must not abort the ones after it")
+	assert.Contains(t, err.Error(), "llama3-8b")
+	assert.Contains(t, err.Error(), "preflight")
+	assert.Contains(t, buf.String(), "Added 1 of 2 models")
 }
 
 // --- Deregister tests ---
