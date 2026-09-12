@@ -772,7 +772,12 @@ func parseModelOptions(raw string, supported []string, errs *[]string) map[strin
 		// to start.
 		name, pairs, found := cutLast(entry, ':')
 		name = strings.TrimSpace(name)
-		if !found || name == "" || strings.TrimSpace(pairs) == "" {
+		// An entry with no key=value after the split is a bare model name
+		// (or a colon-named model with nothing after it, e.g. "gemma4:e2b",
+		// which the split reads as model "gemma4" + options "e2b"). Report
+		// it as malformed rather than as an unknown model, so the operator
+		// sees the entry they wrote, not a truncated name.
+		if !found || name == "" || !strings.Contains(pairs, "=") {
 			*errs = append(*errs, fmt.Sprintf("MODEL_OPTIONS: malformed entry %q (want name:key=value,...)", entry))
 			continue
 		}
