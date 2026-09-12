@@ -931,6 +931,7 @@ func TestLoad_ModelOptions_ValidationFailures(t *testing.T) {
 		{"unknown model entirely", "qwen2.5-7b:num_predict=100", "not in SUPPORTED_MODELS"},
 		{"unknown option key", "llama3-8b:top_p=0.9", "unknown option key"},
 		{"missing pairs", "llama3-8b", "malformed entry"},
+		{"bare colon-named model reads as its own entry, not as model gemma4", "gemma4:e2b", "malformed entry \"gemma4:e2b\""},
 		{"missing value", "llama3-8b:num_predict=", "malformed option"},
 		{"missing key", "llama3-8b:=1024", "malformed option"},
 		{"duplicate model entry", "llama3-8b:num_predict=100;llama3-8b:num_ctx=4096", "duplicate entry"},
