@@ -94,7 +94,8 @@ func (m *RegistrationManager) EnsureRegistered(ctx context.Context, ecdhPubKey [
 				m.workerAddr.Hex(),
 			)
 		}
-		m.logger.Info("worker already registered on-chain with matching encryption key",
+		m.logger.Info(
+			"worker already registered on-chain with matching encryption key",
 			"address", m.workerAddr.Hex(),
 		)
 		return nil
@@ -121,7 +122,8 @@ func (m *RegistrationManager) EnsureRegistered(ctx context.Context, ecdhPubKey [
 		return fmt.Errorf("register worker: %w", err)
 	}
 
-	m.logger.Info("worker registered on-chain",
+	m.logger.Info(
+		"worker registered on-chain",
 		"address", m.workerAddr.Hex(),
 		"stakeWei", stake.String(),
 	)
@@ -129,24 +131,28 @@ func (m *RegistrationManager) EnsureRegistered(ctx context.Context, ecdhPubKey [
 	for i, modelID := range m.modelIDs {
 		if err := m.client.AddSupportedModel(ctx, modelID); err != nil {
 			modelErr := fmt.Errorf("add supported model at index %d: %w", i, err)
-			m.logger.Warn("AddSupportedModel failed, rolling back registration",
+			m.logger.Warn(
+				"AddSupportedModel failed, rolling back registration",
 				"modelIndex", i,
 				"error", err,
 			)
 			if rollbackErr := m.client.DeregisterWorker(ctx); rollbackErr != nil {
-				m.logger.Error("rollback deregistration also failed",
+				m.logger.Error(
+					"rollback deregistration also failed",
 					"error", rollbackErr,
 				)
 				return errors.Join(modelErr, fmt.Errorf("rollback deregister: %w", rollbackErr))
 			}
-			m.logger.Info("registration rolled back after model failure",
+			m.logger.Info(
+				"registration rolled back after model failure",
 				"address", m.workerAddr.Hex(),
 			)
 			return modelErr
 		}
 	}
 
-	m.logger.Info("all models registered",
+	m.logger.Info(
+		"all models registered",
 		"address", m.workerAddr.Hex(),
 		"modelCount", len(m.modelIDs),
 	)
@@ -161,4 +167,61 @@ func (m *RegistrationManager) Deregister(ctx context.Context) error {
 	}
 	m.logger.Info("worker deregistered", "address", m.workerAddr.Hex())
 	return nil
+}
+
+// EnsureCapabilities syncs the worker's on-chain capability mask to the
+// desired capability names — the worker's configuration is the source of
+// truth, matching setCapabilities' overwrite (not merge) semantics. A worker
+// whose config drops a capability (e.g. search disabled after a revoked API
+// key) must stop advertising it, or it keeps winning constrained claims it
+// can no longer serve.
+//
+// Best-effort by design: every failure is logged and skipped, never fatal —
+// the worker must come up even when a capability is not yet registered
+// on-chain or the RPC read fails. If any desired name fails to resolve, the
+// sync degrades to add-only (never clears bits on partial knowledge). The
+// on-chain claimSession check is the enforcement point, not this call.
+func (m *RegistrationManager) EnsureCapabilities(ctx context.Context, names []string) {
+	want := new(big.Int)
+	resolvedAll := true
+	for _, name := range names {
+		mask, err := m.client.GetCapabilityMask(ctx, name)
+		if err != nil {
+			m.logger.Warn("capability mask lookup failed", "name", name, "error", err)
+			resolvedAll = false
+			continue
+		}
+		if mask.Sign() == 0 {
+			m.logger.Warn("capability not registered on-chain; skipping declaration", "name", name)
+			resolvedAll = false
+			continue
+		}
+		want.Or(want, mask)
+	}
+
+	current, err := m.client.GetWorkerCapabilities(ctx, m.workerAddr)
+	if err != nil {
+		m.logger.Warn("worker capability read failed; skipping declaration", "error", err)
+		return
+	}
+
+	target := want
+	if !resolvedAll {
+		// Partial knowledge: only add the bits that resolved; clearing a bit
+		// we merely failed to look up would un-declare a live capability.
+		target = new(big.Int).Or(current, want)
+	}
+	if target.Cmp(current) == 0 {
+		return // already in sync
+	}
+
+	if err := m.client.SetCapabilities(ctx, target); err != nil {
+		m.logger.Warn("setCapabilities failed", "error", err)
+		return
+	}
+	m.logger.Info(
+		"declared worker capabilities on-chain",
+		"address", m.workerAddr.Hex(),
+		"mask", target.String(),
+	)
 }

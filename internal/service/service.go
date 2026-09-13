@@ -4,6 +4,7 @@ package service
 
 import (
 	"context"
+	"crypto/ecdh"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -23,6 +24,7 @@ import (
 	"github.com/hibiken/asynq"
 	"github.com/redis/go-redis/v9"
 
+	pkgcrypto "github.com/lightchain/pkg/crypto"
 	pkgtypes "github.com/lightchain/pkg/types"
 
 	"github.com/lightchain/worker/internal/blob"
@@ -36,6 +38,8 @@ import (
 	"github.com/lightchain/worker/internal/pipeline"
 	"github.com/lightchain/worker/internal/registration"
 	"github.com/lightchain/worker/internal/release"
+	"github.com/lightchain/worker/internal/search"
+	"github.com/lightchain/worker/internal/sortition"
 	"github.com/lightchain/worker/internal/voice"
 )
 
@@ -86,9 +90,11 @@ type Service struct {
 	metrics       *metrics.Metrics
 	metricsServer *http.Server
 
-	// Gateway mode (non-nil when WORKER_GATEWAY_URL is set)
+	// Gateway mode (non-nil when WORKER_GATEWAY_URL is set). streamPub is
+	// non-nil only in the external sortition profile.
 	gwClient  *gw.Client
 	gwHandler *pipeline.JobHandler
+	streamPub *gw.StreamPublisher
 
 	// Release subsystem. Store is always non-nil (the Tracker writes to it
 	// from the pipeline regardless of cfg.ReleaseEnabled). Scheduler and
@@ -98,6 +104,23 @@ type Service struct {
 	releaseTracker    *release.Tracker
 	releaseScheduler  *release.Scheduler
 	releaseReconciler *release.Reconciler
+
+	// Sortition mode (non-nil when SortitionEnabled). Takes precedence over
+	// gateway and direct modes when set.
+	sessionWatcher *sortition.SessionWatcher
+	jobWatcher     *sortition.JobWatcher
+}
+
+// ecdhKeyChecker adapts the worker ECDH private key to the sortition.KeyChecker
+// interface so the JobWatcher can skip jobs whose session key was wrapped for a
+// different worker before wasting GPU time on a decrypt-bound failure.
+type ecdhKeyChecker struct {
+	key *ecdh.PrivateKey
+}
+
+func (c ecdhKeyChecker) CanDecryptSessionKey(enc []byte) bool {
+	_, err := pkgcrypto.DecryptSessionKey(enc, c.key)
+	return err == nil
 }
 
 // releaseMetricsAdapter bridges release.Metrics (a tiny consumer-side
@@ -115,6 +138,7 @@ func (a releaseMetricsAdapter) IncPauseEvent() { a.m.ReleasePauseEventsTotal.Inc
 func (a releaseMetricsAdapter) SetLastSuccessTimestamp(ts int64) {
 	a.m.ReleaseLastSuccessTimestamp.Set(float64(ts))
 }
+
 func (a releaseMetricsAdapter) SetReconcileLastBlock(block uint64) {
 	a.m.ReleaseReconcileLastBlock.Set(float64(block))
 }
@@ -152,6 +176,10 @@ func New(cfg *config.Config) (*Service, error) {
 	}
 
 	logger := newLogger(cfg.LogLevel, cfg.LogFormat)
+
+	if cfg.SortitionEnabled && cfg.WorkerGatewayURL != "" {
+		logger.Info("external worker profile: sortition assignment with gateway egress (responses, heartbeat, drain via worker-gateway)")
+	}
 
 	// Load Ethereum signing key from the go-ethereum keystore file
 	keystoreJSON, err := os.ReadFile(cfg.WorkerKeystorePath)
@@ -221,6 +249,7 @@ func New(cfg *config.Config) (*Service, error) {
 		cfg.WorkerRegistryAddress,
 		cfg.AIConfigAddress,
 		cfg.JobRegistryAddress,
+		cfg.SessionManagerAddress,
 		signingKey,
 		cfg.GasPriceMultiplierBps,
 		coordinator,
@@ -313,9 +342,10 @@ func New(cfg *config.Config) (*Service, error) {
 		return nil, fmt.Errorf("unsupported BLOB_MODE %q", blobMode)
 	}
 
-	// In direct Redis mode (non-gateway), we always need a Redis client for
-	// heartbeat, Asynq job queue, and response publishing. Create it now if
-	// blob mode didn't already create one.
+	// Internal profiles need a Redis client for heartbeat, Asynq queues (or
+	// the sortition heartbeat monitor), and direct response publishing.
+	// External profile (sortition + gateway URL) does all three via the
+	// gateway, so Redis is skipped unless BLOB_MODE=redis already dialed one.
 	if cfg.WorkerGatewayURL == "" && redisClient == nil {
 		redisOpts, err = redis.ParseURL(cfg.RedisURL)
 		if err != nil {
@@ -429,6 +459,34 @@ func New(cfg *config.Config) (*Service, error) {
 	}
 
 	// Job pipeline handler
+	var searcher search.Searcher
+	if cfg.SearchEnabled {
+		searcher = search.NewTavilyClient(cfg.TavilyURL, cfg.TavilyAPIKey, cfg.SearchTimeout)
+	}
+
+	// External profile: replace the direct-Redis publisher with the gateway
+	// stream. The client is reused for heartbeat and drain in runSortitionMode.
+	var extGwClient *gw.Client
+	var extStreamPub *gw.StreamPublisher
+	var publisher pipeline.ResponsePublisher
+	deliveryLabel := metrics.DeliveryAsynq
+	if cfg.SortitionEnabled && cfg.WorkerGatewayURL != "" {
+		extGwClient = gw.NewClient(cfg.WorkerGatewayURL, signingKey, logger)
+		gwAuthCtx, gwAuthCancel := context.WithTimeout(context.Background(), 30*time.Second)
+		err := extGwClient.Authenticate(gwAuthCtx)
+		gwAuthCancel()
+		if err != nil {
+			if redisClient != nil {
+				_ = redisClient.Close()
+			}
+			chainClient.Close()
+			return nil, fmt.Errorf("authenticate with worker-gateway: %w", err)
+		}
+		extStreamPub = gw.NewStreamPublisher(extGwClient, logger)
+		publisher = extStreamPub
+		deliveryLabel = metrics.DeliveryGateway
+	}
+
 	handler := pipeline.NewJobHandler(
 		chainClient,
 		blobFetcher,
@@ -460,13 +518,17 @@ func New(cfg *config.Config) (*Service, error) {
 			STTEnabled:           cfg.STTEnabled,
 			TTSEnabled:           cfg.TTSEnabled,
 			TTSVoice:             cfg.TTSVoice,
+			SpeechModelName:      cfg.SpeechModelName,
 			TTSMaxChars:          cfg.TTSMaxChars,
 			TTSTimeout:           cfg.TTSTimeout,
+			SearchMaxResults:    cfg.SearchMaxResults,
+			SearchTimeout:       cfg.SearchTimeout,
 		},
-		nil, // publisher — fallback wires RedisResponsePublisher from redisClient
+		publisher, // nil for internal profiles — fallback wires RedisResponsePublisher
 		checkpoints,
 		metricsCollector,
-		metrics.DeliveryAsynq,
+		deliveryLabel,
+		searcher,
 	)
 	handler.SetReleaseTracker(releaseTracker)
 	if voiceEngine != nil {
@@ -474,7 +536,10 @@ func New(cfg *config.Config) (*Service, error) {
 	}
 
 	// --- Gateway mode: skip Asynq and direct Redis heartbeat ---
-	if cfg.WorkerGatewayURL != "" {
+	// SortitionEnabled takes precedence: if both are set we already warned above
+	// and fall through to the direct-Redis path so the monitor and sortition
+	// watchers are constructed there.
+	if cfg.WorkerGatewayURL != "" && !cfg.SortitionEnabled {
 		gwClient := gw.NewClient(cfg.WorkerGatewayURL, signingKey, logger)
 
 		gwCtx, gwCancel := context.WithTimeout(context.Background(), 30*time.Second)
@@ -534,20 +599,25 @@ func New(cfg *config.Config) (*Service, error) {
 				STTEnabled:  cfg.STTEnabled,
 				TTSEnabled:  cfg.TTSEnabled,
 				TTSVoice:    cfg.TTSVoice,
+				SpeechModelName: cfg.SpeechModelName,
 				TTSMaxChars: cfg.TTSMaxChars,
 				TTSTimeout:  cfg.TTSTimeout,
+				SearchMaxResults: cfg.SearchMaxResults,
+				SearchTimeout:    cfg.SearchTimeout,
 			},
 			gwPublisher,
 			checkpoints,
 			metricsCollector,
 			metrics.DeliveryGateway,
+			searcher,
 		)
 		gwHandler.SetReleaseTracker(releaseTracker)
 		if voiceEngine != nil {
 			gwHandler.SetVoiceEngine(voiceEngine)
 		}
 
-		logger.Info("worker service initialized (gateway mode)",
+		logger.Info(
+			"worker service initialized (gateway mode)",
 			"address", workerAddr.Hex(),
 			"gateway", cfg.WorkerGatewayURL,
 			"models", len(modelIDs),
@@ -562,7 +632,8 @@ func New(cfg *config.Config) (*Service, error) {
 		if perr == nil && lerr == nil {
 			coordinator.Seed(pendingNonce, latestNonce)
 		} else {
-			logger.Warn("coordinator seed skipped — pending/latest nonce read failed",
+			logger.Warn(
+				"coordinator seed skipped — pending/latest nonce read failed",
 				"pendingErr", perr,
 				"latestErr", lerr,
 				"hint", "first legacy broadcast may race a stuck pool tx; existing ShouldResetNonceOnSendError will recover",
@@ -591,38 +662,54 @@ func New(cfg *config.Config) (*Service, error) {
 
 	// --- Direct Redis mode (default) ---
 
-	// Asynq server — listens on worker-specific queue
-	// Queue name must match dispatcher's workerQueueName(): "worker:{lowercase_hex_with_0x}"
-	queueName := fmt.Sprintf("worker:%s", strings.ToLower(workerAddr.Hex()))
-	asynqSrv := asynq.NewServer(
-		asynqRedisClientOptFromRedisOptions(redisOpts),
-		asynq.Config{
-			Concurrency: cfg.MaxConcurrentJobs,
-			Queues:      map[string]int{queueName: 1},
-		},
-	)
-
-	mux := asynq.NewServeMux()
-	mux.HandleFunc(pipeline.TaskTypeJobInference, handler.HandleTask)
+	// Asynq server — listens on worker-specific queue. Not constructed in
+	// sortition mode; asynqSrv stays nil so the shutdown nil-guard holds.
+	var asynqSrv *asynq.Server
+	var mux *asynq.ServeMux
+	var queueName string
+	if !cfg.SortitionEnabled {
+		// Queue name must match dispatcher's workerQueueName(): "worker:{lowercase_hex_with_0x}"
+		queueName = fmt.Sprintf("worker:%s", strings.ToLower(workerAddr.Hex()))
+		asynqSrv = asynq.NewServer(
+			asynqRedisClientOptFromRedisOptions(redisOpts),
+			asynq.Config{
+				Concurrency: cfg.MaxConcurrentJobs,
+				Queues:      map[string]int{queueName: 1},
+			},
+		)
+		mux = asynq.NewServeMux()
+		mux.HandleFunc(pipeline.TaskTypeJobInference, handler.HandleTask)
+	}
 
 	// Heartbeat monitor — shared job counter for dynamic ActiveJobs/MaxJobs
 	monitorCfg := heartbeat.MonitorConfig{
 		Interval:  cfg.HeartbeatInterval,
 		OllamaURL: cfg.OllamaURL,
 	}
-	addrHex := checksumHexNoPrefix(workerAddr)
-	monitor := heartbeat.NewMonitor(redisClient, monitorCfg, addrHex, modelHexStrings, jobCounter, cfg.MaxConcurrentJobs, logger, metricsCollector)
-
-	// Gate startup on a real heartbeat write
-	startCtx, startCancel := context.WithTimeout(context.Background(), startupHeartbeatTimeout)
-	defer startCancel()
-	if err := monitor.EmitOnce(startCtx); err != nil {
-		_ = redisClient.Close()
-		chainClient.Close()
-		return nil, fmt.Errorf("initial heartbeat write failed — check Redis config: %w", err)
+	capabilities := []string{}
+	if cfg.SearchEnabled && cfg.TavilyAPIKey != "" {
+		capabilities = append(capabilities, "search")
 	}
 
-	logger.Info("worker service initialized",
+	// Heartbeat: internal profiles advertise via Redis; the external profile
+	// heartbeats through the gateway HTTP API in runSortitionMode instead.
+	addrHex := checksumHexNoPrefix(workerAddr)
+	var monitor *heartbeat.Monitor
+	if redisClient != nil {
+		monitor = heartbeat.NewMonitor(redisClient, monitorCfg, addrHex, modelHexStrings, capabilities, jobCounter, cfg.MaxConcurrentJobs, logger, metricsCollector)
+
+		// Gate startup on a real heartbeat write
+		startCtx, startCancel := context.WithTimeout(context.Background(), startupHeartbeatTimeout)
+		defer startCancel()
+		if err := monitor.EmitOnce(startCtx); err != nil {
+			_ = redisClient.Close()
+			chainClient.Close()
+			return nil, fmt.Errorf("initial heartbeat write failed — check Redis config: %w", err)
+		}
+	}
+
+	logger.Info(
+		"worker service initialized",
 		"address", workerAddr.Hex(),
 		"models", len(modelIDs),
 		"maxConcurrentJobs", cfg.MaxConcurrentJobs,
@@ -647,10 +734,86 @@ func New(cfg *config.Config) (*Service, error) {
 	if perr == nil && lerr == nil {
 		coordinator.Seed(pendingNonce, latestNonce)
 	} else {
-		logger.Warn("coordinator seed skipped — pending/latest nonce read failed",
+		logger.Warn(
+			"coordinator seed skipped — pending/latest nonce read failed",
 			"pendingErr", perr,
 			"latestErr", lerr,
 			"hint", "first legacy broadcast may race a stuck pool tx; existing ShouldResetNonceOnSendError will recover",
+		)
+	}
+
+	// --- Sortition mode: flag-gated third intake ---
+	// Construct the chain-watcher pair when SortitionEnabled. Both watchers share
+	// a single CursorStore (dir-backed), the shared jobCounter, and the pipeline
+	// handler as their job sink. Gateway/direct paths above are skipped when
+	// SortitionEnabled is true; asynqSrv is nil (gated above) and gwClient is
+	// nil, so Run dispatches to runSortitionMode instead.
+	var sessionWatcher *sortition.SessionWatcher
+	var jobWatcher *sortition.JobWatcher
+	if cfg.SortitionEnabled {
+		cursorStore, csErr := sortition.NewCursorStore(cfg.SortitionStateDir)
+		if csErr != nil {
+			_ = redisClient.Close()
+			chainClient.Close()
+			return nil, fmt.Errorf("open sortition cursor store: %w", csErr)
+		}
+		// Best-effort capability self-declaration (same predicate that
+		// advertises "search" in the heartbeat), then one read of the final mask
+		// for the watcher's politeness skip. Every failure degrades to an empty
+		// mask — unconstrained requests stay claimable and the on-chain
+		// claimSession check remains the guarantee for constrained ones.
+		var desiredCaps []string
+		if cfg.SearchEnabled && cfg.TavilyAPIKey != "" {
+			desiredCaps = append(desiredCaps, "search")
+		}
+		capCtx, capCancel := context.WithTimeout(context.Background(), 30*time.Second)
+		registration.NewManager(chainClient, workerAddr, nil, logger).EnsureCapabilities(capCtx, desiredCaps)
+		capCancel()
+		// Fresh budget for the read-back: when EnsureCapabilities actually
+		// broadcast (first boot with a new predicate), WaitMined may have eaten
+		// most of capCtx — reusing it would fail the read and pin ownCaps to 0
+		// for the whole process lifetime, silently skipping constrained sessions.
+		readCtx, readCancel := context.WithTimeout(context.Background(), 30*time.Second)
+		ownCaps, capErr := chainClient.GetWorkerCapabilities(readCtx, workerAddr)
+		readCancel()
+		if capErr != nil {
+			logger.Warn("worker capability mask read failed; watcher runs with empty mask", "error", capErr)
+			ownCaps = big.NewInt(0)
+		}
+
+		checker := ecdhKeyChecker{key: ecdhKey}
+		sessionWatcher = sortition.NewSessionWatcher(sortition.SessionWatcherOpts{
+			Client:          chainClient,
+			Cursor:          cursorStore,
+			Worker:          workerAddr,
+			JobCounter:      jobCounter,
+			MaxConcurrent:   cfg.MaxConcurrentJobs,
+			ChunkSize:       cfg.SortitionChunkSize,
+			Confirmations:   cfg.SortitionConfirmations,
+			PollInterval:    cfg.SortitionPollInterval,
+			Logger:          logger,
+			OwnCapabilities: ownCaps,
+			LookbackBlocks:  cfg.SortitionSessionLookbackBlocks,
+		})
+		jobWatcher = sortition.NewJobWatcher(sortition.JobWatcherOpts{
+			Client:                chainClient,
+			KeyChecker:            checker,
+			Sink:                  handler,
+			Cursor:                cursorStore,
+			Worker:                workerAddr,
+			JobCounter:            jobCounter,
+			MaxConcurrent:         cfg.MaxConcurrentJobs,
+			ChunkSize:             cfg.SortitionChunkSize,
+			Confirmations:         cfg.SortitionConfirmations,
+			HistoryLookbackBlocks: cfg.SortitionHistoryLookbackBlocks,
+			SessionRetryLimit:     cfg.SortitionSessionRetryLimit,
+			PollInterval:          cfg.SortitionPollInterval,
+			Logger:                logger,
+		})
+		logger.Info(
+			"sortition mode enabled",
+			"sessionManagerAddress", cfg.SessionManagerAddress.Hex(),
+			"stateDir", cfg.SortitionStateDir,
 		)
 	}
 
@@ -672,6 +835,10 @@ func New(cfg *config.Config) (*Service, error) {
 		releaseTracker:    releaseTracker,
 		releaseScheduler:  releaseScheduler,
 		releaseReconciler: releaseReconciler,
+		sessionWatcher:    sessionWatcher,
+		jobWatcher:        jobWatcher,
+		gwClient:          extGwClient,
+		streamPub:         extStreamPub,
 	}, nil
 }
 
@@ -698,7 +865,8 @@ func (s *Service) startMetricsServer() {
 	s.logger.Info("starting metrics endpoint", "addr", s.metricsServer.Addr)
 	go func() {
 		if err := s.metricsServer.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
-			s.logger.Error("metrics endpoint failed (job processing continues)",
+			s.logger.Error(
+				"metrics endpoint failed (job processing continues)",
 				"addr", s.metricsServer.Addr,
 				"error", err,
 			)
@@ -739,6 +907,17 @@ func (p *gatewayResponsePublisher) PublishResponse(
 	}
 }
 
+func (p *gatewayResponsePublisher) PublishMetadata(
+	_ context.Context,
+	jobID, _ uint64,
+	_ string,
+	_ []byte,
+) {
+	// v1 no-op: gateway mode routes metadata via the relay's Redis pub/sub path,
+	// not HTTP. Citations are best-effort; missing them does not break job delivery.
+	p.logger.Debug("gateway: metadata publish skipped (v1 no-op)", "jobID", jobID)
+}
+
 // PublishChunk is unreachable in practice — SupportsChunks() is false, so
 // the handler never builds a chunk streamer for this publisher. It is
 // implemented defensively rather than left to panic if that gating ever
@@ -769,11 +948,16 @@ func (s *Service) Run(ctx context.Context) error {
 	sigCtx, stop := signal.NotifyContext(runCtx, syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
-	// Metrics endpoint runs in both modes. Non-fatal: a bind failure or
+	// Metrics endpoint runs in all modes. Non-fatal: a bind failure or
 	// transient ListenAndServe error logs loudly but does not stop job
 	// processing — observability outages must not cascade into job
 	// outages. Shutdown is handled in s.shutdown() via srv.Shutdown(ctx).
 	s.startMetricsServer()
+
+	// Sortition mode takes precedence — checked before gateway/direct.
+	if s.sessionWatcher != nil {
+		return s.runSortitionMode(sigCtx, runCancel)
+	}
 
 	// Gateway mode: poll loop + gateway heartbeat
 	if s.gwClient != nil {
@@ -828,6 +1012,29 @@ func (s *Service) Run(ctx context.Context) error {
 	return runErr
 }
 
+// gatewayHeartbeatLoop advertises liveness via the gateway HTTP API. Used by
+// legacy gateway mode and the external sortition profile (no direct Redis).
+func (s *Service) gatewayHeartbeatLoop(ctx context.Context) {
+	ticker := time.NewTicker(s.cfg.HeartbeatInterval)
+	defer ticker.Stop()
+	for {
+		payload := gw.HeartbeatPayload{
+			ActiveJobs:   int(s.jobCounter.Load()),
+			MaxJobs:      s.cfg.MaxConcurrentJobs,
+			OllamaStatus: "ready",
+			Uptime:       0, // parity with the legacy gateway-mode loop
+		}
+		if err := s.gwClient.SendHeartbeat(ctx, payload); err != nil {
+			s.logger.Warn("gateway heartbeat failed", "error", err)
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
+	}
+}
+
 // runGatewayMode runs the worker in gateway mode: connects to the worker-gateway
 // via WebSocket for instant job delivery, and sends heartbeats via HTTP.
 func (s *Service) runGatewayMode(ctx context.Context, cancel context.CancelFunc) error {
@@ -837,26 +1044,7 @@ func (s *Service) runGatewayMode(ctx context.Context, cancel context.CancelFunc)
 	s.startReleaseSubsystem(ctx)
 
 	// Heartbeat loop (HTTP POST, unchanged)
-	go func() {
-		ticker := time.NewTicker(s.cfg.HeartbeatInterval)
-		defer ticker.Stop()
-		for {
-			payload := gw.HeartbeatPayload{
-				ActiveJobs:   int(s.jobCounter.Load()),
-				MaxJobs:      s.cfg.MaxConcurrentJobs,
-				OllamaStatus: "ready",
-				Uptime:       0, // simplified for MVP
-			}
-			if err := s.gwClient.SendHeartbeat(ctx, payload); err != nil {
-				s.logger.Warn("gateway heartbeat failed", "error", err)
-			}
-			select {
-			case <-ctx.Done():
-				return
-			case <-ticker.C:
-			}
-		}
-	}()
+	go s.gatewayHeartbeatLoop(ctx)
 
 	// Job stream via WebSocket (BRPOP-backed, instant delivery)
 	go s.gwClient.StreamJobs(ctx, s.cfg.MaxConcurrentJobs, func(jobCtx context.Context, job pipeline.JobPayload) error {
@@ -881,6 +1069,46 @@ func (s *Service) runGatewayMode(ctx context.Context, cancel context.CancelFunc)
 	return s.shutdown(shutdownCtx)
 }
 
+// runSortitionMode runs the worker in sortition mode: the SessionWatcher polls
+// the chain for SessionRequested events and claims eligible sessions; the
+// JobWatcher serves their JobSubmitted events directly into the pipeline.
+// No dispatcher or worker-gateway is involved.
+func (s *Service) runSortitionMode(ctx context.Context, _ context.CancelFunc) error {
+	s.logger.Info("worker sidecar running (sortition mode) — waiting for shutdown signal")
+
+	// Release subsystem runs identically across all modes.
+	s.startReleaseSubsystem(ctx)
+
+	// Heartbeat + egress: internal profile uses the Redis monitor; external
+	// profile heartbeats over the gateway and runs the response stream.
+	if s.monitor != nil {
+		s.monitor.Start(ctx)
+	}
+	if s.gwClient != nil {
+		go s.gatewayHeartbeatLoop(ctx)
+	}
+	if s.streamPub != nil {
+		go s.streamPub.Run(ctx)
+	}
+
+	// Both chain watchers run in background goroutines; Start blocks until
+	// ctx is cancelled (ticker loop), so we launch each in its own goroutine.
+	go s.sessionWatcher.Start(ctx)
+	go s.jobWatcher.Start(ctx)
+
+	<-ctx.Done()
+	s.logger.Info("shutdown signal received, stopping gracefully")
+
+	// Set the drain marker so new sessions stop being routed to this worker
+	// while in-flight jobs continue to completion. External profile drains
+	// via the gateway; internal profile writes directly to Redis.
+	s.markDrainOnShutdown(s.gwClient != nil)
+
+	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), s.cfg.ShutdownTimeout)
+	defer shutdownCancel()
+	return s.shutdown(shutdownCtx)
+}
+
 // markDrainOnShutdown writes the drain marker as the worker exits. Failure
 // is non-fatal — a missing drain marker just means the worker will be
 // filtered out by stale-detection (TTL expiry on the heartbeat key)
@@ -896,7 +1124,8 @@ func (s *Service) markDrainOnShutdown(gatewayMode bool) {
 		ctx, cancel := context.WithTimeout(context.Background(), shutdownDrainTimeout)
 		defer cancel()
 		if err := s.gwClient.SendDrain(ctx); err != nil {
-			s.logger.Warn("drain_write_failed",
+			s.logger.Warn(
+				"drain_write_failed",
 				"mode", "gateway",
 				"worker", s.workerAddr.Hex(),
 				"error", err,
@@ -921,7 +1150,8 @@ func (s *Service) markDrainOnShutdown(gatewayMode bool) {
 	writeCtx, cancel := context.WithTimeout(context.Background(), shutdownDrainTimeout)
 	defer cancel()
 	if err := pkgtypes.SetDraining(writeCtx, s.redis, s.workerAddr.Hex(), ttl); err != nil {
-		s.logger.Warn("drain_write_failed",
+		s.logger.Warn(
+			"drain_write_failed",
 			"mode", "direct",
 			"worker", s.workerAddr.Hex(),
 			"ttl", ttl,
@@ -929,7 +1159,8 @@ func (s *Service) markDrainOnShutdown(gatewayMode bool) {
 		)
 		return
 	}
-	s.logger.Info("drain marker set via redis",
+	s.logger.Info(
+		"drain marker set via redis",
 		"worker", s.workerAddr.Hex(),
 		"ttl", ttl,
 	)
@@ -959,7 +1190,8 @@ func (s *Service) computeDrainTTL() time.Duration {
 
 	disputeWindow, err := s.chainClient.GetDisputeWindow(lookupCtx)
 	if err != nil {
-		s.logger.Warn("get dispute window for drain TTL failed; using fallback",
+		s.logger.Warn(
+			"get dispute window for drain TTL failed; using fallback",
 			"fallback", drainTTLFallback,
 			"error", err,
 		)
@@ -991,7 +1223,8 @@ func (s *Service) startReleaseSubsystem(ctx context.Context) {
 	if s.releaseScheduler != nil {
 		s.releaseScheduler.Start(ctx)
 	}
-	s.logger.Info("release subsystem started",
+	s.logger.Info(
+		"release subsystem started",
 		"interval", s.cfg.ReleaseInterval,
 		"probe_interval", s.cfg.ReleaseProbeInterval,
 		"reconcile_interval", s.cfg.ReleaseReconcileInterval,
@@ -1011,7 +1244,7 @@ func (s *Service) shutdown(ctx context.Context) error {
 		}
 	}
 
-	// Stop Asynq server — waits for in-flight jobs (nil in gateway mode)
+	// Stop Asynq server — waits for in-flight jobs (nil in gateway and sortition modes)
 	if s.asynqServer != nil {
 		s.asynqServer.Shutdown()
 	}

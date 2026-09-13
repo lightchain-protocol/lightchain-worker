@@ -26,6 +26,21 @@ type mockRegClient struct {
 	deregisterWorkerFn       func(ctx context.Context) error
 	getMinWorkerStakeFn      func(ctx context.Context) (*big.Int, error)
 	getWorkerEncryptionKeyFn func(ctx context.Context, worker common.Address) ([]byte, error)
+	getCapabilityMaskFn      func(ctx context.Context, name string) (*big.Int, error)
+	getWorkerCapabilitiesFn  func(ctx context.Context, worker common.Address) (*big.Int, error)
+	setCapabilitiesFn        func(ctx context.Context, mask *big.Int) error
+}
+
+func (m *mockRegClient) GetCapabilityMask(ctx context.Context, name string) (*big.Int, error) {
+	return m.getCapabilityMaskFn(ctx, name)
+}
+
+func (m *mockRegClient) GetWorkerCapabilities(ctx context.Context, worker common.Address) (*big.Int, error) {
+	return m.getWorkerCapabilitiesFn(ctx, worker)
+}
+
+func (m *mockRegClient) SetCapabilities(ctx context.Context, mask *big.Int) error {
+	return m.setCapabilitiesFn(ctx, mask)
 }
 
 func (m *mockRegClient) IsWorkerRegistered(ctx context.Context, worker common.Address) (bool, error) {

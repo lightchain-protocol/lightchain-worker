@@ -24,6 +24,11 @@ const (
 	streamLineMaxBytes     = 1024 * 1024
 )
 
+// deterministicSeed is the fixed random seed sent to Ollama alongside
+// temperature=0. Both the worker (original execution) and the disputer
+// (re-execution) rely on greedy decoding being reproducible across services.
+const deterministicSeed = 42
+
 // Options mirrors the Ollama request "options" object. Only the knobs the
 // worker needs are modelled. Every field is omitempty so an unset option
 // leaves the server-side default untouched.
@@ -37,6 +42,10 @@ type Options struct {
 	// pointer so that an explicit 0 (fully deterministic) is
 	// distinguishable from "not set".
 	Temperature *float64 `json:"temperature,omitempty"`
+	// Seed pins the sampler's RNG. Fixed rather than configurable: the
+	// disputer re-executes a job and scores the result by similarity, so
+	// an honest worker's output has to stay reproducible.
+	Seed int `json:"seed,omitempty"`
 }
 
 // GenerateRequest is the JSON body sent to POST /api/generate.
@@ -258,13 +267,20 @@ func NewOllamaClientWithOptions(baseURL string, timeout time.Duration, opts Clie
 // requestOptions returns the options object to embed in a request body, or
 // nil when nothing is configured so the field is omitted entirely.
 func (c *OllamaClient) requestOptions() *Options {
-	if c.opts.NumPredict == 0 && c.opts.NumCtx == 0 && c.opts.Temperature == nil {
-		return nil
+	// Determinism is a protocol property here, not a tuning knob, so the
+	// options object is always sent: an omitted temperature lets Ollama
+	// fall back to its default of 0.8 and a random seed, which is what the
+	// pre-merge testnet client existed to prevent.
+	temperature := c.opts.Temperature
+	if temperature == nil {
+		greedy := 0.0
+		temperature = &greedy
 	}
 	return &Options{
 		NumPredict:  c.opts.NumPredict,
 		NumCtx:      c.opts.NumCtx,
-		Temperature: c.opts.Temperature,
+		Temperature: temperature,
+		Seed:        deterministicSeed,
 	}
 }
 

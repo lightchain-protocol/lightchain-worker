@@ -138,6 +138,77 @@ type ttsRequest struct {
 	Voice  string  `json:"voice"`
 	Speed  float64 `json:"speed"`
 	Stream bool    `json:"stream"`
+	// MaxBytes bounds the encoded MP3 on the settled path. Zero omits it,
+	// which is what the streaming path wants.
+	MaxBytes int `json:"maxBytes,omitempty"`
+}
+
+// readSlack lets an over-limit response be detected and rejected rather than
+// silently cut into a corrupt file by the LimitReader.
+const readSlack = 4096
+
+// SynthesizeSettled returns a COMPLETE MP3 of the whole utterance, bounded to
+// maxBytes, for a job whose answer is the audio itself.
+//
+// Distinct from Synthesize for two reasons. The answer to a speech job is
+// settled on chain, so it has to be one finished file — a stream that ended
+// early would settle as a broken MP3 with nothing to say so. And a settled
+// answer rides a single blob, so size is a hard constraint rather than a
+// preference: the sidecar drops bitrate to fit and truncates only when even
+// its lowest rate will not, reporting that in X-Audio-Truncated.
+func (c *Client) SynthesizeSettled(
+	ctx context.Context,
+	text, voice string,
+	maxBytes int,
+) (audio []byte, truncated bool, err error) {
+	if c.ttsURL == "" {
+		return nil, false, fmt.Errorf("%w: TTS sidecar URL not configured", ErrBadAudio)
+	}
+
+	body, err := json.Marshal(ttsRequest{
+		Text: text, Voice: voice, Speed: 1.0, Stream: false, MaxBytes: maxBytes,
+	})
+	if err != nil {
+		return nil, false, fmt.Errorf("build speech request: %w", err)
+	}
+
+	ctx, cancel := context.WithTimeout(ctx, c.ttsTimeout)
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost,
+		c.ttsURL+"/v1/tts.mp3", bytes.NewReader(body))
+	if err != nil {
+		return nil, false, fmt.Errorf("build speech request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return nil, false, fmt.Errorf("speech request: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		errBody, _ := io.ReadAll(io.LimitReader(resp.Body, maxTranscriptionBody))
+		return nil, false, classifyStatus(resp.StatusCode, errBody)
+	}
+
+	limit := int64(maxBytes) + readSlack
+	audio, err = io.ReadAll(io.LimitReader(resp.Body, limit))
+	if err != nil {
+		return nil, false, fmt.Errorf("read speech response: %w", err)
+	}
+	if len(audio) == 0 {
+		return nil, false, fmt.Errorf("%w: sidecar returned no audio", ErrBadAudio)
+	}
+	if maxBytes > 0 && len(audio) > maxBytes {
+		// Settling this would fail the blob submit AFTER the consumer's fee
+		// is spent, so refuse here while the failure is still cheap.
+		return nil, false, fmt.Errorf(
+			"%w: sidecar returned %d bytes, over the %d limit",
+			ErrBadAudio, len(audio), maxBytes)
+	}
+	return audio, resp.Header.Get("X-Audio-Truncated") == "true", nil
 }
 
 // Synthesize starts a streaming synthesis and returns the PCM chunk stream.

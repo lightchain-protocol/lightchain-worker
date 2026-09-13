@@ -97,6 +97,15 @@ type RegistrationClient interface {
 
 	// GetWorkerEncryptionKey returns the ECDH public key stored on-chain for the given worker.
 	GetWorkerEncryptionKey(ctx context.Context, worker common.Address) ([]byte, error)
+
+	// GetCapabilityMask resolves a capability name to its on-chain bitmask (zero = not registered)..
+	GetCapabilityMask(ctx context.Context, name string) (*big.Int, error)
+
+	// GetWorkerCapabilities returns the declared capability mask for the given worker..
+	GetWorkerCapabilities(ctx context.Context, worker common.Address) (*big.Int, error)
+
+	// SetCapabilities declares the worker's full capability mask (overwrite, not merge)..
+	SetCapabilities(ctx context.Context, mask *big.Int) error
 }
 
 // ValidationClient is the narrow read-only chain interface the sidecar uses at

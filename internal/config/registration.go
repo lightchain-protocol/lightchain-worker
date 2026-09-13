@@ -37,6 +37,12 @@ type RegistrationConfig struct {
 	RedisURL         string
 	WorkerGatewayURL string
 
+	// OllamaURL and BeaconAPIURL are consulted only by the preflight
+	// subcommand. Defaults match the sidecar so preflight probes what the
+	// sidecar will actually dial; preflight --worker blanks them unless set.
+	OllamaURL    string
+	BeaconAPIURL string
+
 	// DrainTTLOverride is parsed from LIGHTCHAIN_DRAIN_TTL. When > 0 it
 	// is used as the drain marker TTL, bypassing the on-chain dispute
 	// window lookup. Both SIGTERM-driven (sidecar) and CLI-driven drain
@@ -74,6 +80,8 @@ func LoadRegistration() (*RegistrationConfig, error) {
 		RPCURL:                 envOrDefault("RPC_URL", "http://localhost:8545"),
 		RedisURL:               os.Getenv("REDIS_URL"),
 		WorkerGatewayURL:       os.Getenv("WORKER_GATEWAY_URL"),
+		OllamaURL:              envOrDefault("OLLAMA_URL", "http://localhost:11434"),
+		BeaconAPIURL:           envOrDefault("BEACON_API_URL", "http://localhost:3500"),
 		LogLevel:               envOrDefault("LOG_LEVEL", "info"),
 		LogFormat:              envOrDefault("LOG_FORMAT", "json"),
 	}

@@ -78,7 +78,7 @@ func TestGenerate_ContextCancelled(t *testing.T) {
 	require.Error(t, err)
 }
 
-func TestGenerate_OmitsKeepAliveAndOptionsByDefault(t *testing.T) {
+func TestGenerate_OmitsKeepAliveButAlwaysSendsDeterministicOptions(t *testing.T) {
 	t.Parallel()
 
 	// NewOllamaClient must reproduce the pre-streaming request body: no
@@ -95,7 +95,9 @@ func TestGenerate_OmitsKeepAliveAndOptionsByDefault(t *testing.T) {
 	require.NoError(t, err)
 
 	assert.NotContains(t, raw, "keep_alive")
-	assert.NotContains(t, raw, "options")
+	assert.Contains(t, raw, "options",
+		"determinism is a protocol property: temperature and seed are always sent")
+	assert.Equal(t, map[string]interface{}{"temperature": float64(0), "seed": float64(42)}, raw["options"])
 }
 
 func TestGenerate_SendsKeepAliveAndOptions(t *testing.T) {

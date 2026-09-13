@@ -51,6 +51,14 @@ type Config struct {
 	OllamaURL     string
 	OllamaTimeout time.Duration
 
+	// Web search (Tavily). SearchEnabled gates advertisement of the "search"
+	// capability and the per-job search stage. When false the worker behaves
+	// exactly as before.
+	SearchEnabled    bool
+	TavilyAPIKey     string
+	TavilyURL        string
+	SearchTimeout    time.Duration
+	SearchMaxResults int
 	// OllamaStream selects stream=true inference. When true the worker
 	// publishes incremental `chunk` frames as tokens arrive, collapsing
 	// time-to-first-token from full generation time to ~1s. The terminal
@@ -163,8 +171,15 @@ type Config struct {
 	TTSEnabled    bool
 	TTSSidecarURL string
 	TTSVoice      string
-	TTSMaxChars   int
-	TTSTimeout    time.Duration
+	// SpeechModelName (SPEECH_MODEL_NAME) is the model whose jobs settle
+	// audio instead of text. A job for it skips the language model entirely
+	// and its answer is a base64 MP3 of the prompt read aloud. Empty
+	// disables the path, so a worker that has not opted in treats the name
+	// like any other model and fails to resolve it, which is correct: it
+	// cannot serve one.
+	SpeechModelName string
+	TTSMaxChars     int
+	TTSTimeout      time.Duration
 
 	// Beacon API (CL node)
 	BeaconAPIURL string
@@ -281,6 +296,30 @@ type Config struct {
 	ReleaseDisputeWindowOverride time.Duration
 	ReleaseDisputeWindowCacheTTL time.Duration
 
+	// Sortition mode (Phase 3 — worker self-claims sessions, no dispatcher).
+	SortitionEnabled       bool
+	SessionManagerAddress  common.Address
+	SortitionStateDir      string
+	SortitionChunkSize     uint64
+	SortitionPollInterval  time.Duration
+	SortitionConfirmations uint64
+	// SortitionHistoryLookbackBlocks bounds the JobSubmitted scan the sortition
+	// JobWatcher uses to reconstruct a session's prior job IDs for conversation
+	// history. Defaults to 50000.
+	SortitionHistoryLookbackBlocks uint64
+	// SortitionSessionLookbackBlocks is how far behind its persisted cursor the
+	// SessionWatcher re-scans on its first pass after a start, so requests it had
+	// discovered but not yet been eligible for are not forgotten by a restart.
+	// Cover how long requests stay Open: the consumer-api default expiry is 1 h
+	// (1800 blocks at 2 s slots, 600 at 6 s); raise it where callers open
+	// requests with longer expiries. Defaults to 2000; 0 disables.
+	SortitionSessionLookbackBlocks uint64
+	// SortitionSessionRetryLimit bounds how many passes the JobWatcher retries
+	// a job whose session is not Active before giving up and skipping it, so
+	// one session that never returns to Active cannot wedge the watcher and
+	// starve every job behind it. Defaults to 10.
+	SortitionSessionRetryLimit int
+
 	// Logging
 	LogLevel  string
 	LogFormat string
@@ -297,6 +336,8 @@ func Load() (*Config, error) {
 		RedisURL:               envOrDefault("REDIS_URL", "redis://localhost:6379"),
 		RedisPassword:          os.Getenv("REDIS_PASSWORD"),
 		OllamaURL:              envOrDefault("OLLAMA_URL", "http://localhost:11434"),
+		TavilyAPIKey:           os.Getenv("TAVILY_API_KEY"),
+		TavilyURL:              envOrDefault("TAVILY_URL", "https://api.tavily.com"),
 		BeaconAPIURL:           envOrDefault("BEACON_API_URL", "http://localhost:3500"),
 		SessionKeyFile:         envOrDefault("SESSION_KEY_FILE", "data/session-keys.enc"),
 		WorkerGatewayURL:       os.Getenv("WORKER_GATEWAY_URL"),
@@ -407,6 +448,9 @@ func Load() (*Config, error) {
 		errs = append(errs, fmt.Sprintf("LIGHTCHAIN_DRAIN_SLACK: must be >= 0, got %s", cfg.DrainSlack))
 	}
 	cfg.OllamaTimeout = parseDuration("OLLAMA_TIMEOUT", "120s", &errs)
+	cfg.SearchEnabled = parseBool("SEARCH_ENABLED", false, &errs)
+	cfg.SearchTimeout = parseDuration("SEARCH_TIMEOUT", "10s", &errs)
+	cfg.SearchMaxResults = parseInt("SEARCH_MAX_RESULTS", 5, &errs)
 	cfg.AckTxTimeout = parseDuration("ACK_TX_TIMEOUT", "15s", &errs)
 	// BlobTxTimeout bounds stage 8 (submit_blob): slot wait + SendTransaction
 	// + WaitMined. Default 90s = ~15 blocks at 6s block time, generous buffer
@@ -453,6 +497,9 @@ func Load() (*Config, error) {
 	cfg.TTSEnabled = parseBool("TTS_ENABLED", false, &errs)
 	cfg.TTSSidecarURL = envOrDefault("TTS_SIDECAR_URL", "http://127.0.0.1:8101")
 	cfg.TTSVoice = envOrDefault("TTS_VOICE", "af_heart")
+	// Defaults to the name the deployed consumer already submits, so a
+	// worker enabling voice serves read-aloud without extra configuration.
+	cfg.SpeechModelName = envOrDefault("SPEECH_MODEL_NAME", "tts-piper")
 	cfg.TTSMaxChars = parseInt("TTS_MAX_CHARS", 4000, &errs)
 	cfg.TTSTimeout = parseDuration("TTS_TIMEOUT", "20s", &errs)
 
@@ -485,6 +532,25 @@ func Load() (*Config, error) {
 	cfg.ReleaseStaleDisputeWarnAfter = parseDuration("RELEASE_STALE_DISPUTE_WARN_AFTER", "168h", &errs)
 	cfg.ReleaseDisputeWindowOverride = parseDuration("RELEASE_DISPUTE_WINDOW_OVERRIDE", "0s", &errs)
 	cfg.ReleaseDisputeWindowCacheTTL = parseDuration("RELEASE_DISPUTE_WINDOW_CACHE_TTL", "15m", &errs)
+
+	// Sortition mode (Phase 3 — worker self-claims sessions, no dispatcher).
+	cfg.SortitionEnabled = parseBool("SORTITION_ENABLED", false, &errs)
+	smStr := os.Getenv("SESSION_MANAGER_ADDRESS")
+	switch {
+	case smStr == "":
+		// optional unless sortition enabled (checked in Validate)
+	case !common.IsHexAddress(smStr):
+		errs = append(errs, fmt.Sprintf("SESSION_MANAGER_ADDRESS: invalid hex address %q", smStr))
+	default:
+		cfg.SessionManagerAddress = common.HexToAddress(smStr)
+	}
+	cfg.SortitionStateDir = envOrDefault("SORTITION_STATE_DIR", "data/sortition-state")
+	cfg.SortitionChunkSize = parseUint64("SORTITION_CHUNK_SIZE", 5000, &errs)
+	cfg.SortitionPollInterval = parseDuration("SORTITION_POLL_INTERVAL", "4s", &errs)
+	cfg.SortitionConfirmations = parseUint64("SORTITION_CONFIRMATIONS", 0, &errs)
+	cfg.SortitionHistoryLookbackBlocks = parseUint64("SORTITION_HISTORY_LOOKBACK_BLOCKS", 50000, &errs)
+	cfg.SortitionSessionLookbackBlocks = parseUint64("SORTITION_SESSION_LOOKBACK_BLOCKS", 2000, &errs)
+	cfg.SortitionSessionRetryLimit = parseInt("SORTITION_SESSION_RETRY_LIMIT", 10, &errs)
 
 	if len(errs) > 0 {
 		return nil, fmt.Errorf("config load errors:\n  - %s", strings.Join(errs, "\n  - "))
@@ -534,6 +600,17 @@ func (c *Config) Validate() []string {
 	}
 	if c.OllamaTimeout <= 0 {
 		errs = append(errs, "OLLAMA_TIMEOUT must be positive")
+	}
+	if c.SearchEnabled {
+		if c.TavilyAPIKey == "" {
+			errs = append(errs, "TAVILY_API_KEY is required when SEARCH_ENABLED=true")
+		}
+		if c.SearchTimeout <= 0 {
+			errs = append(errs, "SEARCH_TIMEOUT must be positive")
+		}
+		if c.SearchMaxResults <= 0 {
+			errs = append(errs, "SEARCH_MAX_RESULTS must be positive")
+		}
 	}
 	if c.AckTxTimeout <= 0 {
 		errs = append(errs, "ACK_TX_TIMEOUT must be positive")
@@ -659,6 +736,11 @@ func (c *Config) Validate() []string {
 		if c.ReleaseDisputeWindowCacheTTL < 0 {
 			errs = append(errs, "RELEASE_DISPUTE_WINDOW_CACHE_TTL must be ≥ 0")
 		}
+	}
+
+	// Sortition mode cross-field validation.
+	if c.SortitionEnabled && c.SessionManagerAddress == (common.Address{}) {
+		errs = append(errs, "SESSION_MANAGER_ADDRESS is required when SORTITION_ENABLED=true")
 	}
 
 	return errs
