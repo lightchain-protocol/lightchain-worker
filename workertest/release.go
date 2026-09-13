@@ -118,6 +118,7 @@ func NewReleaseTester(t testing.TB, opts ReleaseTesterOptions) *ReleaseTester {
 		opts.WorkerRegistryAddress,
 		opts.AIConfigAddress,
 		opts.JobRegistryAddress,
+		common.Address{}, // sessionManagerAddr: not used in release test harness
 		opts.SigningKey,
 		opts.GasPriceMultiplierBps,
 		workerchain.NewSubpoolCoordinator(nil, 0),

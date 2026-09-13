@@ -3,9 +3,11 @@ package chain
 import (
 	"context"
 	"crypto/ecdsa"
+	"errors"
 	"fmt"
 	"log/slog"
 	"math/big"
+	"sort"
 	"sync"
 	"time"
 
@@ -46,6 +48,7 @@ type ChainClient struct {
 	aiConfig        *bindings.AIConfig
 	jobRegistry     *bindings.JobRegistry
 	jobRegistryAddr common.Address
+	sessionManager  *bindings.SessionManager
 	signingKey      *ecdsa.PrivateKey
 	workerAddr      common.Address
 	chainID         *big.Int
@@ -87,6 +90,7 @@ func NewChainClient(
 	registryAddr common.Address,
 	aiConfigAddr common.Address,
 	jobRegistryAddr common.Address,
+	sessionManagerAddr common.Address,
 	signingKey *ecdsa.PrivateKey,
 	gasMulBps int,
 	coordinator *SubpoolCoordinator,
@@ -128,6 +132,15 @@ func NewChainClient(
 		}
 	}
 
+	var sessMgr *bindings.SessionManager
+	if sessionManagerAddr != (common.Address{}) {
+		sessMgr, err = bindings.NewSessionManager(sessionManagerAddr, client)
+		if err != nil {
+			client.Close()
+			return nil, fmt.Errorf("bind SessionManager at %s: %w", sessionManagerAddr.Hex(), err)
+		}
+	}
+
 	workerAddr := crypto.PubkeyToAddress(signingKey.PublicKey)
 	nonceMgr := NewNonceManager(client, workerAddr)
 
@@ -138,6 +151,7 @@ func NewChainClient(
 		aiConfig:        aiCfg,
 		jobRegistry:     jobReg,
 		jobRegistryAddr: jobRegistryAddr,
+		sessionManager:  sessMgr,
 		signingKey:      signingKey,
 		workerAddr:      workerAddr,
 		chainID:         big.NewInt(chainID),
@@ -199,6 +213,23 @@ func (c *ChainClient) AddSupportedModel(ctx context.Context, modelID [32]byte) e
 	return c.submitPreparedTx(ctx, "AddSupportedModel", nil, func(opts *bind.TransactOpts) (*types.Transaction, error) {
 		return c.registry.AddSupportedModel(opts, modelID)
 	})
+}
+
+// SetCapabilities declares this worker's full on-chain capability mask (overwrite, not merge)..
+func (c *ChainClient) SetCapabilities(ctx context.Context, mask *big.Int) error {
+	return c.submitPreparedTx(ctx, "SetCapabilities", nil, func(opts *bind.TransactOpts) (*types.Transaction, error) {
+		return c.registry.SetCapabilities(opts, mask)
+	})
+}
+
+// GetWorkerCapabilities reads the declared capability mask for the given worker..
+func (c *ChainClient) GetWorkerCapabilities(ctx context.Context, worker common.Address) (*big.Int, error) {
+	return c.registry.GetWorkerCapabilities(&bind.CallOpts{Context: ctx}, worker)
+}
+
+// GetCapabilityMask resolves a capability name to its bitmask (zero = not registered on-chain)..
+func (c *ChainClient) GetCapabilityMask(ctx context.Context, name string) (*big.Int, error) {
+	return c.registry.GetCapabilityMask(&bind.CallOpts{Context: ctx}, name)
 }
 
 // DeregisterWorker submits a deregisterWorker transaction, withdrawing all stake.
@@ -533,6 +564,45 @@ func (c *ChainClient) requireJobRegistry() error {
 	return nil
 }
 
+// requireSessionManager returns an error if the sessionManager binding is nil.
+// All sortition-facing methods must call this before dereferencing c.sessionManager.
+func (c *ChainClient) requireSessionManager() error {
+	if c.sessionManager == nil {
+		return fmt.Errorf("session manager binding not configured")
+	}
+	return nil
+}
+
+// ClaimSession sends a claimSession tx for the given request id (sortition claim).
+func (c *ChainClient) ClaimSession(ctx context.Context, reqID uint64) error {
+	if err := c.requireSessionManager(); err != nil {
+		return err
+	}
+	return c.submitPreparedTx(ctx, "ClaimSession", nil, func(opts *bind.TransactOpts) (*types.Transaction, error) {
+		return c.sessionManager.ClaimSession(opts, new(big.Int).SetUint64(reqID))
+	})
+}
+
+// GetRequiredCapabilities reads a session request's required-capability mask (zero = unconstrained)..
+func (c *ChainClient) GetRequiredCapabilities(ctx context.Context, reqID uint64) (*big.Int, error) {
+	if err := c.requireSessionManager(); err != nil {
+		return nil, err
+	}
+	return c.sessionManager.GetRequiredCapabilities(&bind.CallOpts{Context: ctx}, new(big.Int).SetUint64(reqID))
+}
+
+// EligibleNow returns whether `worker` currently clears the sortition threshold for the request.
+func (c *ChainClient) EligibleNow(ctx context.Context, reqID uint64, worker common.Address) (bool, error) {
+	if err := c.requireSessionManager(); err != nil {
+		return false, err
+	}
+	ok, err := c.sessionManager.EligibleNow(&bind.CallOpts{Context: ctx}, new(big.Int).SetUint64(reqID), worker)
+	if err != nil {
+		return false, fmt.Errorf("eligibleNow req %d worker %s: %w", reqID, worker.Hex(), err)
+	}
+	return ok, nil
+}
+
 // AcknowledgeJob submits an acknowledgeJob transaction for the given job ID
 // and blocks until it is mined.
 func (c *ChainClient) AcknowledgeJob(ctx context.Context, jobID uint64) error {
@@ -644,6 +714,21 @@ func (c *ChainClient) HasJobCompleted(ctx context.Context, jobID uint64) (bool, 
 // Source: contracts/src/interfaces/IJobRegistry.sol â€” enum SessionStatus { Active, ... }
 const sessionStatusActive uint8 = 0
 
+// ErrSessionNotActive marks a session that is not in Active status — a
+// condition retrying cannot fix from the worker's side (Closed, or
+// Reassigning away from this worker). Callers classify it as permanent
+// (bounded retry, then skip) rather than transient (unlimited retry).
+var ErrSessionNotActive = errors.New("session not active")
+
+// sessionNotActiveErr builds the ErrSessionNotActive-wrapped error returned
+// by GetSessionEncWorkerKey when a session's status is not Active. Split out
+// from GetSessionEncWorkerKey so the classification is unit-testable without
+// a live chain backend (jobRegistry is a concrete generated binding with no
+// mockable interface seam).
+func sessionNotActiveErr(sessionID uint64, status uint8) error {
+	return fmt.Errorf("session %d: %w (status=%d)", sessionID, ErrSessionNotActive, status)
+}
+
 // GetSessionEncWorkerKey retrieves the current encrypted worker key for a session
 // from JobRegistry session storage. Sessions that are not currently Active are
 // blocked until on-chain failover has completed.
@@ -656,7 +741,7 @@ func (c *ChainClient) GetSessionEncWorkerKey(ctx context.Context, sessionID uint
 		return nil, fmt.Errorf("GetSession %d: %w", sessionID, err)
 	}
 	if sess.Status != sessionStatusActive {
-		return nil, fmt.Errorf("session %d not active: status=%d", sessionID, sess.Status)
+		return nil, sessionNotActiveErr(sessionID, sess.Status)
 	}
 	encWorkerKey := sess.EncWorkerKey
 	if len(encWorkerKey) == 0 {
@@ -914,4 +999,256 @@ func (c *ChainClient) FilterJobCompleted(
 		return nil, fmt.Errorf("iterate JobCompleted [%d..%d]: %w", fromBlock, toBlock, err)
 	}
 	return events, nil
+}
+
+// SessionRequestedEvent is the decoded view of the on-chain SessionRequested
+// log. ReqID and ModelID use Go-idiomatic casing even though the abigen struct
+// uses ReqId/ModelId.
+type SessionRequestedEvent struct {
+	ReqID        uint64
+	User         common.Address
+	ModelID      [32]byte
+	RequestBlock uint64
+	BlockNumber  uint64
+}
+
+// JobSubmittedEvent is the decoded view of the on-chain JobSubmitted log.
+type JobSubmittedEvent struct {
+	JobID       uint64
+	SessionID   uint64
+	Worker      common.Address
+	BlockNumber uint64
+}
+
+// SessionInfo is a trimmed view of IJobRegistrySession returned by GetSession.
+type SessionInfo struct {
+	User    common.Address
+	ModelID [32]byte
+	Worker  common.Address
+	Status  uint8
+}
+
+// RequestInfo is the subset of on-chain SessionManager.Request storage the
+// SessionWatcher needs to decide whether a pending request is still actionable.
+// ReqStatus enum on-chain: Open=0, Claimed=1, Ready=2, Expired=3.
+type RequestInfo struct {
+	Status uint8
+	Expiry uint64
+	Worker common.Address
+}
+
+// FilterSessionRequested returns all SessionRequested events emitted by the
+// SessionManager contract in [fromBlock, toBlock] (both inclusive). No indexed
+// filter is applied — the caller is expected to further filter by reqId/user/modelId
+// as needed.
+func (c *ChainClient) FilterSessionRequested(ctx context.Context, fromBlock, toBlock uint64) ([]SessionRequestedEvent, error) {
+	if toBlock < fromBlock {
+		return nil, fmt.Errorf("FilterSessionRequested: toBlock %d < fromBlock %d", toBlock, fromBlock)
+	}
+	if err := c.requireSessionManager(); err != nil {
+		return nil, err
+	}
+	end := toBlock
+	opts := &bind.FilterOpts{Context: ctx, Start: fromBlock, End: &end}
+	iter, err := c.sessionManager.FilterSessionRequested(opts, nil, nil, nil)
+	if err != nil {
+		return nil, fmt.Errorf("filter SessionRequested [%d,%d]: %w", fromBlock, toBlock, err)
+	}
+	defer iter.Close()
+	var out []SessionRequestedEvent
+	for iter.Next() {
+		ev := iter.Event
+		if ev == nil || ev.ReqId == nil {
+			continue
+		}
+		out = append(out, SessionRequestedEvent{
+			ReqID:        ev.ReqId.Uint64(),
+			User:         ev.User,
+			ModelID:      ev.ModelId,
+			RequestBlock: ev.RequestBlock.Uint64(),
+			BlockNumber:  ev.Raw.BlockNumber,
+		})
+	}
+	if err := iter.Error(); err != nil {
+		return nil, fmt.Errorf("iterate SessionRequested [%d,%d]: %w", fromBlock, toBlock, err)
+	}
+	return out, nil
+}
+
+// FilterJobSubmitted returns all JobSubmitted events in [fromBlock, toBlock]
+// (both inclusive). No indexed filter is applied — callers that need only jobs
+// for a specific worker must filter the returned slice themselves.
+func (c *ChainClient) FilterJobSubmitted(ctx context.Context, fromBlock, toBlock uint64) ([]JobSubmittedEvent, error) {
+	if toBlock < fromBlock {
+		return nil, fmt.Errorf("FilterJobSubmitted: toBlock %d < fromBlock %d", toBlock, fromBlock)
+	}
+	if err := c.requireJobRegistry(); err != nil {
+		return nil, err
+	}
+	end := toBlock
+	opts := &bind.FilterOpts{Context: ctx, Start: fromBlock, End: &end}
+	iter, err := c.jobRegistry.FilterJobSubmitted(opts, nil, nil)
+	if err != nil {
+		return nil, fmt.Errorf("filter JobSubmitted [%d,%d]: %w", fromBlock, toBlock, err)
+	}
+	defer iter.Close()
+	var out []JobSubmittedEvent
+	for iter.Next() {
+		ev := iter.Event
+		if ev == nil || ev.JobId == nil {
+			continue
+		}
+		out = append(out, JobSubmittedEvent{
+			JobID:       ev.JobId.Uint64(),
+			SessionID:   ev.SessionId.Uint64(),
+			Worker:      ev.Worker,
+			BlockNumber: ev.Raw.BlockNumber,
+		})
+	}
+	if err := iter.Error(); err != nil {
+		return nil, fmt.Errorf("iterate JobSubmitted [%d,%d]: %w", fromBlock, toBlock, err)
+	}
+	return out, nil
+}
+
+// GetPriorSessionJobIDs returns the ascending list of job IDs submitted for
+// sessionID strictly before currentJobID, scanning JobSubmitted events (indexed
+// by sessionId) in [fromBlock, toBlock]. Used by the sortition JobWatcher to
+// reconstruct the conversation-history job list the dispatcher used to supply.
+func (c *ChainClient) GetPriorSessionJobIDs(ctx context.Context, sessionID, currentJobID, fromBlock, toBlock uint64) ([]uint64, error) {
+	if toBlock < fromBlock {
+		return nil, fmt.Errorf("GetPriorSessionJobIDs: toBlock %d < fromBlock %d", toBlock, fromBlock)
+	}
+	if err := c.requireJobRegistry(); err != nil {
+		return nil, err
+	}
+	end := toBlock
+	opts := &bind.FilterOpts{Context: ctx, Start: fromBlock, End: &end}
+	sid := []*big.Int{new(big.Int).SetUint64(sessionID)}
+	iter, err := c.jobRegistry.FilterJobSubmitted(opts, nil, sid)
+	if err != nil {
+		return nil, fmt.Errorf("filter JobSubmitted session %d [%d,%d]: %w", sessionID, fromBlock, toBlock, err)
+	}
+	defer iter.Close()
+	var out []uint64
+	for iter.Next() {
+		ev := iter.Event
+		if ev == nil || ev.JobId == nil {
+			continue
+		}
+		if jid := ev.JobId.Uint64(); jid < currentJobID {
+			out = append(out, jid)
+		}
+	}
+	if err := iter.Error(); err != nil {
+		return nil, fmt.Errorf("iterate JobSubmitted session %d: %w", sessionID, err)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i] < out[j] })
+	return out, nil
+}
+
+// GetSessionInfo fetches session metadata for the given session ID from the
+// JobRegistry. Only the fields needed by the sortition watcher are returned.
+func (c *ChainClient) GetSessionInfo(ctx context.Context, sessionID uint64) (SessionInfo, error) {
+	if err := c.requireJobRegistry(); err != nil {
+		return SessionInfo{}, err
+	}
+	s, err := c.jobRegistry.GetSession(&bind.CallOpts{Context: ctx}, new(big.Int).SetUint64(sessionID))
+	if err != nil {
+		return SessionInfo{}, fmt.Errorf("GetSession %d: %w", sessionID, err)
+	}
+	return SessionInfo{
+		User:    s.User,
+		ModelID: s.ModelId,
+		Worker:  s.Worker,
+		Status:  s.Status,
+	}, nil
+}
+
+// GetRequestInfo fetches the status, expiry, and assigned worker for the given
+// sortition request ID from the SessionManager contract. Used by the SessionWatcher
+// to re-evaluate pending requests across multiple poll passes.
+func (c *ChainClient) GetRequestInfo(ctx context.Context, reqID uint64) (RequestInfo, error) {
+	if err := c.requireSessionManager(); err != nil {
+		return RequestInfo{}, err
+	}
+	r, err := c.sessionManager.GetRequest(&bind.CallOpts{Context: ctx}, new(big.Int).SetUint64(reqID))
+	if err != nil {
+		return RequestInfo{}, fmt.Errorf("getRequest %d: %w", reqID, err)
+	}
+	return RequestInfo{Status: r.Status, Expiry: r.Expiry, Worker: r.Worker}, nil
+}
+
+// --- Read-only helpers used by the operator CLI preflight ---
+
+// ChainID returns the chain id reported by the RPC endpoint (eth_chainId).
+func (c *ChainClient) ChainID(ctx context.Context) (*big.Int, error) {
+	id, err := c.ethClient.ChainID(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("ChainID: %w", err)
+	}
+	return id, nil
+}
+
+// Balance returns the native-token balance of addr at the latest block.
+func (c *ChainClient) Balance(ctx context.Context, addr common.Address) (*big.Int, error) {
+	bal, err := c.ethClient.BalanceAt(ctx, addr, nil)
+	if err != nil {
+		return nil, fmt.Errorf("BalanceAt %s: %w", addr.Hex(), err)
+	}
+	return bal, nil
+}
+
+// IsWorkerSuspended reports whether the worker is currently serving a suspension cooldown.
+func (c *ChainClient) IsWorkerSuspended(ctx context.Context, worker common.Address) (bool, error) {
+	v, err := c.registry.IsWorkerSuspended(&bind.CallOpts{Context: ctx}, worker)
+	if err != nil {
+		return false, fmt.Errorf("IsWorkerSuspended %s: %w", worker.Hex(), err)
+	}
+	return v, nil
+}
+
+// GetOffenseCount returns the worker's recorded offense count.
+func (c *ChainClient) GetOffenseCount(ctx context.Context, worker common.Address) (*big.Int, error) {
+	v, err := c.registry.GetOffenseCount(&bind.CallOpts{Context: ctx}, worker)
+	if err != nil {
+		return nil, fmt.Errorf("GetOffenseCount %s: %w", worker.Hex(), err)
+	}
+	return v, nil
+}
+
+// GetWorkerStake returns the worker's currently staked amount in wei.
+func (c *ChainClient) GetWorkerStake(ctx context.Context, worker common.Address) (*big.Int, error) {
+	v, err := c.registry.GetWorkerStake(&bind.CallOpts{Context: ctx}, worker)
+	if err != nil {
+		return nil, fmt.Errorf("GetWorkerStake %s: %w", worker.Hex(), err)
+	}
+	return v, nil
+}
+
+// IsModelWhitelisted reports whether the model id may be registered by workers.
+func (c *ChainClient) IsModelWhitelisted(ctx context.Context, modelID [32]byte) (bool, error) {
+	v, err := c.registry.IsModelWhitelisted(&bind.CallOpts{Context: ctx}, modelID)
+	if err != nil {
+		return false, fmt.Errorf("IsModelWhitelisted: %w", err)
+	}
+	return v, nil
+}
+
+// IsModelEnabled reports whether AIConfig currently enables the model.
+func (c *ChainClient) IsModelEnabled(ctx context.Context, modelID [32]byte) (bool, error) {
+	v, err := c.aiConfig.IsModelEnabled(&bind.CallOpts{Context: ctx}, modelID)
+	if err != nil {
+		return false, fmt.Errorf("IsModelEnabled: %w", err)
+	}
+	return v, nil
+}
+
+// WorkerSupportsModel reports whether the worker has added the model on-chain.
+func (c *ChainClient) WorkerSupportsModel(ctx context.Context, worker common.Address, modelID [32]byte) (bool, error) {
+	v, err := c.registry.WorkerSupportsModel(&bind.CallOpts{Context: ctx}, worker, modelID)
+	if err != nil {
+		return false, fmt.Errorf("WorkerSupportsModel %s: %w", worker.Hex(), err)
+	}
+	return v, nil
 }

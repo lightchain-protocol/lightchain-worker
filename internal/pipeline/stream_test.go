@@ -187,6 +187,8 @@ func (p *capturingPublisher) PublishChunk(
 	p.frames = append(p.frames, capturedFrame{seq: sequence, kind: kind, body: string(plain)})
 }
 
+func (p *capturingPublisher) PublishMetadata(context.Context, uint64, uint64, string, []byte) {}
+
 func (p *capturingPublisher) SupportsChunks() bool { return true }
 
 var testStreamKey = bytes.Repeat([]byte{7}, 32)

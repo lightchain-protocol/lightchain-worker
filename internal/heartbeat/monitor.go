@@ -48,15 +48,16 @@ type MonitorConfig struct {
 
 // Monitor publishes periodic heartbeat payloads to Redis.
 type Monitor struct {
-	redisClient *redis.Client
-	cfg         MonitorConfig
-	workerAddr  string   // EIP-55 checksummed hex, no 0x prefix
-	modelIDs    []string // 0x-prefixed lowercase hex bytes32
-	startedAt   time.Time
-	httpClient  *http.Client
-	logger      *slog.Logger
-	jobCounter  *atomic.Int32
-	maxJobs     int
+	redisClient  *redis.Client
+	cfg          MonitorConfig
+	workerAddr   string   // EIP-55 checksummed hex, no 0x prefix
+	modelIDs     []string // 0x-prefixed lowercase hex bytes32
+	capabilities []string // advertised capability tokens, e.g. ["search"]
+	startedAt    time.Time
+	httpClient   *http.Client
+	logger       *slog.Logger
+	jobCounter   *atomic.Int32
+	maxJobs      int
 	// metrics is optional — when nil the monitor still writes to Redis but
 	// does not update OllamaUp / HeartbeatLastEmit. Production constructs
 	// always pass non-nil; some tests pass nil to keep them focused.
@@ -78,23 +79,25 @@ func NewMonitor(
 	cfg MonitorConfig,
 	workerAddr string,
 	modelIDs []string,
+	capabilities []string,
 	jobCounter *atomic.Int32,
 	maxJobs int,
 	logger *slog.Logger,
 	metricsCollector *metrics.Metrics,
 ) *Monitor {
 	return &Monitor{
-		redisClient: redisClient,
-		cfg:         cfg,
-		workerAddr:  workerAddr,
-		modelIDs:    modelIDs,
-		startedAt:   time.Now(),
-		httpClient:  &http.Client{Timeout: 2 * time.Second},
-		logger:      logger,
-		jobCounter:  jobCounter,
-		maxJobs:     maxJobs,
-		metrics:     metricsCollector,
-		done:        make(chan struct{}),
+		redisClient:  redisClient,
+		cfg:          cfg,
+		workerAddr:   workerAddr,
+		modelIDs:     modelIDs,
+		capabilities: capabilities,
+		startedAt:    time.Now(),
+		httpClient:   &http.Client{Timeout: 2 * time.Second},
+		logger:       logger,
+		jobCounter:   jobCounter,
+		maxJobs:      maxJobs,
+		metrics:      metricsCollector,
+		done:         make(chan struct{}),
 	}
 }
 
@@ -162,20 +165,31 @@ func (m *Monitor) emit(ctx context.Context) error {
 		return fmt.Errorf("marshal model IDs: %w", err)
 	}
 
+	caps := m.capabilities
+	if caps == nil {
+		caps = []string{}
+	}
+	capsJSON, err := json.Marshal(caps)
+	if err != nil {
+		return fmt.Errorf("marshal capabilities: %w", err)
+	}
+
 	ttl := 3 * m.cfg.Interval
 	key := pkgtypes.HeartbeatRedisKey(m.workerAddr)
 
 	pipe := m.redisClient.TxPipeline()
 	pipe.HSet(ctx, key, map[string]interface{}{
-		pkgtypes.HBFieldLastHeartbeat: time.Now().Unix(),
-		pkgtypes.HBFieldActiveJobs:    activeJobs,
-		pkgtypes.HBFieldMaxJobs:       m.maxJobs,
-		pkgtypes.HBFieldLatencyMs:     0,
-		pkgtypes.HBFieldGPUUtil:       strconv.FormatFloat(0, 'f', -1, 64),
-		pkgtypes.HBFieldStatus:        pkgtypes.HeartbeatStatusActive,
-		pkgtypes.HBFieldModels:        string(modelsJSON),
-		pkgtypes.HBFieldOllamaStatus:  ollamaStatus,
-		pkgtypes.HBFieldUptime:        int64(time.Since(m.startedAt).Seconds()),
+		pkgtypes.HBFieldLastHeartbeat:   time.Now().Unix(),
+		pkgtypes.HBFieldActiveJobs:      activeJobs,
+		pkgtypes.HBFieldMaxJobs:         m.maxJobs,
+		pkgtypes.HBFieldLatencyMs:       0,
+		pkgtypes.HBFieldGPUUtil:         strconv.FormatFloat(0, 'f', -1, 64),
+		pkgtypes.HBFieldStatus:          pkgtypes.HeartbeatStatusActive,
+		pkgtypes.HBFieldModels:          string(modelsJSON),
+		pkgtypes.HBFieldOllamaStatus:    ollamaStatus,
+		pkgtypes.HBFieldUptime:          int64(time.Since(m.startedAt).Seconds()),
+		pkgtypes.HBFieldCapabilities:    string(capsJSON),
+		pkgtypes.HBFieldProtocolVersion: pkgtypes.WorkerProtocolVersion,
 	})
 	pipe.PExpire(ctx, key, ttl)
 

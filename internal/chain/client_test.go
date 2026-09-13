@@ -3,6 +3,7 @@ package chain
 import (
 	"context"
 	"errors"
+	"fmt"
 	"math/big"
 	"sync"
 	"testing"
@@ -17,8 +18,10 @@ import (
 )
 
 // Compile-time assertions: ChainClient must satisfy both interfaces.
-var _ RegistrationClient = (*ChainClient)(nil)
-var _ JobExecutionClient = (*ChainClient)(nil)
+var (
+	_ RegistrationClient = (*ChainClient)(nil)
+	_ JobExecutionClient = (*ChainClient)(nil)
+)
 
 // MockRegistrationClient is a hand-rolled mock for RegistrationClient.
 // All fields are function vars so tests can inject return values without a mock library.
@@ -29,6 +32,21 @@ type MockRegistrationClient struct {
 	DeregisterWorkerFn       func(ctx context.Context) error
 	GetMinWorkerStakeFn      func(ctx context.Context) (*big.Int, error)
 	GetWorkerEncryptionKeyFn func(ctx context.Context, worker common.Address) ([]byte, error)
+	GetCapabilityMaskFn      func(ctx context.Context, name string) (*big.Int, error)
+	GetWorkerCapabilitiesFn  func(ctx context.Context, worker common.Address) (*big.Int, error)
+	SetCapabilitiesFn        func(ctx context.Context, mask *big.Int) error
+}
+
+func (m *MockRegistrationClient) GetCapabilityMask(ctx context.Context, name string) (*big.Int, error) {
+	return m.GetCapabilityMaskFn(ctx, name)
+}
+
+func (m *MockRegistrationClient) GetWorkerCapabilities(ctx context.Context, worker common.Address) (*big.Int, error) {
+	return m.GetWorkerCapabilitiesFn(ctx, worker)
+}
+
+func (m *MockRegistrationClient) SetCapabilities(ctx context.Context, mask *big.Int) error {
+	return m.SetCapabilitiesFn(ctx, mask)
 }
 
 func (m *MockRegistrationClient) IsWorkerRegistered(ctx context.Context, worker common.Address) (bool, error) {
@@ -435,4 +453,133 @@ func (e mockRPCError) Error() string {
 
 func (e mockRPCError) ErrorCode() int {
 	return e.code
+}
+
+// TestChainClient_ClaimSession_NoBindingErrors verifies that a ChainClient
+// without a SessionManager binding returns an error rather than panicking.
+func TestChainClient_ClaimSession_NoBindingErrors(t *testing.T) {
+	t.Parallel()
+	c := &ChainClient{}
+	err := c.ClaimSession(context.Background(), 1)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "session manager binding not configured")
+}
+
+// TestChainClient_EligibleNow_NoBindingErrors verifies that a ChainClient
+// without a SessionManager binding returns an error rather than panicking.
+func TestChainClient_EligibleNow_NoBindingErrors(t *testing.T) {
+	t.Parallel()
+	c := &ChainClient{}
+	_, err := c.EligibleNow(context.Background(), 1, common.Address{})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "session manager binding not configured")
+}
+
+// TestChainClient_FilterSessionRequested_RangeGuard verifies that a range
+// where toBlock < fromBlock is rejected immediately.
+func TestChainClient_FilterSessionRequested_RangeGuard(t *testing.T) {
+	t.Parallel()
+	c := &ChainClient{}
+	_, err := c.FilterSessionRequested(context.Background(), 10, 5) // to < from
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "toBlock")
+}
+
+// TestChainClient_FilterSessionRequested_NoBindingErrors verifies that a
+// ChainClient without a SessionManager binding returns an error.
+func TestChainClient_FilterSessionRequested_NoBindingErrors(t *testing.T) {
+	t.Parallel()
+	c := &ChainClient{}
+	_, err := c.FilterSessionRequested(context.Background(), 1, 10) // valid range
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "session manager binding not configured")
+}
+
+// TestChainClient_FilterJobSubmitted_RangeGuard verifies that a range
+// where toBlock < fromBlock is rejected immediately.
+func TestChainClient_FilterJobSubmitted_RangeGuard(t *testing.T) {
+	t.Parallel()
+	c := &ChainClient{}
+	_, err := c.FilterJobSubmitted(context.Background(), 10, 5) // to < from
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "toBlock")
+}
+
+// TestChainClient_FilterJobSubmitted_NoBindingErrors verifies that a
+// ChainClient without a JobRegistry binding returns an error.
+func TestChainClient_FilterJobSubmitted_NoBindingErrors(t *testing.T) {
+	t.Parallel()
+	c := &ChainClient{}
+	_, err := c.FilterJobSubmitted(context.Background(), 1, 10) // valid range
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "jobRegistry not configured")
+}
+
+// TestChainClient_GetPriorSessionJobIDs_RangeGuard verifies that a range
+// where toBlock < fromBlock is rejected immediately.
+func TestChainClient_GetPriorSessionJobIDs_RangeGuard(t *testing.T) {
+	t.Parallel()
+	c := &ChainClient{}
+	_, err := c.GetPriorSessionJobIDs(context.Background(), 10, 5, 10, 5) // to < from
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "toBlock")
+}
+
+// TestChainClient_GetPriorSessionJobIDs_NoBindingErrors verifies that a
+// ChainClient without a JobRegistry binding returns an error rather than
+// panicking.
+func TestChainClient_GetPriorSessionJobIDs_NoBindingErrors(t *testing.T) {
+	t.Parallel()
+	c := &ChainClient{}
+	_, err := c.GetPriorSessionJobIDs(context.Background(), 10, 5, 1, 10) // valid range
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "jobRegistry not configured")
+}
+
+// TestChainClient_GetSessionInfo_NoBindingErrors verifies that a ChainClient
+// without a JobRegistry binding returns an error rather than panicking.
+func TestChainClient_GetSessionInfo_NoBindingErrors(t *testing.T) {
+	t.Parallel()
+	c := &ChainClient{}
+	_, err := c.GetSessionInfo(context.Background(), 1)
+	require.Error(t, err)
+}
+
+// TestChainClient_GetRequestInfo_NoBindingErrors verifies that a ChainClient
+// without a SessionManager binding returns an error rather than panicking.
+func TestChainClient_GetRequestInfo_NoBindingErrors(t *testing.T) {
+	t.Parallel()
+	c := &ChainClient{}
+	_, err := c.GetRequestInfo(context.Background(), 1)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "session manager binding not configured")
+}
+
+// TestSessionNotActiveErr_MatchesSentinel verifies that the error
+// GetSessionEncWorkerKey returns for a non-Active session is matchable via
+// errors.Is(err, ErrSessionNotActive), and carries sessionID+status context.
+// sessionNotActiveErr is the exact helper GetSessionEncWorkerKey calls, so
+// this exercises the real classification logic without needing a live/mock
+// chain backend (jobRegistry is a concrete *bindings.JobRegistry with no
+// interface seam — see the "NoBindingErrors" tests above).
+func TestSessionNotActiveErr_MatchesSentinel(t *testing.T) {
+	t.Parallel()
+	err := sessionNotActiveErr(42, 2)
+	require.True(t, errors.Is(err, ErrSessionNotActive), "must satisfy errors.Is(err, ErrSessionNotActive)")
+	require.Contains(t, err.Error(), "42")
+	require.Contains(t, err.Error(), "status=2")
+}
+
+// TestSessionNotActiveErr_RPCFailureDoesNotMatchSentinel verifies that a
+// plain RPC failure — wrapped the same way GetSessionEncWorkerKey wraps the
+// GetSession() call error — does NOT satisfy errors.Is(err,
+// ErrSessionNotActive). Only the explicit non-Active-status branch produces a
+// sentinel-matchable error; a transient RPC error must keep retrying forever
+// (stop-and-retry), never hit the bounded-retry skip path.
+func TestSessionNotActiveErr_RPCFailureDoesNotMatchSentinel(t *testing.T) {
+	t.Parallel()
+	rpcErr := errors.New("dial tcp: i/o timeout")
+	wrapped := fmt.Errorf("GetSession %d: %w", 42, rpcErr)
+	require.False(t, errors.Is(wrapped, ErrSessionNotActive))
+	require.True(t, errors.Is(wrapped, rpcErr))
 }

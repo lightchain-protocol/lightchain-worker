@@ -24,10 +24,12 @@ import (
 	"golang.org/x/sync/singleflight"
 
 	pkgcrypto "github.com/lightchain/pkg/crypto"
+	"github.com/lightchain/pkg/searchaug"
 	pkgtypes "github.com/lightchain/pkg/types"
 
 	"github.com/lightchain/worker/internal/metrics"
 	"github.com/lightchain/worker/internal/ollama"
+	"github.com/lightchain/worker/internal/search"
 )
 
 // SessionKeyGetter retrieves and stores session keys.
@@ -75,7 +77,7 @@ type JobExecutionClient interface {
 	// CompleteJob submits a completeJob TX with a single bytes32 response blob hash.
 	// The contract enforces `blobhash(0) == responseBlobHash`, so the caller must
 	// have submitted exactly one blob in the same (blob-carrying) transaction.
-	CompleteJob(ctx context.Context, jobID uint64, responseBlobHash [32]byte, responseCiphertextHash [32]byte) error
+	CompleteJob(ctx context.Context, jobID uint64, responseBlobHash, responseCiphertextHash [32]byte) error
 	HasJobAcknowledged(ctx context.Context, jobID uint64) (bool, error)
 	HasJobCompleted(ctx context.Context, jobID uint64) (bool, error)
 	// GetSessionEncWorkerKey retrieves the current encrypted worker key for a session
@@ -85,7 +87,7 @@ type JobExecutionClient interface {
 	// GetJobBlobInfo returns the single prompt and response blob hashes for a
 	// completed job along with the blocks they were submitted in. Used to build
 	// conversation history.
-	GetJobBlobInfo(ctx context.Context, jobID uint64) (promptHash common.Hash, responseHash common.Hash, submitBlock uint64, completionBlock uint64, err error)
+	GetJobBlobInfo(ctx context.Context, jobID uint64) (promptHash, responseHash common.Hash, submitBlock, completionBlock uint64, err error)
 }
 
 // AsyncAckClient is the optional non-blocking extension of
@@ -196,8 +198,13 @@ type HandlerConfig struct {
 	STTEnabled  bool
 	TTSEnabled  bool
 	TTSVoice    string
+	// SpeechModelName is the model whose jobs settle audio rather than
+	// text. Empty leaves the speech path inert.
+	SpeechModelName string
 	TTSMaxChars int
 	TTSTimeout  time.Duration
+	SearchMaxResults    int
+	SearchTimeout       time.Duration
 }
 
 // ResponsePublisher publishes encrypted responses for real-time delivery.
@@ -241,6 +248,9 @@ type ResponsePublisher interface {
 	// one return false and the handler skips per-chunk encryption
 	// entirely rather than doing work that gets dropped downstream.
 	SupportsChunks() bool
+
+	// PublishMetadata publishes search citations (best-effort).
+	PublishMetadata(ctx context.Context, jobID, sessionID uint64, correlationID string, payload []byte)
 }
 
 // ReleaseTracker records that a job has just been completed and is now
@@ -259,6 +269,7 @@ type JobHandler struct {
 	blobSubmitter     BlobSubmitter
 	keyStore          SessionKeyGetter
 	ollamaClient      InferenceClient
+	searcher          search.Searcher // nil ⇒ web search disabled
 	redisClient       *redis.Client
 	responsePublisher ResponsePublisher
 	signingKey        *ecdsa.PrivateKey
@@ -325,6 +336,7 @@ func NewJobHandler(
 	checkpoints *CheckpointStore,
 	metricsCollector *metrics.Metrics,
 	delivery string,
+	searcher search.Searcher,
 ) *JobHandler {
 	modelIDToName := make(map[string]string, len(cfg.ModelIDToName))
 	for k, v := range cfg.ModelIDToName {
@@ -346,6 +358,7 @@ func NewJobHandler(
 		blobSubmitter:     blobSubmitter,
 		keyStore:          keyStore,
 		ollamaClient:      ollamaClient,
+		searcher:          searcher,
 		redisClient:       redisClient,
 		responsePublisher: publisher,
 		signingKey:        signingKey,
@@ -528,13 +541,50 @@ func (p *RedisResponsePublisher) publish(ctx context.Context, msg pkgtypes.PubSu
 	}
 }
 
+// PublishMetadata fans out an encrypted metadata frame (e.g. web-search
+// sources). Non-fatal — citations are best-effort UX, not the authoritative
+// response. No signature: the relay only signature-checks complete frames.
+func (p *RedisResponsePublisher) PublishMetadata(
+	ctx context.Context,
+	jobID, sessionID uint64,
+	correlationID string,
+	payload []byte,
+) {
+	msg := pkgtypes.PubSubMessage{
+		Type:          pkgtypes.MessageTypeMetadata,
+		JobID:         pkgtypes.JobID(jobID),
+		SessionID:     pkgtypes.SessionID(sessionID),
+		Sequence:      0,
+		TotalChunks:   1,
+		Payload:       payload,
+		CorrelationID: correlationID,
+		Timestamp:     time.Now().Unix(),
+	}
+	data, err := json.Marshal(msg)
+	if err != nil {
+		p.logger.Warn("failed to marshal metadata frame", "jobID", jobID, "error", err)
+		return
+	}
+	pubCtx := ctx
+	if p.publishTimeout > 0 {
+		var cancel context.CancelFunc
+		pubCtx, cancel = context.WithTimeout(ctx, p.publishTimeout)
+		defer cancel()
+	}
+	channel := fmt.Sprintf("session:%d:responses", sessionID)
+	if err := p.client.Publish(pubCtx, channel, data).Err(); err != nil {
+		p.logger.Warn("failed to publish metadata frame", "jobID", jobID, "channel", channel, "error", err)
+	}
+}
+
 // HandleJobPayload processes a job from a raw JobPayload (used in gateway mode
 // where jobs come via HTTP polling instead of Asynq).
 func (h *JobHandler) HandleJobPayload(ctx context.Context, payload JobPayload) error {
 	h.jobCounter.Add(1)
 	defer h.jobCounter.Add(-1)
 
-	h.logger.Info("processing job",
+	h.logger.Info(
+		"processing job",
 		"jobID", payload.JobID,
 		"sessionID", payload.SessionID,
 		"model", payload.ModelID,
@@ -578,7 +628,8 @@ func (h *JobHandler) HandleTask(ctx context.Context, task *asynq.Task) error {
 		budget = time.Until(deadline)
 	}
 
-	h.logger.Info("processing job",
+	h.logger.Info(
+		"processing job",
 		"jobID", payload.JobID,
 		"sessionID", payload.SessionID,
 		"model", payload.ModelID,
@@ -599,7 +650,8 @@ func (h *JobHandler) HandleTask(ctx context.Context, task *asynq.Task) error {
 	if hasDeadline {
 		minBudget := h.cfg.AckTxTimeout + h.cfg.BlobTxTimeout + 10*time.Second
 		if budget < minBudget {
-			h.logger.Warn("task budget appears too small for the pipeline",
+			h.logger.Warn(
+				"task budget appears too small for the pipeline",
 				"jobID", payload.JobID,
 				"taskBudgetMs", budget.Milliseconds(),
 				"minRecommendedMs", minBudget.Milliseconds(),
@@ -611,7 +663,8 @@ func (h *JobHandler) HandleTask(ctx context.Context, task *asynq.Task) error {
 	}
 
 	if err := h.processJob(ctx, payload); err != nil {
-		h.logger.Error("job failed",
+		h.logger.Error(
+			"job failed",
 			"jobID", payload.JobID,
 			"attempt", retryCount+1,
 			"maxRetry", maxRetry,
@@ -621,7 +674,8 @@ func (h *JobHandler) HandleTask(ctx context.Context, task *asynq.Task) error {
 		return err
 	}
 
-	h.logger.Info("job completed",
+	h.logger.Info(
+		"job completed",
 		"jobID", payload.JobID,
 		"attempt", retryCount+1,
 	)
@@ -698,7 +752,8 @@ func (h *JobHandler) processJob(ctx context.Context, p JobPayload) (err error) {
 		return err
 	}
 	d := rec.End(metrics.OutcomeOK, metrics.CacheNone)
-	logger.Info("stage 1 complete",
+	logger.Info(
+		"stage 1 complete",
 		"stage", "ack",
 		"overlapped", ack != nil,
 		"durationMs", d.Milliseconds(),
@@ -719,7 +774,8 @@ func (h *JobHandler) processJob(ctx context.Context, p JobPayload) (err error) {
 	if ckpt.HasCiphertext() {
 		cacheState = metrics.CacheHit
 		h.metrics.CheckpointEvents.WithLabelValues(metrics.CheckpointEventHitInference).Inc()
-		logger.Info("checkpoint hit, skipping stages 2-6",
+		logger.Info(
+			"checkpoint hit, skipping stages 2-6",
 			"stage", "checkpoint",
 			"reason", "inference_cached",
 			"ciphertextBytes", len(ckpt.Ciphertext),
@@ -735,7 +791,8 @@ func (h *JobHandler) processJob(ctx context.Context, p JobPayload) (err error) {
 			return err
 		}
 		rec = h.metrics.StartStage(metrics.StageFetchBlob, model, delivery)
-		logger.Info("stage 2 starting",
+		logger.Info(
+			"stage 2 starting",
 			"stage", "fetch_blob",
 			"promptBlobHash", p.PromptBlobHash.Hex(),
 			"blockNumber", p.BlockNumber,
@@ -747,7 +804,8 @@ func (h *JobHandler) processJob(ctx context.Context, p JobPayload) (err error) {
 			return err
 		}
 		d = rec.End(metrics.OutcomeOK, metrics.CacheMiss)
-		logger.Info("stage 2 complete",
+		logger.Info(
+			"stage 2 complete",
 			"stage", "fetch_blob",
 			"blobBytes", len(blobData),
 			"durationMs", d.Milliseconds(),
@@ -779,20 +837,23 @@ func (h *JobHandler) processJob(ctx context.Context, p JobPayload) (err error) {
 			canonical, wasSet, cErr := h.checkpoints.SetCiphertextIfAbsent(ctx, p.JobID, ciphertext)
 			switch {
 			case cErr != nil:
-				logger.Warn("failed to persist ciphertext to checkpoint",
+				logger.Warn(
+					"failed to persist ciphertext to checkpoint",
 					"stage", "checkpoint",
 					"error", cErr,
 				)
 			case !wasSet:
 				h.metrics.CheckpointEvents.WithLabelValues(metrics.CheckpointEventRaceLost).Inc()
-				logger.Warn("checkpoint race lost, using canonical ciphertext",
+				logger.Warn(
+					"checkpoint race lost, using canonical ciphertext",
 					"stage", "checkpoint",
 					"localBytes", len(ciphertext),
 					"canonicalBytes", len(canonical),
 				)
 				ciphertext = canonical
 			default:
-				logger.Debug("ciphertext persisted to checkpoint",
+				logger.Debug(
+					"ciphertext persisted to checkpoint",
 					"stage", "checkpoint",
 					"ciphertextBytes", len(ciphertext),
 				)
@@ -817,22 +878,34 @@ func (h *JobHandler) processJob(ctx context.Context, p JobPayload) (err error) {
 	// a duplicate complete frame.
 	if ckpt.Delivered {
 		h.metrics.CheckpointEvents.WithLabelValues(metrics.CheckpointEventHitDelivered).Inc()
-		logger.Info("checkpoint hit, skipping stage 7",
+		logger.Info(
+			"checkpoint hit, skipping stage 7",
 			"stage", "checkpoint",
 			"reason", "delivered",
 		)
 	} else {
 		rec = h.metrics.StartStage(metrics.StageRedisPublish, model, delivery)
-		h.publishToRedis(ctx, logger, p.JobID, p.SessionID, p.CorrelationID, ciphertext, chunkFrames+1)
+		// completePayload and ciphertext intentionally differ for v2 search jobs:
+		// the relay complete frame carries the PLAIN answer (consumer contract),
+		// while ciphertext stays the {answer,searchContext} envelope used by the
+		// blob + on-chain responseCiphertextHash (the disputer reads it). Do NOT
+		// unify these — see relayCompleteCiphertext.
+		completePayload := ciphertext
+		if sk, skErr := h.getOrDeriveSessionKey(ctx, logger, p.SessionID); skErr == nil {
+			completePayload = h.relayCompleteCiphertext(sk, ciphertext)
+		} // on key error, fall back to ciphertext (non-fatal; matches existing publish best-effort posture)
+		h.publishToRedis(ctx, logger, p.JobID, p.SessionID, p.CorrelationID, completePayload, chunkFrames+1)
 		d = rec.End(metrics.OutcomeOK, metrics.CacheMiss)
-		logger.Info("stage 7 complete",
+		logger.Info(
+			"stage 7 complete",
 			"stage", "redis_publish",
 			"chunkFrames", chunkFrames,
 			"durationMs", d.Milliseconds(),
 		)
 		if h.checkpoints != nil {
 			if mErr := h.checkpoints.MarkDelivered(ctx, p.JobID); mErr != nil {
-				logger.Warn("failed to mark delivered on checkpoint",
+				logger.Warn(
+					"failed to mark delivered on checkpoint",
 					"stage", "checkpoint",
 					"error", mErr,
 				)
@@ -850,7 +923,8 @@ func (h *JobHandler) processJob(ctx context.Context, p JobPayload) (err error) {
 	// Stage 8b: Complete job on-chain.
 	rec = h.metrics.StartStage(metrics.StageCompleteJob, model, delivery)
 	responseCiphertextHash := crypto.Keccak256Hash(ciphertext)
-	logger.Info("stage 8b starting",
+	logger.Info(
+		"stage 8b starting",
 		"stage", "complete_job",
 		"versionedHash", versionedHash.Hex(),
 		"ciphertextHash", responseCiphertextHash.Hex(),
@@ -861,7 +935,8 @@ func (h *JobHandler) processJob(ctx context.Context, p JobPayload) (err error) {
 		return err
 	}
 	d = rec.End(metrics.OutcomeOK, metrics.CacheNone)
-	logger.Info("stage 8b complete",
+	logger.Info(
+		"stage 8b complete",
 		"stage", "complete_job",
 		"durationMs", d.Milliseconds(),
 	)
@@ -887,7 +962,8 @@ func (h *JobHandler) processJob(ctx context.Context, p JobPayload) (err error) {
 	// an already-completed on-chain job). Reconciler backs us up.
 	if h.releaseTracker != nil {
 		if mErr := h.releaseTracker.MarkEligible(ctx, p.JobID, time.Now().Unix()); mErr != nil {
-			logger.Warn("failed to mark job eligible for release; reconciler will backfill",
+			logger.Warn(
+				"failed to mark job eligible for release; reconciler will backfill",
 				"stage", "release_tracker",
 				"error", mErr,
 			)
@@ -899,7 +975,8 @@ func (h *JobHandler) processJob(ctx context.Context, p JobPayload) (err error) {
 	// disappears; outright Delete would race concurrent retries.
 	if h.checkpoints != nil {
 		if tErr := h.checkpoints.Tombstone(ctx, p.JobID); tErr != nil {
-			logger.Warn("failed to tombstone checkpoint after completion",
+			logger.Warn(
+				"failed to tombstone checkpoint after completion",
 				"stage", "checkpoint",
 				"error", tErr,
 			)
@@ -920,7 +997,8 @@ func (h *JobHandler) readCheckpoint(ctx context.Context, logger *slog.Logger, jo
 	}
 	ckpt, err := h.checkpoints.Get(ctx, jobID)
 	if err != nil {
-		logger.Warn("failed to read checkpoint; treating as cache miss",
+		logger.Warn(
+			"failed to read checkpoint; treating as cache miss",
 			"stage", "checkpoint",
 			"error", err,
 		)
@@ -960,7 +1038,8 @@ func (h *JobHandler) runInferencePipeline(
 		return nil, 0, fmt.Errorf("stage 3 (session key): %w", err)
 	}
 	d := rec.End(metrics.OutcomeOK, metrics.CacheMiss)
-	logger.Info("stage 3 complete",
+	logger.Info(
+		"stage 3 complete",
 		"stage", "session_key",
 		"durationMs", d.Milliseconds(),
 	)
@@ -974,7 +1053,8 @@ func (h *JobHandler) runInferencePipeline(
 	rec = h.metrics.StartStage(metrics.StageDecrypt, model, delivery)
 	prompt, err := pkgcrypto.Decrypt(sessionKey, blobData)
 	if err != nil {
-		logger.Warn("stage 4: initial decrypt failed, refreshing session key",
+		logger.Warn(
+			"stage 4: initial decrypt failed, refreshing session key",
 			"stage", "decrypt",
 			"error", err,
 		)
@@ -991,11 +1071,44 @@ func (h *JobHandler) runInferencePipeline(
 		}
 	}
 	d = rec.End(metrics.OutcomeOK, metrics.CacheMiss)
-	logger.Info("stage 4 complete",
+	logger.Info(
+		"stage 4 complete",
 		"stage", "decrypt",
 		"promptBytes", len(prompt),
 		"durationMs", d.Milliseconds(),
 	)
+
+	// Stage 4.5: optional web-search augmentation (one-shot Tavily). Fail-open:
+	// any search failure proceeds with the original prompt and emits no sources.
+	// Sources are stashed here and published AFTER inference (see end of function)
+	// so the UI renders "Sources" beneath the answer, not above it.
+	promptText, searchEnabled, decErr := searchaug.DecodePrompt(prompt)
+	if decErr != nil {
+		return nil, 0, fmt.Errorf("stage 4 (decode prompt envelope): %w", decErr)
+	}
+	var searchSources []searchaug.Source
+	if searchEnabled && h.searcher != nil {
+		searchCtx := ctx
+		if h.cfg.SearchTimeout > 0 {
+			var cancel context.CancelFunc
+			searchCtx, cancel = context.WithTimeout(ctx, h.cfg.SearchTimeout)
+			defer cancel()
+		}
+		maxResults := h.cfg.SearchMaxResults
+		if maxResults <= 0 {
+			maxResults = 5
+		}
+		sources, sErr := h.searcher.Search(searchCtx, promptText, maxResults)
+		if sErr != nil {
+			logger.Warn("stage 4.5: web search failed, proceeding without context",
+				"stage", "search", "error", sErr)
+		} else if len(sources) > 0 {
+			augSources := toSearchaugSources(sources)
+			promptText = searchaug.BuildAugmentedPrompt(searchaug.CurrentTemplateVersion, promptText, augSources)
+			searchSources = augSources // stash; publish after inference
+			logger.Info("stage 4.5 complete", "stage", "search", "sources", len(sources))
+		}
+	}
 
 	// Stage 5: AI inference (with conversation history if prior jobs exist)
 	modelName, err := h.resolveModelName(p.ModelID)
@@ -1009,7 +1122,11 @@ func (h *JobHandler) runInferencePipeline(
 	// stage-5 audit fields and the stats frame.
 	infClient, effectiveOpts, overrideApplied := h.inferenceClientFor(logger, modelName)
 
-	envelope, err := decodePrompt(prompt)
+	// Decode the search-processed text, not the raw blob: stage 4.5 has
+	// already unwrapped a search envelope (and augmented it when sources
+	// came back), while a multimodal envelope passes through searchaug
+	// untouched and is parsed here as before.
+	envelope, err := decodePrompt([]byte(promptText))
 	if err != nil {
 		return nil, 0, fmt.Errorf("stage 5 (decode prompt): %w", err)
 	}
@@ -1038,14 +1155,23 @@ func (h *JobHandler) runInferencePipeline(
 
 	var history []ollama.ChatMessage
 	if len(p.PriorJobIDs) > 0 {
+		histStart := time.Now()
 		var hErr error
 		history, hErr = h.buildConversationHistory(infCtx, p.PriorJobIDs, sessionKey)
 		if hErr != nil {
-			logger.Warn("failed to build conversation history, falling back to single prompt",
+			logger.Warn(
+				"failed to build conversation history, falling back to single prompt",
 				"stage", "inference",
 				"error", hErr,
 			)
 			history = nil
+		} else {
+			logger.Info("conversation history built",
+				"stage", "build_history",
+				"priorJobs", len(p.PriorJobIDs),
+				"historyTurns", len(history),
+				"durationMs", time.Since(histStart).Milliseconds(),
+			)
 		}
 	}
 
@@ -1103,7 +1229,8 @@ func (h *JobHandler) runInferencePipeline(
 		return nil, streamer.frames(), wrapped
 	}
 	d = rec.End(metrics.OutcomeOK, metrics.CacheMiss)
-	logger.Info("stage 5 complete",
+	logger.Info(
+		"stage 5 complete",
 		"stage", "inference",
 		"model", modelName,
 		"responseBytes", len(response),
@@ -1148,18 +1275,39 @@ func (h *JobHandler) runInferencePipeline(
 	// it â€” the per-chunk ciphertexts published above are an independent,
 	// throwaway encryption of the same plaintext deltas and are never
 	// concatenated, hashed, or committed anywhere.
+	// Stage 6: Encode and encrypt response. For search jobs the response is
+	// wrapped in a v2 JSON envelope that captures the search context so the
+	// disputer can reproduce the exact augmented prompt on replay. For plain
+	// (non-search) jobs EncodeResponse returns raw answer bytes — byte-identical
+	// to the legacy format.
 	rec = h.metrics.StartStage(metrics.StageEncrypt, model, delivery)
-	ciphertext, err := pkgcrypto.Encrypt(sessionKey, []byte(response))
+	respBytes, encErr := searchaug.EncodeResponse(response, searchSources)
+	if encErr != nil {
+		rec.End(metrics.OutcomeError, metrics.CacheMiss)
+		return nil, 0, fmt.Errorf("stage 6 (encode response): %w", encErr)
+	}
+	ciphertext, err := pkgcrypto.Encrypt(sessionKey, respBytes)
 	if err != nil {
 		rec.End(metrics.OutcomeError, metrics.CacheMiss)
 		return nil, streamer.frames(), fmt.Errorf("stage 6 (encrypt response): %w", err)
 	}
 	d = rec.End(metrics.OutcomeOK, metrics.CacheMiss)
-	logger.Info("stage 6 complete",
+	logger.Info(
+		"stage 6 complete",
 		"stage", "encrypt",
 		"ciphertextBytes", len(ciphertext),
 		"durationMs", d.Milliseconds(),
 	)
+
+	// Emit citations AFTER the answer is ready so the UI renders Sources
+	// beneath the response (best-effort, non-fatal).
+	if len(searchSources) > 0 && h.responsePublisher != nil {
+		if metaPayload, encErr := pkgcrypto.Encrypt(sessionKey, sourcesMetadataJSON(searchSources)); encErr != nil {
+			logger.Warn("post-inference: encrypt sources failed", "stage", "search", "error", encErr)
+		} else {
+			h.responsePublisher.PublishMetadata(ctx, p.JobID, p.SessionID, p.CorrelationID, metaPayload)
+		}
+	}
 
 	// Voice output (stage 6b): when the consumer opted in, synthesize the
 	// response text and stream the PCM to the consumer as `audio` frames
@@ -1186,6 +1334,17 @@ func (h *JobHandler) runInference(
 	history []ollama.ChatMessage,
 	streamer *chunkStreamer,
 ) (string, ollama.StreamStats, error) {
+	// A speech job's answer IS the recording, so it never reaches a language
+	// model: no Ollama call, no history, no streaming. Producing the audio
+	// here rather than special-casing the caller means stages 6-8 encrypt,
+	// blob and settle it byte for byte the way they settle a sentence.
+	//
+	// Distinct from the TTS_ENABLED path, which reads an ordinary answer
+	// aloud over audio frames and settles nothing.
+	if h.cfg.SpeechModelName != "" && modelName == h.cfg.SpeechModelName {
+		return h.runSpeechJob(ctx, logger, prompt.Text)
+	}
+
 	if streamer == nil {
 		var (
 			text string
@@ -1302,7 +1461,8 @@ func (h *JobHandler) ensureAcknowledged(
 		return nil, fmt.Errorf("check acknowledged state: %w", err)
 	}
 	if acknowledged {
-		logger.Info("stage 1: job already acknowledged on-chain, skipping ack tx",
+		logger.Info(
+			"stage 1: job already acknowledged on-chain, skipping ack tx",
 			"stage", "ack",
 			"path", "already_acked",
 		)
@@ -1313,7 +1473,8 @@ func (h *JobHandler) ensureAcknowledged(
 		return h.broadcastAck(ctx, logger, async, jobID)
 	}
 
-	logger.Info("stage 1: sending ack tx",
+	logger.Info(
+		"stage 1: sending ack tx",
 		"stage", "ack",
 		"path", "sending_ack",
 		"timeout", h.cfg.AckTxTimeout.String(),
@@ -1500,7 +1661,8 @@ func (h *JobHandler) ensureBlobSubmitted(
 		rec := h.metrics.StartStage(metrics.StageSubmitBlob, model, delivery)
 		rec.End(metrics.OutcomeSkipped, metrics.CacheHit)
 		h.metrics.CheckpointEvents.WithLabelValues(metrics.CheckpointEventHitBlob).Inc()
-		logger.Info("checkpoint hit, skipping stage 8a",
+		logger.Info(
+			"checkpoint hit, skipping stage 8a",
 			"stage", "checkpoint",
 			"reason", "blob_submitted",
 			"versionedHash", ckpt.VersionedHash.Hex(),
@@ -1531,14 +1693,16 @@ func (h *JobHandler) ensureBlobSubmitted(
 	}
 	versionedHash := common.Hash(blobHashes[0])
 	d := rec.End(metrics.OutcomeOK, metrics.CacheMiss)
-	logger.Info("stage 8a complete",
+	logger.Info(
+		"stage 8a complete",
 		"stage", "submit_blob",
 		"versionedHash", versionedHash.Hex(),
 		"durationMs", d.Milliseconds(),
 	)
 	if h.checkpoints != nil {
 		if err := h.checkpoints.SetVersionedHash(ctx, jobID, versionedHash); err != nil {
-			logger.Warn("failed to persist versionedHash on checkpoint",
+			logger.Warn(
+				"failed to persist versionedHash on checkpoint",
 				"stage", "checkpoint",
 				"error", err,
 			)
@@ -1577,7 +1741,8 @@ func (h *JobHandler) completeJob(
 			return fmt.Errorf("complete job: %w (recheck failed: %v)", err, checkErr)
 		}
 		if completed {
-			logger.Warn("stage 8b: completeJob tx returned error but job is completed on-chain",
+			logger.Warn(
+				"stage 8b: completeJob tx returned error but job is completed on-chain",
 				"stage", "complete_job",
 				"error", err,
 			)
@@ -1612,7 +1777,8 @@ func (h *JobHandler) completeJob(
 func (h *JobHandler) getOrDeriveSessionKey(ctx context.Context, logger *slog.Logger, sessionID uint64) ([]byte, error) {
 	if key, err := h.keyStore.GetKey(sessionID); err == nil {
 		h.metrics.SessionKeyEvents.WithLabelValues(metrics.SessionKeyPathCacheHit).Inc()
-		logger.Info("stage 3: session key cache hit",
+		logger.Info(
+			"stage 3: session key cache hit",
 			"stage", "session_key",
 			"path", "cache_hit",
 		)
@@ -1626,14 +1792,16 @@ func (h *JobHandler) getOrDeriveSessionKey(ctx context.Context, logger *slog.Log
 		// just finished between our outer miss and entering Do.
 		if k, err := h.keyStore.GetKey(sessionID); err == nil {
 			h.metrics.SessionKeyEvents.WithLabelValues(metrics.SessionKeyPathCacheHit).Inc()
-			logger.Info("stage 3: session key cache hit (inside flight)",
+			logger.Info(
+				"stage 3: session key cache hit (inside flight)",
 				"stage", "session_key",
 				"path", "cache_hit",
 			)
 			return k, nil
 		}
 		h.metrics.SessionKeyEvents.WithLabelValues(metrics.SessionKeyPathChainDerive).Inc()
-		logger.Info("stage 3: session key cache miss, deriving from chain",
+		logger.Info(
+			"stage 3: session key cache miss, deriving from chain",
 			"stage", "session_key",
 			"path", "chain_derive",
 		)
@@ -1655,7 +1823,8 @@ func (h *JobHandler) getOrDeriveSessionKey(ctx context.Context, logger *slog.Log
 // session key.
 func (h *JobHandler) refreshSessionKey(ctx context.Context, logger *slog.Logger, sessionID uint64) ([]byte, error) {
 	h.metrics.SessionKeyEvents.WithLabelValues(metrics.SessionKeyPathRefresh).Inc()
-	logger.Info("stage 4: refreshing session key from chain (possible rotation)",
+	logger.Info(
+		"stage 4: refreshing session key from chain (possible rotation)",
 		"stage", "session_key",
 		"path", "refresh",
 	)
@@ -1715,6 +1884,28 @@ func init() {
 	}
 }
 
+// relayCompleteCiphertext returns the ciphertext to deliver on the relay
+// `complete` frame. For a v2 search envelope it re-encrypts just the plain
+// answer (the v1.1 consumer contract — the envelope with searchContext stays in
+// the blob for the disputer). For a legacy/plain ciphertext it returns it
+// unchanged. Best-effort: on any decrypt/decode/encrypt error it falls back to
+// the original ciphertext (never fails the job).
+func (h *JobHandler) relayCompleteCiphertext(sessionKey, blobCiphertext []byte) []byte {
+	plain, err := pkgcrypto.Decrypt(sessionKey, blobCiphertext)
+	if err != nil {
+		return blobCiphertext
+	}
+	env := searchaug.DecodeResponse(plain)
+	if env.V != searchaug.ResponseEnvelopeVersion {
+		return blobCiphertext // legacy/non-search: already the plain answer
+	}
+	ac, err := pkgcrypto.Encrypt(sessionKey, []byte(env.Answer))
+	if err != nil {
+		return blobCiphertext
+	}
+	return ac
+}
+
 // publishToRedis signs and publishes the terminal response frame via the
 // configured ResponsePublisher. Errors are logged but non-fatal â€” the
 // on-chain blob is the authoritative response.
@@ -1740,7 +1931,8 @@ func (h *JobHandler) publishToRedis(
 
 	sig, err := signMismatchEvidence(h.cfg.ChainID, h.cfg.JobRegistryAddr, jobID, sessionID, ciphertext, h.signingKey)
 	if err != nil {
-		h.logger.Warn("failed to sign response",
+		h.logger.Warn(
+			"failed to sign response",
 			"stage", "redis_publish",
 			"jobID", jobID,
 			"error", err,
@@ -1832,12 +2024,18 @@ func (h *JobHandler) buildConversationHistory(
 			// including full base64 image payloads - into the context as
 			// text, where it wastes prompt tokens against num_ctx and the
 			// vision model never sees the image as an image.
-			env, dErr := decodePrompt(promptText)
+			// A search envelope wraps the text the same way it does on the live
+			// turn, so unwrap it before the multimodal decode.
+			plain, _, dErr := searchaug.DecodePrompt(promptText)
+			var env promptEnvelope
+			if dErr == nil {
+				env, dErr = decodePrompt([]byte(plain))
+			}
 			if dErr != nil {
-				// Practically unreachable: stage 5 enforces the same image
-				// limit before a job can complete and land in history. Stay
-				// conservative and keep the raw text rather than drop the
-				// turn.
+				// Practically unreachable: stages 4.5 and 5 reject the same
+				// malformed envelopes before a job can complete and land in
+				// history. Stay conservative and keep the raw text rather
+				// than drop the turn.
 				messages = append(messages, ollama.ChatMessage{Role: "user", Content: string(promptText)})
 			} else {
 				messages = append(messages, ollama.ChatMessage{Role: "user", Content: env.Text, Images: env.Images})
@@ -1854,7 +2052,7 @@ func (h *JobHandler) buildConversationHistory(
 			if err != nil {
 				return nil, fmt.Errorf("decrypt response for job %d: %w", jobID, err)
 			}
-			messages = append(messages, ollama.ChatMessage{Role: "assistant", Content: string(responseText)})
+			messages = append(messages, ollama.ChatMessage{Role: "assistant", Content: searchaug.DecodeResponse(responseText).Answer})
 		}
 	}
 
@@ -1875,6 +2073,43 @@ func (h *JobHandler) resolveModelName(modelID string) (string, error) {
 	}
 
 	return modelID, nil
+}
+
+// toSearchaugSources converts search.Source (the Tavily/search-package type)
+// to searchaug.Source (the shared pkg type). Fields are identical; this
+// converter avoids a dependency between the two packages.
+func toSearchaugSources(sources []search.Source) []searchaug.Source {
+	out := make([]searchaug.Source, len(sources))
+	for i, s := range sources {
+		out[i] = searchaug.Source{
+			Position: s.Position,
+			Title:    s.Title,
+			URL:      s.URL,
+			Snippet:  s.Snippet,
+		}
+	}
+	return out
+}
+
+// sourcesMetadataJSON renders the citation payload in the exact shape the
+// frontend's parseWebSearchSources expects. Accepts []searchaug.Source so it
+// can be called after the search.Source → searchaug.Source conversion.
+func sourcesMetadataJSON(sources []searchaug.Source) []byte {
+	type wire struct {
+		Position int    `json:"position"`
+		Title    string `json:"title"`
+		URL      string `json:"url"`
+		Snippet  string `json:"snippet"`
+	}
+	out := struct {
+		Type    string `json:"type"`
+		Sources []wire `json:"sources"`
+	}{Type: "webSearchSources"}
+	for _, s := range sources {
+		out.Sources = append(out.Sources, wire{s.Position, s.Title, s.URL, s.Snippet})
+	}
+	data, _ := json.Marshal(out)
+	return data
 }
 
 func normalizeModelLookupKey(modelID string) string {

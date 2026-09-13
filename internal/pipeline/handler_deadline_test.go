@@ -75,6 +75,7 @@ func newGuardTestHandler(
 		nil, // checkpoints
 		testMetrics(t),
 		metrics.DeliveryAsynq,
+nil,
 	)
 }
 
@@ -494,6 +495,7 @@ func TestBuildConversationHistory_DecodesPromptEnvelopes(t *testing.T) {
 		nil, testSigningKey(t), testECDHKey(t), &atomic.Int32{},
 		slog.New(slog.NewTextHandler(io.Discard, nil)),
 		HandlerConfig{}, nil, nil, testMetrics(t), metrics.DeliveryAsynq,
+nil,
 	)
 
 	msgs, err := handler.buildConversationHistory(context.Background(), []uint64{7}, sessionKey)
@@ -540,6 +542,7 @@ func TestBuildConversationHistory_PlainPromptsUnchanged(t *testing.T) {
 				nil, testSigningKey(t), testECDHKey(t), &atomic.Int32{},
 				slog.New(slog.NewTextHandler(io.Discard, nil)),
 				HandlerConfig{}, nil, nil, testMetrics(t), metrics.DeliveryAsynq,
+nil,
 			)
 
 			msgs, err := handler.buildConversationHistory(context.Background(), []uint64{9}, sessionKey)

@@ -139,6 +139,7 @@ func newAckFixture(t *testing.T, chainClient *mockAsyncAckChain, overlapEnabled 
 		nil, // checkpoints
 		fix.collector,
 		metrics.DeliveryAsynq,
+		nil,
 	)
 	return fix
 }
@@ -449,6 +450,7 @@ func TestAckOverlap_FallsBackWhenClientCannotBroadcast(t *testing.T) {
 		slog.New(slog.NewTextHandler(io.Discard, &slog.HandlerOptions{Level: slog.LevelError})),
 		HandlerConfig{AckTxTimeout: 2 * time.Second, BlobTxTimeout: 2 * time.Second, AckOverlapEnabled: true},
 		nil, nil, testMetrics(t), metrics.DeliveryAsynq,
+nil,
 	)
 
 	require.NoError(t, handler.processJob(context.Background(), testPayload(t)))

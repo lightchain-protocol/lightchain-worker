@@ -5,6 +5,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/ethereum/go-ethereum/common"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -33,6 +34,11 @@ var allEnvKeys = []string{
 	"TTS_ENABLED", "TTS_SIDECAR_URL", "TTS_VOICE",
 	"TTS_MAX_CHARS", "TTS_TIMEOUT",
 	"LOG_LEVEL", "LOG_FORMAT",
+	// Sortition mode (Phase 3)
+	"SORTITION_ENABLED", "SESSION_MANAGER_ADDRESS",
+	"SORTITION_STATE_DIR", "SORTITION_CHUNK_SIZE",
+	"SORTITION_POLL_INTERVAL", "SORTITION_CONFIRMATIONS",
+	"SORTITION_SESSION_RETRY_LIMIT",
 }
 
 // clearEnv ensures all config-related env vars are unset before each test.
@@ -592,6 +598,31 @@ func TestLoad_JobExecutionOverrides(t *testing.T) {
 	assert.Equal(t, 5*time.Second, cfg.ReceiptPollInterval)
 }
 
+func TestLoad_SearchDefaults(t *testing.T) {
+	validEnv(t)
+	t.Setenv("WORKER_KEYSTORE_PATH", "/tmp/k")
+	t.Setenv("WORKER_KEYSTORE_PASSWORD", "p")
+	// SEARCH_* unset → search disabled, sane defaults.
+	cfg, err := Load()
+	require.NoError(t, err)
+	assert.False(t, cfg.SearchEnabled)
+	assert.Equal(t, "https://api.tavily.com", cfg.TavilyURL)
+	assert.Equal(t, 10*time.Second, cfg.SearchTimeout)
+	assert.Equal(t, 5, cfg.SearchMaxResults)
+}
+
+func TestLoad_SearchEnabled(t *testing.T) {
+	validEnv(t)
+	t.Setenv("WORKER_KEYSTORE_PATH", "/tmp/k")
+	t.Setenv("WORKER_KEYSTORE_PASSWORD", "p")
+	t.Setenv("SEARCH_ENABLED", "true")
+	t.Setenv("TAVILY_API_KEY", "tvly-xxx")
+	cfg, err := Load()
+	require.NoError(t, err)
+	assert.True(t, cfg.SearchEnabled)
+	assert.Equal(t, "tvly-xxx", cfg.TavilyAPIKey)
+}
+
 func TestValidate_JobRegistryZeroAddress(t *testing.T) {
 	validEnv(t)
 	t.Setenv("WORKER_KEYSTORE_PATH", "/tmp/keystore.json")
@@ -608,6 +639,87 @@ func TestValidate_JobRegistryZeroAddress(t *testing.T) {
 		combined += e + " "
 	}
 	assert.Contains(t, combined, "JOB_REGISTRY_ADDRESS must be a non-zero address")
+}
+
+// loadValidConfig sets the minimal required env, overlays extras, calls Load(), and
+// returns the result. Fails the test if Load() returns an error.
+func loadValidConfig(t *testing.T, extra map[string]string) *Config {
+	t.Helper()
+	validEnv(t)
+	t.Setenv("WORKER_KEYSTORE_PATH", "/tmp/keystore.json")
+	t.Setenv("WORKER_KEYSTORE_PASSWORD", "secret")
+	for k, v := range extra {
+		t.Setenv(k, v)
+	}
+	cfg, err := Load()
+	require.NoError(t, err)
+	return cfg
+}
+
+// requireConfigError sets the minimal required env, overlays extras, calls Load(),
+// and asserts a Load-time error containing wantSubstr.
+func requireConfigError(t *testing.T, extra map[string]string, wantSubstr string) {
+	t.Helper()
+	validEnv(t)
+	t.Setenv("WORKER_KEYSTORE_PATH", "/tmp/keystore.json")
+	t.Setenv("WORKER_KEYSTORE_PASSWORD", "secret")
+	for k, v := range extra {
+		t.Setenv(k, v)
+	}
+	cfg, err := Load()
+	// If Load() passes, check Validate() for cross-field errors
+	if err == nil {
+		errs := cfg.Validate()
+		combined := ""
+		for _, e := range errs {
+			combined += e + " "
+		}
+		require.Contains(t, combined, wantSubstr,
+			"expected config error containing %q but Validate() returned: %v", wantSubstr, errs)
+		return
+	}
+	require.Error(t, err)
+	require.Contains(t, err.Error(), wantSubstr)
+}
+
+func TestConfig_SortitionDefaults(t *testing.T) {
+	cfg := loadValidConfig(t, map[string]string{})
+	require.False(t, cfg.SortitionEnabled)
+	require.Equal(t, common.Address{}, cfg.SessionManagerAddress)
+	require.Equal(t, "data/sortition-state", cfg.SortitionStateDir)
+	require.Equal(t, uint64(5000), cfg.SortitionChunkSize)
+	require.Equal(t, 4*time.Second, cfg.SortitionPollInterval)
+	require.Equal(t, uint64(0), cfg.SortitionConfirmations)
+	require.Equal(t, 10, cfg.SortitionSessionRetryLimit)
+}
+
+func TestConfig_SortitionSessionRetryLimit_Parses(t *testing.T) {
+	cfg := loadValidConfig(t, map[string]string{
+		"SORTITION_ENABLED":             "true",
+		"SESSION_MANAGER_ADDRESS":       "0x000000000000000000000000000000000000dEaD",
+		"SORTITION_SESSION_RETRY_LIMIT": "25",
+	})
+	require.Equal(t, 25, cfg.SortitionSessionRetryLimit)
+}
+
+func TestConfig_SortitionEnabled_RequiresSessionManager(t *testing.T) {
+	// Enabling sortition without SESSION_MANAGER_ADDRESS must be a config error.
+	requireConfigError(t, map[string]string{
+		"SORTITION_ENABLED": "true",
+	}, "SESSION_MANAGER_ADDRESS is required when SORTITION_ENABLED=true")
+}
+
+func TestConfig_SortitionEnabled_Parses(t *testing.T) {
+	cfg := loadValidConfig(t, map[string]string{
+		"SORTITION_ENABLED":       "true",
+		"SESSION_MANAGER_ADDRESS": "0x000000000000000000000000000000000000dEaD",
+		"SORTITION_POLL_INTERVAL": "2s",
+		"SORTITION_CHUNK_SIZE":    "1000",
+	})
+	require.True(t, cfg.SortitionEnabled)
+	require.Equal(t, common.HexToAddress("0x000000000000000000000000000000000000dEaD"), cfg.SessionManagerAddress)
+	require.Equal(t, 2*time.Second, cfg.SortitionPollInterval)
+	require.Equal(t, uint64(1000), cfg.SortitionChunkSize)
 }
 
 func TestLoad_DeadlineGuardDefaults(t *testing.T) {
