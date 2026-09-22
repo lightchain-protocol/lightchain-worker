@@ -96,6 +96,11 @@ type Service struct {
 	gwHandler *pipeline.JobHandler
 	streamPub *gw.StreamPublisher
 
+	// Hex model IDs and capability tokens the gateway heartbeat advertises.
+	// The Redis monitor carries its own copy.
+	advertisedModels []string
+	advertisedCaps   []string
+
 	// Release subsystem. Store is always non-nil (the Tracker writes to it
 	// from the pipeline regardless of cfg.ReleaseEnabled). Scheduler and
 	// Reconciler are nil when ReleaseEnabled=false; in that case the
@@ -463,6 +468,11 @@ func New(cfg *config.Config) (*Service, error) {
 	if cfg.SearchEnabled {
 		searcher = search.NewTavilyClient(cfg.TavilyURL, cfg.TavilyAPIKey, cfg.SearchTimeout)
 	}
+	// Capability tokens advertised in every heartbeat, Redis or gateway.
+	capabilities := []string{}
+	if cfg.SearchEnabled && cfg.TavilyAPIKey != "" {
+		capabilities = append(capabilities, "search")
+	}
 
 	// External profile: replace the direct-Redis publisher with the gateway
 	// stream. The client is reused for heartbeat and drain in runSortitionMode.
@@ -653,6 +663,8 @@ func New(cfg *config.Config) (*Service, error) {
 			metricsServer:     buildMetricsServer(cfg, metricsCollector),
 			gwClient:          gwClient,
 			gwHandler:         gwHandler,
+			advertisedModels:  modelHexStrings,
+			advertisedCaps:    capabilities,
 			releaseStore:      releaseStore,
 			releaseTracker:    releaseTracker,
 			releaseScheduler:  releaseScheduler,
@@ -685,10 +697,6 @@ func New(cfg *config.Config) (*Service, error) {
 	monitorCfg := heartbeat.MonitorConfig{
 		Interval:  cfg.HeartbeatInterval,
 		OllamaURL: cfg.OllamaURL,
-	}
-	capabilities := []string{}
-	if cfg.SearchEnabled && cfg.TavilyAPIKey != "" {
-		capabilities = append(capabilities, "search")
 	}
 
 	// Heartbeat: internal profiles advertise via Redis; the external profile
@@ -839,6 +847,8 @@ func New(cfg *config.Config) (*Service, error) {
 		jobWatcher:        jobWatcher,
 		gwClient:          extGwClient,
 		streamPub:         extStreamPub,
+		advertisedModels:  modelHexStrings,
+		advertisedCaps:    capabilities,
 	}, nil
 }
 
@@ -1018,13 +1028,7 @@ func (s *Service) gatewayHeartbeatLoop(ctx context.Context) {
 	ticker := time.NewTicker(s.cfg.HeartbeatInterval)
 	defer ticker.Stop()
 	for {
-		payload := gw.HeartbeatPayload{
-			ActiveJobs:   int(s.jobCounter.Load()),
-			MaxJobs:      s.cfg.MaxConcurrentJobs,
-			OllamaStatus: "ready",
-			Uptime:       0, // parity with the legacy gateway-mode loop
-		}
-		if err := s.gwClient.SendHeartbeat(ctx, payload); err != nil {
+		if err := s.gwClient.SendHeartbeat(ctx, s.gatewayHeartbeatPayload()); err != nil {
 			s.logger.Warn("gateway heartbeat failed", "error", err)
 		}
 		select {
@@ -1032,6 +1036,21 @@ func (s *Service) gatewayHeartbeatLoop(ctx context.Context) {
 			return
 		case <-ticker.C:
 		}
+	}
+}
+
+// gatewayHeartbeatPayload advertises what the Redis monitor does: the
+// dispatcher routes search sessions on capabilities and protocolVersion, and
+// the explorer compares models against the on-chain eligible set.
+func (s *Service) gatewayHeartbeatPayload() gw.HeartbeatPayload {
+	return gw.HeartbeatPayload{
+		ActiveJobs:      int(s.jobCounter.Load()),
+		MaxJobs:         s.cfg.MaxConcurrentJobs,
+		Models:          s.advertisedModels,
+		Capabilities:    s.advertisedCaps,
+		ProtocolVersion: pkgtypes.WorkerProtocolVersion,
+		OllamaStatus:    "ready",
+		Uptime:          0, // parity with the legacy gateway-mode loop
 	}
 }
 
