@@ -269,11 +269,13 @@ func (c *Client) PublishResponse(
 
 // HeartbeatPayload matches the worker-gateway POST /api/heartbeat request body.
 type HeartbeatPayload struct {
-	ActiveJobs   int      `json:"activeJobs"`
-	MaxJobs      int      `json:"maxJobs"`
-	Models       []string `json:"models"`
-	OllamaStatus string   `json:"ollamaStatus"`
-	Uptime       int64    `json:"uptimeSeconds"`
+	ActiveJobs      int      `json:"activeJobs"`
+	MaxJobs         int      `json:"maxJobs"`
+	Models          []string `json:"models"`
+	Capabilities    []string `json:"capabilities"`
+	ProtocolVersion int      `json:"protocolVersion"`
+	OllamaStatus    string   `json:"ollamaStatus"`
+	Uptime          int64    `json:"uptimeSeconds"`
 }
 
 // --- HTTP helpers ---
