@@ -2,8 +2,10 @@ package service
 
 import (
 	"crypto/tls"
+	"encoding/json"
 	"io"
 	"log/slog"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -86,4 +88,32 @@ func TestService_sortitionWatchers_nilWhenDisabled(t *testing.T) {
 	}
 	assert.Nil(t, s.sessionWatcher, "sessionWatcher must be nil when SortitionEnabled=false")
 	assert.Nil(t, s.jobWatcher, "jobWatcher must be nil when SortitionEnabled=false")
+}
+
+// The gateway heartbeat is the only channel an external worker has for
+// advertising models and capabilities, so it must carry what the Redis
+// monitor does.
+func TestService_gatewayHeartbeatPayload_advertisesModelsAndCapabilities(t *testing.T) {
+	t.Parallel()
+
+	jobs := &atomic.Int32{}
+	jobs.Store(1)
+	s := &Service{
+		cfg:              &config.Config{MaxConcurrentJobs: 2},
+		jobCounter:       jobs,
+		advertisedModels: []string{"0xaa", "0xbb"},
+		advertisedCaps:   []string{"search"},
+	}
+
+	body, err := json.Marshal(s.gatewayHeartbeatPayload())
+	assert.NoError(t, err)
+	assert.JSONEq(t, `{
+		"activeJobs": 1,
+		"maxJobs": 2,
+		"models": ["0xaa", "0xbb"],
+		"capabilities": ["search"],
+		"protocolVersion": 2,
+		"ollamaStatus": "ready",
+		"uptimeSeconds": 0
+	}`, string(body))
 }
