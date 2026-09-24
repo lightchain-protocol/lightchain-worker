@@ -657,7 +657,7 @@ func TestWithReasoningAllowance(t *testing.T) {
 		"gpt-oss:20b": {NumPredict: 8192},
 		"qwen3-vl:8b": {Temperature: &temp},
 	}
-	got := WithReasoningAllowance(explicit, []string{"gpt-oss:20b", "qwen3-vl:8b", "deepseek-r1"}, 4096)
+	got := WithReasoningAllowance(explicit, []string{"gpt-oss:20b", "qwen3-vl:8b", "deepseek-r1"}, 1024, 4096)
 
 	assert.Equal(t, 8192, got["gpt-oss:20b"].NumPredict, "an explicit MODEL_OPTIONS cap wins")
 	assert.Equal(t, 4096, got["qwen3-vl:8b"].NumPredict)
@@ -666,5 +666,7 @@ func TestWithReasoningAllowance(t *testing.T) {
 	_, touched := explicit["deepseek-r1"]
 	assert.False(t, touched, "the parsed MODEL_OPTIONS map is not mutated")
 
-	assert.Nil(t, WithReasoningAllowance(nil, nil, 4096), "no reasoning models keeps the nil map")
+	assert.Nil(t, WithReasoningAllowance(nil, nil, 1024, 4096), "no reasoning models keeps the nil map")
+	assert.Nil(t, WithReasoningAllowance(nil, []string{"qwen3-vl:8b"}, -1, 4096), "an unlimited base is never capped")
+	assert.Nil(t, WithReasoningAllowance(nil, []string{"qwen3-vl:8b"}, 8192, 4096), "a larger base is never lowered")
 }

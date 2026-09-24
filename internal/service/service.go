@@ -301,7 +301,7 @@ func New(cfg *config.Config) (*Service, error) {
 		if err != nil {
 			logger.Warn("ollama reasoning-model detection incomplete (non-fatal)", "error", err)
 		}
-		cfg.ModelOptions = ollama.WithReasoningAllowance(cfg.ModelOptions, thinking, cfg.OllamaReasoningNumPredict)
+		cfg.ModelOptions = ollama.WithReasoningAllowance(cfg.ModelOptions, thinking, cfg.OllamaNumPredict, cfg.OllamaReasoningNumPredict)
 		logger.Info("reasoning models detected", "models", thinking, "numPredict", cfg.OllamaReasoningNumPredict)
 	}
 
