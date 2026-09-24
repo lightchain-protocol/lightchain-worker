@@ -936,6 +936,13 @@ func (p *gatewayResponsePublisher) PublishMetadata(
 	p.logger.Debug("gateway: metadata publish skipped (v1 no-op)", "jobID", jobID)
 }
 
+// PublishError is a deliberate no-op: the gateway's response endpoint
+// forces every frame to `complete`, so an error sent through it would reach
+// the consumer as an empty final answer.
+func (p *gatewayResponsePublisher) PublishError(_ context.Context, jobID, _ uint64, _ string) {
+	p.logger.Debug("gateway: error frame not sent (endpoint cannot carry a frame type)", "jobID", jobID)
+}
+
 // PublishChunk is unreachable in practice — SupportsChunks() is false, so
 // the handler never builds a chunk streamer for this publisher. It is
 // implemented defensively rather than left to panic if that gating ever

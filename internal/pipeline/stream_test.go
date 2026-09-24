@@ -189,6 +189,8 @@ func (p *capturingPublisher) PublishChunk(
 
 func (p *capturingPublisher) PublishMetadata(context.Context, uint64, uint64, string, []byte) {}
 
+func (p *capturingPublisher) PublishError(context.Context, uint64, uint64, string) {}
+
 func (p *capturingPublisher) SupportsChunks() bool { return true }
 
 var testStreamKey = bytes.Repeat([]byte{7}, 32)

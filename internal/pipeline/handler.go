@@ -251,6 +251,12 @@ type ResponsePublisher interface {
 
 	// PublishMetadata publishes search citations (best-effort).
 	PublishMetadata(ctx context.Context, jobID, sessionID uint64, correlationID string, payload []byte)
+
+	// PublishError tells the consumer the worker has given up on the job,
+	// so the chat can stop waiting instead of sitting until the on-chain
+	// timeout. Best-effort and unsigned, like chunk frames; it carries no
+	// payload because the relay and frontend need only the job it ends.
+	PublishError(ctx context.Context, jobID, sessionID uint64, correlationID string)
 }
 
 // ReleaseTracker records that a job has just been completed and is now
@@ -541,6 +547,23 @@ func (p *RedisResponsePublisher) publish(ctx context.Context, msg pkgtypes.PubSu
 	}
 }
 
+// PublishError PUBLISHes an `error` frame for a job the worker gave up on.
+// The relay forwards error frames unverified and chat-v2 ends the turn on
+// one ("The worker reported an error while answering").
+func (p *RedisResponsePublisher) PublishError(
+	ctx context.Context,
+	jobID, sessionID uint64,
+	correlationID string,
+) {
+	p.publish(ctx, pkgtypes.PubSubMessage{
+		Type:          pkgtypes.MessageTypeError,
+		JobID:         pkgtypes.JobID(jobID),
+		SessionID:     pkgtypes.SessionID(sessionID),
+		CorrelationID: correlationID,
+		Timestamp:     time.Now().Unix(),
+	})
+}
+
 // PublishMetadata fans out an encrypted metadata frame (e.g. web-search
 // sources). Non-fatal — citations are best-effort UX, not the authoritative
 // response. No signature: the relay only signature-checks complete frames.
@@ -593,6 +616,8 @@ func (h *JobHandler) HandleJobPayload(ctx context.Context, payload JobPayload) e
 
 	if err := h.processJob(ctx, payload); err != nil {
 		h.logger.Error("job failed", "jobID", payload.JobID, "error", err)
+		// Nothing retries a payload job: sortition serves each job once.
+		h.reportFailure(ctx, payload, err)
 		return err
 	}
 
@@ -615,7 +640,7 @@ func (h *JobHandler) HandleTask(ctx context.Context, task *asynq.Task) error {
 	// which lets us distinguish a fresh job from a retried one without
 	// changing the task payload shape.
 	retryCount, _ := asynq.GetRetryCount(ctx)
-	maxRetry, _ := asynq.GetMaxRetry(ctx)
+	maxRetry, hasMaxRetry := asynq.GetMaxRetry(ctx)
 
 	// Surface the dispatcher-configured asynq task deadline so operators
 	// can correlate "context deadline exceeded" cascades with the upstream
@@ -671,6 +696,11 @@ func (h *JobHandler) HandleTask(ctx context.Context, task *asynq.Task) error {
 			"willRetry", retryCount < maxRetry,
 			"error", err,
 		)
+		// Only the last attempt speaks for the job; an earlier one would end
+		// the consumer's turn while a retry might still answer it.
+		if errors.Is(err, asynq.SkipRetry) || (hasMaxRetry && retryCount >= maxRetry) {
+			h.reportFailure(ctx, payload, err)
+		}
 		return err
 	}
 
@@ -680,6 +710,28 @@ func (h *JobHandler) HandleTask(ctx context.Context, task *asynq.Task) error {
 		"attempt", retryCount+1,
 	)
 	return nil
+}
+
+// errAnswerDelivered marks a processJob failure that happened after stage 7
+// published the complete frame: the consumer already has the answer.
+var errAnswerDelivered = errors.New("answer already delivered to the consumer")
+
+// errorFramePublishTimeout bounds the error frame when the job's own context
+// is already cancelled, so shutdown is never held up by it.
+const errorFramePublishTimeout = 5 * time.Second
+
+// reportFailure publishes the error frame for a job that has definitively
+// failed. It stays silent when the answer was already delivered, because an
+// error frame then would replace a delivered answer with an error.
+func (h *JobHandler) reportFailure(ctx context.Context, p JobPayload, err error) {
+	if h.responsePublisher == nil || errors.Is(err, errAnswerDelivered) {
+		return
+	}
+	// A cancelled job context (timeout, shutdown) is often why the job
+	// failed; the consumer still needs to hear about it.
+	pubCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), errorFramePublishTimeout)
+	defer cancel()
+	h.responsePublisher.PublishError(pubCtx, p.JobID, p.SessionID, p.CorrelationID)
 }
 
 // processJob executes the 8-stage inference pipeline.
@@ -728,6 +780,16 @@ func (h *JobHandler) processJob(ctx context.Context, p JobPayload) (err error) {
 		h.metrics.JobTotalDuration.WithLabelValues(
 			cacheState, delivery, outcome,
 		).Observe(time.Since(jobStart).Seconds())
+	}()
+
+	// delivered flips once stage 7 has handed the consumer the answer (or a
+	// retry finds it already delivered). A later failure is tagged so the
+	// entry points don't follow a delivered answer with an error frame.
+	delivered := false
+	defer func() {
+		if err != nil && delivered {
+			err = fmt.Errorf("%w (%w)", err, errAnswerDelivered)
+		}
 	}()
 
 	// Stage 0: on-chain deadline guard. completeJob reverts DeadlineExceeded
@@ -876,6 +938,7 @@ func (h *JobHandler) processJob(ctx context.Context, p JobPayload) (err error) {
 	// Stage 7: Publish to Redis (non-fatal on error). Skipped on retry if
 	// the checkpoint records delivered=true so relay subscribers don't see
 	// a duplicate complete frame.
+	delivered = true
 	if ckpt.Delivered {
 		h.metrics.CheckpointEvents.WithLabelValues(metrics.CheckpointEventHitDelivered).Inc()
 		logger.Info(
