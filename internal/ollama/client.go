@@ -9,7 +9,9 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"net/http"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -681,4 +683,76 @@ func (c *OllamaClient) VerifyModels(ctx context.Context, models []string) error 
 	}
 
 	return nil
+}
+
+// ThinkingModels returns the subset of models whose Ollama capabilities
+// include "thinking". Such a model spends part of num_predict reasoning even
+// with think=false (qwen3-vl and gpt-oss ignore it), so it needs a larger cap
+// than a plain model or it can exhaust the budget before writing any answer.
+// Models /api/show cannot describe are skipped and reported in the error;
+// the ones it could describe are still returned.
+func (c *OllamaClient) ThinkingModels(ctx context.Context, models []string) ([]string, error) {
+	var thinking []string
+	var errs []error
+	for _, m := range models {
+		caps, err := c.capabilities(ctx, m)
+		if err != nil {
+			errs = append(errs, fmt.Errorf("%s: %w", m, err))
+			continue
+		}
+		if slices.Contains(caps, "thinking") {
+			thinking = append(thinking, m)
+		}
+	}
+	return thinking, errors.Join(errs...)
+}
+
+func (c *OllamaClient) capabilities(ctx context.Context, model string) ([]string, error) {
+	body, err := json.Marshal(map[string]string{"model": model})
+	if err != nil {
+		return nil, err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+"/api/show", bytes.NewReader(body))
+	if err != nil {
+		return nil, fmt.Errorf("create show request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("ollama show request: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		msg, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+		return nil, fmt.Errorf("ollama show returned status %d: %s", resp.StatusCode, msg)
+	}
+	var show struct {
+		Capabilities []string `json:"capabilities"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&show); err != nil {
+		return nil, fmt.Errorf("decode show response: %w", err)
+	}
+	return show.Capabilities, nil
+}
+
+// WithReasoningAllowance returns a copy of the per-model overrides in which
+// every reasoning model without an explicit num_predict runs under
+// numPredict. An explicit MODEL_OPTIONS cap always wins: heat-tier aliases
+// use it as the paid budget and it must not be raised behind their back.
+func WithReasoningAllowance(opts map[string]ClientOptions, thinking []string, numPredict int) map[string]ClientOptions {
+	if len(thinking) == 0 {
+		return opts
+	}
+	out := maps.Clone(opts)
+	if out == nil {
+		out = make(map[string]ClientOptions, len(thinking))
+	}
+	for _, m := range thinking {
+		o := out[m]
+		if o.NumPredict == 0 {
+			o.NumPredict = numPredict
+		}
+		out[m] = o
+	}
+	return out
 }

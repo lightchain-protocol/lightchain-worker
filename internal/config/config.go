@@ -88,6 +88,14 @@ type Config struct {
 	OllamaNumCtx     int
 	OllamaThink      bool
 
+	// OllamaReasoningNumPredict is the num_predict cap for models whose
+	// Ollama capabilities include "thinking", detected at startup. Some of
+	// them reason even with think=false (qwen3-vl, gpt-oss), and at the
+	// plain-model cap they can spend the whole budget thinking and return
+	// no answer. An explicit MODEL_OPTIONS num_predict still wins; 0 turns
+	// the detection off. The on-chain deadline guard bounds the extra time.
+	OllamaReasoningNumPredict int
+
 	// ModelOptions holds per-model generation-option overrides parsed from
 	// MODEL_OPTIONS. Grammar:
 	//
@@ -472,6 +480,7 @@ func Load() (*Config, error) {
 	cfg.OllamaNumPredict = parseInt("OLLAMA_NUM_PREDICT", 1024, &errs)
 	cfg.OllamaNumCtx = parseInt("OLLAMA_NUM_CTX", 0, &errs)
 	cfg.OllamaThink = parseBool("OLLAMA_THINK", false, &errs)
+	cfg.OllamaReasoningNumPredict = parseInt("OLLAMA_REASONING_NUM_PREDICT", 4096, &errs)
 	cfg.StreamChunkTokens = parseInt("STREAM_CHUNK_TOKENS", 8, &errs)
 	cfg.StreamChunkInterval = parseDuration("STREAM_CHUNK_INTERVAL", "250ms", &errs)
 	cfg.StreamReasoning = parseBool("STREAM_REASONING", true, &errs)
