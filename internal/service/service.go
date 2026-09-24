@@ -296,6 +296,14 @@ func New(cfg *config.Config) (*Service, error) {
 	if err := ollamaClient.VerifyModels(context.Background(), cfg.SupportedModels); err != nil {
 		logger.Warn("ollama model verification failed (non-fatal)", "error", err)
 	}
+	if cfg.OllamaReasoningNumPredict > 0 {
+		thinking, err := ollamaClient.ThinkingModels(context.Background(), cfg.SupportedModels)
+		if err != nil {
+			logger.Warn("ollama reasoning-model detection incomplete (non-fatal)", "error", err)
+		}
+		cfg.ModelOptions = ollama.WithReasoningAllowance(cfg.ModelOptions, thinking, cfg.OllamaNumPredict, cfg.OllamaReasoningNumPredict)
+		logger.Info("reasoning models detected", "models", thinking, "numPredict", cfg.OllamaReasoningNumPredict)
+	}
 
 	// Blob fetcher + submitter (mode-dependent)
 	blobMode := strings.ToLower(strings.TrimSpace(os.Getenv("BLOB_MODE")))
