@@ -620,3 +620,51 @@ func TestOptions_ReportsEffectiveKnobs(t *testing.T) {
 	assert.Equal(t, 8192, overridden.Options().NumPredict)
 	assert.Equal(t, 6144, client.Options().NumPredict)
 }
+
+func TestThinkingModels_ReadsCapabilities(t *testing.T) {
+	t.Parallel()
+
+	caps := map[string][]string{
+		"qwen3-vl:8b": {"completion", "vision", "thinking"},
+		"llama3-8b":   {"completion"},
+	}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		assert.Equal(t, "/api/show", r.URL.Path)
+		var body struct {
+			Model string `json:"model"`
+		}
+		require.NoError(t, json.NewDecoder(r.Body).Decode(&body))
+		c, ok := caps[body.Model]
+		if !ok {
+			http.Error(w, `{"error":"model not found"}`, http.StatusNotFound)
+			return
+		}
+		json.NewEncoder(w).Encode(map[string]any{"capabilities": c})
+	}))
+	defer srv.Close()
+
+	client := NewOllamaClient(srv.URL, 5*time.Second)
+	got, err := client.ThinkingModels(context.Background(), []string{"qwen3-vl:8b", "llama3-8b", "missing"})
+	require.Error(t, err, "a model Ollama cannot describe is reported")
+	assert.Equal(t, []string{"qwen3-vl:8b"}, got, "the models it could describe are still classified")
+}
+
+func TestWithReasoningAllowance(t *testing.T) {
+	t.Parallel()
+
+	temp := 0.2
+	explicit := map[string]ClientOptions{
+		"gpt-oss:20b": {NumPredict: 8192},
+		"qwen3-vl:8b": {Temperature: &temp},
+	}
+	got := WithReasoningAllowance(explicit, []string{"gpt-oss:20b", "qwen3-vl:8b", "deepseek-r1"}, 4096)
+
+	assert.Equal(t, 8192, got["gpt-oss:20b"].NumPredict, "an explicit MODEL_OPTIONS cap wins")
+	assert.Equal(t, 4096, got["qwen3-vl:8b"].NumPredict)
+	assert.Same(t, &temp, got["qwen3-vl:8b"].Temperature, "other overrides survive")
+	assert.Equal(t, 4096, got["deepseek-r1"].NumPredict)
+	_, touched := explicit["deepseek-r1"]
+	assert.False(t, touched, "the parsed MODEL_OPTIONS map is not mutated")
+
+	assert.Nil(t, WithReasoningAllowance(nil, nil, 4096), "no reasoning models keeps the nil map")
+}
