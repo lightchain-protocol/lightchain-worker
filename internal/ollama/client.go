@@ -739,8 +739,10 @@ func (c *OllamaClient) capabilities(ctx context.Context, model string) ([]string
 // every reasoning model without an explicit num_predict runs under
 // numPredict. An explicit MODEL_OPTIONS cap always wins: heat-tier aliases
 // use it as the paid budget and it must not be raised behind their back.
-func WithReasoningAllowance(opts map[string]ClientOptions, thinking []string, numPredict int) map[string]ClientOptions {
-	if len(thinking) == 0 {
+// It only ever raises the process-wide cap base: a base of -1/-2 (unlimited)
+// or one already at numPredict or above is left alone.
+func WithReasoningAllowance(opts map[string]ClientOptions, thinking []string, base, numPredict int) map[string]ClientOptions {
+	if len(thinking) == 0 || base <= 0 || numPredict <= base {
 		return opts
 	}
 	out := maps.Clone(opts)
