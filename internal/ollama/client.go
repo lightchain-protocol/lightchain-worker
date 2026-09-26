@@ -57,10 +57,11 @@ type GenerateRequest struct {
 	Stream    bool     `json:"stream"`
 	KeepAlive any      `json:"keep_alive,omitempty"`
 	Options   *Options `json:"options,omitempty"`
-	// Think toggles a reasoning model's hidden thinking channel. Nil omits
-	// the field. Ollama accepts it against non-reasoning models too, where
-	// it is simply ignored, so it is safe to send unconditionally.
-	Think *bool `json:"think,omitempty"`
+	// Think toggles a reasoning model's hidden thinking channel: a bool, or
+	// an effort level ("low", "medium", "high") for models that take one.
+	// Nil omits the field. Ollama accepts it against non-reasoning models
+	// too, where it is simply ignored, so it is safe to send unconditionally.
+	Think any `json:"think,omitempty"`
 	// Format constrains the output shape. "json" puts the model in JSON
 	// mode; a JSON-schema object constrains it further. Needed so an agent
 	// plan can be parsed rather than scraped out of prose with a regex.
@@ -101,7 +102,7 @@ type ChatRequest struct {
 	Stream    bool          `json:"stream"`
 	KeepAlive any           `json:"keep_alive,omitempty"`
 	Options   *Options      `json:"options,omitempty"`
-	Think     *bool         `json:"think,omitempty"`
+	Think     any           `json:"think,omitempty"`
 	Format    any           `json:"format,omitempty"`
 }
 
@@ -217,6 +218,11 @@ type ClientOptions struct {
 	// Worse, a model that spends its whole budget reasoning returns empty
 	// Content, which settles on chain as an answer of zero bytes.
 	Think *bool
+	// ThinkLevel, when set, is sent instead of Think. gpt-oss ignores
+	// think=false and reasons at its default effort, which on a long
+	// conversation used up a 4096-token budget before any answer; "low"
+	// keeps its reasoning to a few sentences.
+	ThinkLevel string
 	// Temperature overrides the model's sampling temperature when set.
 	Temperature *float64
 	// Format constrains output shape ("json", or a JSON schema object).
@@ -227,6 +233,19 @@ type ClientOptions struct {
 // ThinkSetting renders a ClientOptions.Think value.
 func ThinkSetting(enabled bool) *bool {
 	return &enabled
+}
+
+// thinkField is the request's think value: the effort level when one is set,
+// else the on/off switch, else nil so the field is omitted. It returns an
+// untyped nil rather than a nil *bool, which would marshal as "think":null.
+func (o ClientOptions) thinkField() any {
+	if o.ThinkLevel != "" {
+		return o.ThinkLevel
+	}
+	if o.Think != nil {
+		return *o.Think
+	}
+	return nil
 }
 
 // TagsResponse is the JSON body returned from GET /api/tags.
@@ -329,7 +348,7 @@ func (c *OllamaClient) Generate(ctx context.Context, model, prompt string) (stri
 		Stream:    false,
 		KeepAlive: c.keepAlive(),
 		Options:   c.requestOptions(),
-		Think:     c.opts.Think,
+		Think:     c.opts.thinkField(),
 		Format:    c.opts.Format,
 	}
 
@@ -379,7 +398,7 @@ func (c *OllamaClient) Chat(ctx context.Context, model string, messages []ChatMe
 		Stream:    false,
 		KeepAlive: c.keepAlive(),
 		Options:   c.requestOptions(),
-		Think:     c.opts.Think,
+		Think:     c.opts.thinkField(),
 		Format:    c.opts.Format,
 	}
 
@@ -438,7 +457,7 @@ func (c *OllamaClient) GenerateStream(
 		Stream:    true,
 		KeepAlive: c.keepAlive(),
 		Options:   c.requestOptions(),
-		Think:     c.opts.Think,
+		Think:     c.opts.thinkField(),
 		Format:    c.opts.Format,
 		Images:    images,
 	}
@@ -537,7 +556,7 @@ func (c *OllamaClient) ChatStream(
 		Stream:    true,
 		KeepAlive: c.keepAlive(),
 		Options:   c.requestOptions(),
-		Think:     c.opts.Think,
+		Think:     c.opts.thinkField(),
 		Format:    c.opts.Format,
 	}
 
