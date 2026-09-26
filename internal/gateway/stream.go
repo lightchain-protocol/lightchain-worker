@@ -184,6 +184,14 @@ func (p *StreamPublisher) PublishMetadata(
 	}
 }
 
+// PublishError is a deliberate no-op. The worker-gateway stream ingress
+// accepts only chunk, metadata and complete frames and counts anything else
+// as a violation, closing the stream after a few, which would cut off every
+// other job in flight on it. Enable once the gateway accepts error frames.
+func (p *StreamPublisher) PublishError(_ context.Context, jobID, _ uint64, _ string) {
+	p.logger.Debug("stream: error frame not sent (gateway ingress rejects it)", "jobID", jobID)
+}
+
 // PublishResponse sends the final complete frame. Ordering with in-flight
 // chunks is preserved by using the same queue while connected; when the
 // stream is down (or the queue is full) it falls back to the gateway's bulk

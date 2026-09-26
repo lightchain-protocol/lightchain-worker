@@ -57,6 +57,8 @@ func (r *recordingPublisher) PublishResponse(_ context.Context, _, _ uint64, _, 
 	r.responseAt = time.Now()
 }
 
+func (r *recordingPublisher) PublishError(context.Context, uint64, uint64, string) {}
+
 func (r *recordingPublisher) SupportsChunks() bool { return true }
 
 func (r *recordingPublisher) PublishChunk(_ context.Context, _, _ uint64, _ string, seq uint32, _ pkgtypes.FrameKind, _ []byte) {
