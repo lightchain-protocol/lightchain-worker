@@ -102,7 +102,8 @@ type Config struct {
 	//	MODEL_OPTIONS="name:key=value,key=value;name2:key=value"
 	//
 	// where every name must appear verbatim in SUPPORTED_MODELS and the
-	// allowed keys are num_predict, num_ctx, temperature. Only the named
+	// allowed keys are num_predict, num_ctx, temperature, think
+	// (low|medium|high: a reasoning-effort level). Only the named
 	// fields are overridden per job (via OllamaClient.WithOverrides); every
 	// other model and every unspecified knob keeps the process-wide default,
 	// so an unset MODEL_OPTIONS reproduces request bodies byte for byte.
@@ -833,7 +834,9 @@ func cutLast(s string, sep byte) (before, after string, found bool) {
 // Every failure appends to errs and returns nil — a malformed MODEL_OPTIONS
 // is a startup error, never a partially-applied map. Rules:
 //   - every name must match a SUPPORTED_MODELS entry verbatim;
-//   - keys are limited to num_predict, num_ctx, temperature;
+//   - keys are limited to num_predict, num_ctx, temperature, think;
+//   - think must be low, medium or high (sent as Ollama's think level; the
+//     on/off switch stays process-wide in OLLAMA_THINK);
 //   - num_predict follows the OLLAMA_NUM_PREDICT rule (positive, -1, or -2);
 //   - num_ctx must be positive (0 is the "unset" sentinel, so writing it
 //     explicitly is a typo);
@@ -922,8 +925,15 @@ func parseModelOptions(raw string, supported []string, errs *[]string) map[strin
 					continue
 				}
 				opts.Temperature = &v
+			case "think":
+				if value != "low" && value != "medium" && value != "high" {
+					*errs = append(*errs, fmt.Sprintf("MODEL_OPTIONS: %s: think must be low, medium or high, got %q", name, value))
+					entryOK = false
+					continue
+				}
+				opts.ThinkLevel = value
 			default:
-				*errs = append(*errs, fmt.Sprintf("MODEL_OPTIONS: %s: unknown option key %q (allowed: num_predict, num_ctx, temperature)", name, key))
+				*errs = append(*errs, fmt.Sprintf("MODEL_OPTIONS: %s: unknown option key %q (allowed: num_predict, num_ctx, temperature, think)", name, key))
 				entryOK = false
 			}
 		}

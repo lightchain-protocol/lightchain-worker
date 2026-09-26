@@ -45,6 +45,26 @@ func TestInferenceClientFor_AppliesPerModelOverride(t *testing.T) {
 	assert.NotSame(t, base, client)
 }
 
+func TestInferenceClientFor_AppliesThinkLevel(t *testing.T) {
+	base := ollama.NewOllamaClientWithOptions("http://unused", 5*time.Second, ollama.ClientOptions{
+		Think: ollama.ThinkSetting(false),
+	})
+	h := &JobHandler{
+		ollamaClient: base,
+		logger:       slog.New(slog.NewTextHandler(io.Discard, nil)),
+		cfg: HandlerConfig{
+			ModelOptions: map[string]ollama.ClientOptions{
+				"gpt-oss:120b": {ThinkLevel: "low"},
+			},
+		},
+	}
+
+	_, opts, applied := h.inferenceClientFor(h.logger, "gpt-oss:120b")
+	require.True(t, applied)
+	assert.Equal(t, "low", opts.ThinkLevel)
+	assert.Empty(t, base.Options().ThinkLevel, "every other model keeps think=false")
+}
+
 func TestInferenceClientFor_NoEntryKeepsSharedClient(t *testing.T) {
 	base := ollama.NewOllamaClientWithOptions("http://unused", 5*time.Second, ollama.ClientOptions{
 		NumPredict: 1024,
