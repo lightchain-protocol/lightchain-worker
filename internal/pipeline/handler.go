@@ -951,16 +951,11 @@ func (h *JobHandler) processJob(ctx context.Context, p JobPayload) (err error) {
 		)
 	} else {
 		rec = h.metrics.StartStage(metrics.StageRedisPublish, model, delivery)
-		// completePayload and ciphertext intentionally differ for v2 search jobs:
-		// the relay complete frame carries the PLAIN answer (consumer contract),
-		// while ciphertext stays the {answer,searchContext} envelope used by the
-		// blob + on-chain responseCiphertextHash (the disputer reads it). Do NOT
-		// unify these — see relayCompleteCiphertext.
-		completePayload := ciphertext
-		if sk, skErr := h.getOrDeriveSessionKey(ctx, logger, p.SessionID); skErr == nil {
-			completePayload = h.relayCompleteCiphertext(sk, ciphertext)
-		} // on key error, fall back to ciphertext (non-fatal; matches existing publish best-effort posture)
-		h.publishToRedis(ctx, logger, p.JobID, p.SessionID, p.CorrelationID, completePayload, chunkFrames+1)
+		// The terminal frame carries the committed ciphertext byte for byte,
+		// including a search job's v2 {answer, searchContext} envelope, which
+		// consumers unwrap for display. Relaying any other bytes under the
+		// worker's signature is a valid disputeResponseMismatch proof.
+		h.publishToRedis(ctx, logger, p.JobID, p.SessionID, p.CorrelationID, ciphertext, chunkFrames+1)
 		d = rec.End(metrics.OutcomeOK, metrics.CacheMiss)
 		logger.Info(
 			"stage 7 complete",
@@ -1948,28 +1943,6 @@ func init() {
 		{Type: uint256Ty}, // sessionId
 		{Type: bytesTy},   // ciphertext
 	}
-}
-
-// relayCompleteCiphertext returns the ciphertext to deliver on the relay
-// `complete` frame. For a v2 search envelope it re-encrypts just the plain
-// answer (the v1.1 consumer contract — the envelope with searchContext stays in
-// the blob for the disputer). For a legacy/plain ciphertext it returns it
-// unchanged. Best-effort: on any decrypt/decode/encrypt error it falls back to
-// the original ciphertext (never fails the job).
-func (h *JobHandler) relayCompleteCiphertext(sessionKey, blobCiphertext []byte) []byte {
-	plain, err := pkgcrypto.Decrypt(sessionKey, blobCiphertext)
-	if err != nil {
-		return blobCiphertext
-	}
-	env := searchaug.DecodeResponse(plain)
-	if env.V != searchaug.ResponseEnvelopeVersion {
-		return blobCiphertext // legacy/non-search: already the plain answer
-	}
-	ac, err := pkgcrypto.Encrypt(sessionKey, []byte(env.Answer))
-	if err != nil {
-		return blobCiphertext
-	}
-	return ac
 }
 
 // publishToRedis signs and publishes the terminal response frame via the
