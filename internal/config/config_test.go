@@ -919,6 +919,19 @@ func TestLoad_ColonInModelName(t *testing.T) {
 	assert.Equal(t, 8192, cfg.ModelOptions["gpt-oss:20b"].NumCtx)
 }
 
+func TestLoad_ModelOptions_ThinkLevel(t *testing.T) {
+	validEnv(t)
+	t.Setenv("SUPPORTED_MODELS", "llama3-8b,gpt-oss:120b")
+	t.Setenv("MODEL_OPTIONS", "gpt-oss:120b:think=low")
+
+	cfg, err := Load()
+	require.NoError(t, err)
+	opts := cfg.ModelOptions["gpt-oss:120b"]
+	assert.Equal(t, "low", opts.ThinkLevel)
+	assert.Equal(t, 0, opts.NumPredict, "think alone leaves the cap to the reasoning allowance")
+	assert.NotContains(t, cfg.ModelOptions, "llama3-8b")
+}
+
 // Every malformed shape is a startup failure. These are the fraud-by-config
 // guards: none of these may silently degrade to default behavior.
 func TestLoad_ModelOptions_ValidationFailures(t *testing.T) {
@@ -944,6 +957,7 @@ func TestLoad_ModelOptions_ValidationFailures(t *testing.T) {
 		{"temperature above range", "llama3-8b:temperature=2.5", "temperature must be"},
 		{"temperature negative", "llama3-8b:temperature=-0.1", "temperature must be"},
 		{"temperature non-float", "llama3-8b:temperature=hot", "temperature must be"},
+		{"think is a level, not the on/off switch", "llama3-8b:think=false", "think must be low, medium or high"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

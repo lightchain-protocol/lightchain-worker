@@ -431,6 +431,9 @@ func (h *JobHandler) inferenceClientFor(logger *slog.Logger, modelName string) (
 		if override.Temperature != nil {
 			o.Temperature = override.Temperature
 		}
+		if override.ThinkLevel != "" {
+			o.ThinkLevel = override.ThinkLevel
+		}
 	})
 	return client, client.Options(), true
 }
