@@ -6,13 +6,16 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"math/big"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/ethereum/go-ethereum/accounts"
 	"github.com/ethereum/go-ethereum/common"
+	"github.com/ethereum/go-ethereum/crypto"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -590,54 +593,88 @@ func TestDecodePromptDrivesSearch(t *testing.T) {
 	}
 }
 
-// TestRelayCompleteCiphertext verifies that relayCompleteCiphertext strips the
-// v2 search envelope before the relay complete frame so the frontend receives
-// the plain answer, not the JSON blob.
-func TestRelayCompleteCiphertext(t *testing.T) {
+// completeRecorder captures the terminal frame's ciphertext and signature.
+type completeRecorder struct {
+	recordingPublisher
+	ciphertext []byte
+	signature  string
+}
+
+func (c *completeRecorder) PublishResponse(_ context.Context, _, _ uint64, _, sig string, ct []byte, _ uint32) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.ciphertext, c.signature = ct, sig
+}
+
+// TestSearchJob_TerminalFrameIsTheCommittedCiphertext pins the invariant
+// JobRegistry.disputeResponseMismatch enforces: the ciphertext the worker signs
+// on the terminal frame must be byte-identical to the one it commits in
+// completeJob. A search job used to relay a re-encrypted plain answer instead,
+// handing every consumer a valid slashing proof against an honest worker.
+func TestSearchJob_TerminalFrameIsTheCommittedCiphertext(t *testing.T) {
 	t.Parallel()
 
-	// Minimal JobHandler — relayCompleteCiphertext only uses pkgcrypto + searchaug,
-	// no other dependencies.
-	h := &JobHandler{}
+	sessionKey := testSessionKey(t)
+	ecdhKey := testECDHKey(t)
+	signingKey := testSigningKey(t)
+	chainID := big.NewInt(9200)
+	registry := common.HexToAddress("0x1234")
 
-	t.Run("v2 envelope: complete frame decrypts to plain answer", func(t *testing.T) {
-		t.Parallel()
+	var committed [32]byte
+	chain := &mockChainClient{
+		ackJobFn: func(context.Context, uint64) error { return nil },
+		completeJobFn: func(_ context.Context, _ uint64, _, h [32]byte) error {
+			committed = h
+			return nil
+		},
+		getEncWorkerKeyFn: func(context.Context, uint64) ([]byte, error) {
+			return encryptSessionKeyForWorker(t, sessionKey, ecdhKey), nil
+		},
+	}
+	fetcher := &mockBlobFetcher{fetchFn: func(context.Context, common.Hash, uint64) ([]byte, error) {
+		return pkgcrypto.Encrypt(sessionKey, searchaug.EncodePrompt("what year is it?", true))
+	}}
+	submitter := &mockBlobSubmitter{submitFn: func(context.Context, []byte) ([][32]byte, error) {
+		return [][32]byte{{0x01}}, nil
+	}}
+	gen := &mockOllama{generateFn: func(context.Context, string, string) (string, error) {
+		return "the answer", nil
+	}}
+	pub := &completeRecorder{}
+	logger := slog.New(slog.NewTextHandler(io.Discard, &slog.HandlerOptions{Level: slog.LevelError}))
 
-		sk := testSessionKey(t)
+	handler := NewJobHandler(
+		chain, fetcher, submitter, newMockKeyStore(), gen, nil,
+		signingKey, ecdhKey, &atomic.Int32{}, logger,
+		HandlerConfig{
+			AckTxTimeout:     5 * time.Second,
+			BlobTxTimeout:    60 * time.Second,
+			SearchMaxResults: 3,
+			ChainID:          chainID,
+			JobRegistryAddr:  registry,
+		},
+		pub, nil, testMetrics(t), metrics.DeliveryAsynq,
+		&fakeSearcher{sources: twoSources()},
+	)
+	payload := testPayload(t)
+	require.NoError(t, handler.HandleJobPayload(context.Background(), payload))
 
-		// Build a v2 blob ciphertext as stage 6 would produce it.
-		envBytes, err := searchaug.EncodeResponse("the answer", toSearchaugSources(twoSources()))
-		require.NoError(t, err)
-		blobCt, err := pkgcrypto.Encrypt(sk, envBytes)
-		require.NoError(t, err)
+	require.NotEmpty(t, pub.ciphertext, "terminal frame must be published")
+	assert.Equal(t, common.Hash(committed), crypto.Keccak256Hash(pub.ciphertext),
+		"terminal frame ciphertext must hash to the completeJob commitment")
 
-		out := h.relayCompleteCiphertext(sk, blobCt)
+	digest, err := responseMismatchDigest(chainID, registry, payload.JobID, payload.SessionID, pub.ciphertext)
+	require.NoError(t, err)
+	signer, err := crypto.SigToPub(accounts.TextHash(digest), common.FromHex(pub.signature))
+	require.NoError(t, err)
+	assert.Equal(t, crypto.PubkeyToAddress(signingKey.PublicKey), crypto.PubkeyToAddress(*signer))
 
-		// The relay frame must decrypt to the plain answer — NOT the envelope JSON.
-		plain, decErr := pkgcrypto.Decrypt(sk, out)
-		require.NoError(t, decErr)
-		assert.Equal(t, "the answer", string(plain),
-			"relay complete frame must carry the plain answer, not the v2 envelope JSON")
-	})
-
-	t.Run("legacy/plain: complete frame passes through unchanged (decrypts to plain answer)", func(t *testing.T) {
-		t.Parallel()
-
-		sk := testSessionKey(t)
-
-		// Non-search job: EncodeResponse with nil sources returns raw answer bytes.
-		rawBytes, err := searchaug.EncodeResponse("plain answer", nil)
-		require.NoError(t, err)
-		blobCt, err := pkgcrypto.Encrypt(sk, rawBytes)
-		require.NoError(t, err)
-
-		out := h.relayCompleteCiphertext(sk, blobCt)
-
-		plain, decErr := pkgcrypto.Decrypt(sk, out)
-		require.NoError(t, decErr)
-		assert.Equal(t, "plain answer", string(plain),
-			"relay complete frame for non-search job must decrypt to the plain answer")
-	})
+	// The frame carries the v2 envelope; consumers unwrap it for display.
+	plain, err := pkgcrypto.Decrypt(sessionKey, pub.ciphertext)
+	require.NoError(t, err)
+	env := searchaug.DecodeResponse(plain)
+	assert.Equal(t, "the answer", env.Answer)
+	assert.Len(t, env.SearchContext, 2)
 }
 
 // TestStage5_ModelReceivesSearchAugmentedPrompt pins the hand-off between
