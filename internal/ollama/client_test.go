@@ -340,6 +340,32 @@ func TestThink_FalseIsSentExplicitly(t *testing.T) {
 	assert.Equal(t, false, raw["think"])
 }
 
+// A per-model effort level replaces the on/off switch: gpt-oss ignores
+// think=false but keeps its reasoning short at "low".
+func TestThink_LevelIsSentInsteadOfSwitch(t *testing.T) {
+	t.Parallel()
+
+	var raw map[string]any
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		require.NoError(t, json.NewDecoder(r.Body).Decode(&raw))
+		json.NewEncoder(w).Encode(ChatResponse{
+			Message: ChatMessage{Role: "assistant", Content: "ok"},
+			Done:    true,
+		})
+	}))
+	defer srv.Close()
+
+	client := NewOllamaClientWithOptions(srv.URL, 5*time.Second, ClientOptions{
+		Think:      ThinkSetting(false),
+		ThinkLevel: "low",
+	})
+	_, err := client.Chat(context.Background(), "gpt-oss:120b",
+		[]ChatMessage{{Role: "user", Content: "hi"}})
+	require.NoError(t, err)
+
+	assert.Equal(t, "low", raw["think"])
+}
+
 func TestGenerateStream_StopsAtDone(t *testing.T) {
 	t.Parallel()
 
