@@ -505,6 +505,13 @@ func New(cfg *config.Config) (*Service, error) {
 		deliveryLabel = metrics.DeliveryGateway
 	}
 
+	// Sortition mode has no dispatcher to name a chat job's prior jobs, so
+	// the handler lists them from the chain.
+	var historyLookback uint64
+	if cfg.SortitionEnabled {
+		historyLookback = cfg.SortitionHistoryLookbackBlocks
+	}
+
 	handler := pipeline.NewJobHandler(
 		chainClient,
 		blobFetcher,
@@ -541,6 +548,8 @@ func New(cfg *config.Config) (*Service, error) {
 			TTSTimeout:           cfg.TTSTimeout,
 			SearchMaxResults:    cfg.SearchMaxResults,
 			SearchTimeout:       cfg.SearchTimeout,
+
+			HistoryLookbackBlocks: historyLookback,
 		},
 		publisher, // nil for internal profiles — fallback wires RedisResponsePublisher
 		checkpoints,
@@ -810,19 +819,18 @@ func New(cfg *config.Config) (*Service, error) {
 			LookbackBlocks:  cfg.SortitionSessionLookbackBlocks,
 		})
 		jobWatcher = sortition.NewJobWatcher(sortition.JobWatcherOpts{
-			Client:                chainClient,
-			KeyChecker:            checker,
-			Sink:                  handler,
-			Cursor:                cursorStore,
-			Worker:                workerAddr,
-			JobCounter:            jobCounter,
-			MaxConcurrent:         cfg.MaxConcurrentJobs,
-			ChunkSize:             cfg.SortitionChunkSize,
-			Confirmations:         cfg.SortitionConfirmations,
-			HistoryLookbackBlocks: cfg.SortitionHistoryLookbackBlocks,
-			SessionRetryLimit:     cfg.SortitionSessionRetryLimit,
-			PollInterval:          cfg.SortitionPollInterval,
-			Logger:                logger,
+			Client:            chainClient,
+			KeyChecker:        checker,
+			Sink:              handler,
+			Cursor:            cursorStore,
+			Worker:            workerAddr,
+			JobCounter:        jobCounter,
+			MaxConcurrent:     cfg.MaxConcurrentJobs,
+			ChunkSize:         cfg.SortitionChunkSize,
+			Confirmations:     cfg.SortitionConfirmations,
+			SessionRetryLimit: cfg.SortitionSessionRetryLimit,
+			PollInterval:      cfg.SortitionPollInterval,
+			Logger:            logger,
 		})
 		logger.Info(
 			"sortition mode enabled",

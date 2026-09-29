@@ -206,6 +206,20 @@ type HandlerConfig struct {
 	TTSTimeout  time.Duration
 	SearchMaxResults    int
 	SearchTimeout       time.Duration
+
+	// HistoryLookbackBlocks, when non-zero, has the handler list a chat
+	// job's earlier jobs in its session from the chain (JobSubmitted events
+	// this many blocks back) when the payload names none. Sortition mode sets
+	// it: there is no dispatcher to supply PriorJobIDs. Zero leaves history
+	// to the payload.
+	HistoryLookbackBlocks uint64
+}
+
+// priorJobLister is the optional chain-client extension that lists a
+// session's earlier jobs, satisfied by *chain.ChainClient. A client without
+// it serves payloads that name no prior jobs single-turn.
+type priorJobLister interface {
+	GetPriorSessionJobIDs(ctx context.Context, sessionID, currentJobID, fromBlock, toBlock uint64) ([]uint64, error)
 }
 
 // ResponsePublisher publishes encrypted responses for real-time delivery.
@@ -1221,12 +1235,18 @@ func (h *JobHandler) runInferencePipeline(
 	}
 
 	// A self-contained job carries its whole conversation, so the session's
-	// earlier jobs are never fetched: they may be other conversations.
+	// earlier jobs are never looked up: they may be other conversations.
+	priorJobIDs := p.PriorJobIDs
+	if envelope.SelfContained() {
+		priorJobIDs = nil
+	} else if len(priorJobIDs) == 0 {
+		priorJobIDs = h.listPriorJobs(infCtx, logger, &p)
+	}
 	var history []ollama.ChatMessage
-	if len(p.PriorJobIDs) > 0 && !envelope.SelfContained() {
+	if len(priorJobIDs) > 0 {
 		histStart := time.Now()
 		var hErr error
-		history, hErr = h.buildConversationHistory(infCtx, p.PriorJobIDs, sessionKey)
+		history, hErr = h.buildConversationHistory(infCtx, priorJobIDs, sessionKey)
 		if hErr != nil {
 			logger.Warn(
 				"failed to build conversation history, falling back to single prompt",
@@ -1237,7 +1257,7 @@ func (h *JobHandler) runInferencePipeline(
 		} else {
 			logger.Info("conversation history built",
 				"stage", "build_history",
-				"priorJobs", len(p.PriorJobIDs),
+				"priorJobs", len(priorJobIDs),
 				"historyTurns", len(history),
 				"durationMs", time.Since(histStart).Milliseconds(),
 			)
@@ -2042,6 +2062,29 @@ func responseMismatchDigest(
 		return nil, fmt.Errorf("pack mismatch payload: %w", err)
 	}
 	return crypto.Keccak256(encoded), nil
+}
+
+// listPriorJobs lists the session's jobs submitted before p within the
+// configured look-back, for a payload that names none. Best-effort: a failed
+// listing serves the job single-turn.
+func (h *JobHandler) listPriorJobs(ctx context.Context, logger *slog.Logger, p *JobPayload) []uint64 {
+	lister, ok := h.chainClient.(priorJobLister)
+	if !ok || h.cfg.HistoryLookbackBlocks == 0 {
+		return nil
+	}
+	var from uint64
+	if p.BlockNumber > h.cfg.HistoryLookbackBlocks {
+		from = p.BlockNumber - h.cfg.HistoryLookbackBlocks
+	}
+	ids, err := lister.GetPriorSessionJobIDs(ctx, p.SessionID, p.JobID, from, p.BlockNumber)
+	if err != nil {
+		logger.Warn("prior session jobs lookup failed; serving single-turn",
+			"stage", "build_history",
+			"error", err,
+		)
+		return nil
+	}
+	return ids
 }
 
 // buildConversationHistory fetches prior jobs' prompt and response blobs,
