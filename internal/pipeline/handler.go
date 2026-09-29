@@ -24,6 +24,7 @@ import (
 	"golang.org/x/sync/singleflight"
 
 	pkgcrypto "github.com/lightchain/pkg/crypto"
+	"github.com/lightchain/pkg/promptenv"
 	"github.com/lightchain/pkg/searchaug"
 	pkgtypes "github.com/lightchain/pkg/types"
 
@@ -1187,9 +1188,14 @@ func (h *JobHandler) runInferencePipeline(
 	// already unwrapped a search envelope (and augmented it when sources
 	// came back), while a multimodal envelope passes through searchaug
 	// untouched and is parsed here as before.
-	envelope, err := decodePrompt([]byte(promptText))
+	envelope, err := promptenv.Decode([]byte(promptText))
 	if err != nil {
-		return nil, 0, fmt.Errorf("stage 5 (decode prompt): %w", err)
+		err = fmt.Errorf("stage 5 (decode prompt): %w", err)
+		// A malformed self-contained job fails the same way on every attempt.
+		if errors.Is(err, promptenv.ErrInvalidSelfContained) {
+			return nil, 0, noRetry(err)
+		}
+		return nil, 0, err
 	}
 
 	// Deadline gate: an acknowledged job whose remaining window cannot
@@ -1214,8 +1220,10 @@ func (h *JobHandler) runInferencePipeline(
 		return nil, 0, err
 	}
 
+	// A self-contained job carries its whole conversation, so the session's
+	// earlier jobs are never fetched: they may be other conversations.
 	var history []ollama.ChatMessage
-	if len(p.PriorJobIDs) > 0 {
+	if len(p.PriorJobIDs) > 0 && !envelope.SelfContained() {
 		histStart := time.Now()
 		var hErr error
 		history, hErr = h.buildConversationHistory(infCtx, p.PriorJobIDs, sessionKey)
@@ -1247,7 +1255,7 @@ func (h *JobHandler) runInferencePipeline(
 	startAttrs := []any{
 		"stage", "inference",
 		"model", modelName,
-		"promptBytes", envelope.bytes(),
+		"promptBytes", envelope.Bytes(),
 		"promptImages", len(envelope.Images),
 		"historyTurns", len(history),
 		"streaming", streamer != nil,
@@ -1411,7 +1419,9 @@ func (h *JobHandler) runInference(
 			text string
 			err  error
 		)
-		if len(history) > 0 || len(prompt.Images) > 0 {
+		// A self-contained job always chats, even for a single user turn,
+		// so the disputer re-runs it through the same call.
+		if len(history) > 0 || len(prompt.Images) > 0 || prompt.SelfContained() {
 			text, err = client.Chat(ctx, modelName, chatMessages(history, prompt))
 		} else {
 			text, err = client.Generate(ctx, modelName, prompt.Text)
@@ -1438,7 +1448,7 @@ func (h *JobHandler) runInference(
 		stats    ollama.StreamStats
 		err      error
 	)
-	if len(history) > 0 || len(prompt.Images) > 0 {
+	if len(history) > 0 || len(prompt.Images) > 0 || prompt.SelfContained() {
 		response, stats, err = streamer.client.ChatStream(ctx, modelName, chatMessages(history, prompt), handlers)
 	} else {
 		response, stats, err = streamer.client.GenerateStream(ctx, modelName, prompt.Text, prompt.Images, handlers)
@@ -1460,8 +1470,16 @@ func (h *JobHandler) runInference(
 }
 
 // chatMessages appends the current prompt as the final user turn. Images ride
-// on that turn: Ollama attaches them to the most recent user message.
+// on that turn: Ollama attaches them to the most recent user message. A
+// self-contained job's messages are the whole conversation, as sent.
 func chatMessages(history []ollama.ChatMessage, prompt promptEnvelope) []ollama.ChatMessage {
+	if prompt.SelfContained() {
+		messages := make([]ollama.ChatMessage, 0, len(prompt.Messages))
+		for _, m := range prompt.Messages {
+			messages = append(messages, ollama.ChatMessage{Role: m.Role, Content: m.Content})
+		}
+		return messages
+	}
 	messages := make([]ollama.ChatMessage, 0, len(history)+1)
 	messages = append(messages, history...)
 	return append(messages, ollama.ChatMessage{
@@ -2068,7 +2086,7 @@ func (h *JobHandler) buildConversationHistory(
 			plain, _, dErr := searchaug.DecodePrompt(promptText)
 			var env promptEnvelope
 			if dErr == nil {
-				env, dErr = decodePrompt([]byte(plain))
+				env, dErr = promptenv.Decode([]byte(plain))
 			}
 			if dErr != nil {
 				// Practically unreachable: stages 4.5 and 5 reject the same
