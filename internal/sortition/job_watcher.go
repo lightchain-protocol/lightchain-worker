@@ -26,7 +26,6 @@ type ServeClient interface {
 	GetJobBlobInfo(ctx context.Context, jobID uint64) (promptHash, respHash common.Hash, submitBlock, completeBlock uint64, err error)
 	GetSessionInfo(ctx context.Context, sessionID uint64) (chain.SessionInfo, error)
 	GetSessionEncWorkerKey(ctx context.Context, sessionID uint64) ([]byte, error)
-	GetPriorSessionJobIDs(ctx context.Context, sessionID, currentJobID, fromBlock, toBlock uint64) ([]uint64, error)
 }
 
 // KeyChecker validates that the session key is decryptable before serving a
@@ -52,10 +51,6 @@ type JobWatcherOpts struct {
 	MaxConcurrent int
 	ChunkSize     uint64
 	Confirmations uint64
-	// HistoryLookbackBlocks bounds the JobSubmitted scan used to reconstruct a
-	// session's prior job IDs for conversation history. Defaults to 50000 when
-	// zero.
-	HistoryLookbackBlocks uint64
 	// SessionRetryLimit bounds how many passes a job may stop-and-retry on
 	// chain.ErrSessionNotActive before it is given up on (cursor advances,
 	// skipping the job) so one session that never returns to Active cannot
@@ -83,7 +78,6 @@ type JobWatcher struct {
 	maxJobs           int
 	chunk             uint64
 	confs             uint64
-	historyLookback   uint64
 	sessionRetryLimit int
 	// notActiveRetries counts consecutive chain.ErrSessionNotActive passes per
 	// jobID. Only ever touched from RunOnce, which Start() calls sequentially
@@ -106,10 +100,6 @@ func NewJobWatcher(o JobWatcherOpts) *JobWatcher {
 	if interval == 0 {
 		interval = 30 * time.Second
 	}
-	lookback := o.HistoryLookbackBlocks
-	if lookback == 0 {
-		lookback = 50000 // ~1.15 days at 2s blocks; covers any realistic session
-	}
 	retryLimit := o.SessionRetryLimit
 	if retryLimit == 0 {
 		retryLimit = 10
@@ -124,7 +114,6 @@ func NewJobWatcher(o JobWatcherOpts) *JobWatcher {
 		maxJobs:           o.MaxConcurrent,
 		chunk:             chunk,
 		confs:             o.Confirmations,
-		historyLookback:   lookback,
 		sessionRetryLimit: retryLimit,
 		notActiveRetries:  make(map[uint64]int),
 		interval:          interval,
@@ -311,19 +300,9 @@ func (w *JobWatcher) RunOnce(ctx context.Context) error {
 				CorrelationID:  fmt.Sprintf("%d-%d", ev.SessionID, ev.JobID),
 			}
 
-			// Sortition mode has no dispatcher to supply PriorJobIDs, so
-			// reconstruct the session's earlier jobs from the chain for
-			// conversation history. Best-effort: on error, serve single-turn.
-			var from uint64
-			if submitBlock > w.historyLookback {
-				from = submitBlock - w.historyLookback
-			}
-			if prior, phErr := w.c.GetPriorSessionJobIDs(ctx, ev.SessionID, ev.JobID, from, submitBlock); phErr != nil {
-				w.log.Warn("prior session jobs lookup failed; serving single-turn",
-					"jobId", ev.JobID, "sessionId", ev.SessionID, "error", phErr)
-			} else if len(prior) > 0 {
-				payload.PriorJobIDs = prior
-			}
+			// PriorJobIDs stays empty: the handler lists the session's earlier
+			// jobs itself once it has decoded the prompt, and only for a job
+			// that is not self-contained.
 
 			if w.syncServe {
 				// Test hook: synchronous serve makes tests deterministic without

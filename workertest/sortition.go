@@ -169,6 +169,9 @@ func NewSortitionHarness(t testing.TB, opts SortitionOptions) *SortitionHarness 
 			ModelIDToName:       opts.ModelIDToName,
 			ChainID:             big.NewInt(opts.ChainID),
 			JobRegistryAddr:     opts.JobRegistryAddress,
+
+			// Sortition mode: the handler lists a chat job's prior jobs.
+			HistoryLookbackBlocks: 5000,
 		},
 		nil, // publisher — fallback wires RedisResponsePublisher from RedisClient
 		checkpoints,
@@ -200,19 +203,18 @@ func NewSortitionHarness(t testing.TB, opts SortitionOptions) *SortitionHarness 
 			OwnCapabilities: ownCaps,
 		}),
 		jobWatcher: sortition.NewJobWatcher(sortition.JobWatcherOpts{
-			Client:                chainClient,
-			KeyChecker:            ecdhChecker{key: opts.ECDHKey},
-			Sink:                  &notifySink{inner: handler, served: served},
-			Cursor:                cursorStore,
-			Worker:                workerAddr,
-			JobCounter:            jobCounter,
-			MaxConcurrent:         1,
-			ChunkSize:             2048,
-			Confirmations:         0,
-			HistoryLookbackBlocks: 5000,
-			SessionRetryLimit:     3,
-			PollInterval:          time.Second,
-			Logger:                opts.Logger,
+			Client:            chainClient,
+			KeyChecker:        ecdhChecker{key: opts.ECDHKey},
+			Sink:              &notifySink{inner: handler, served: served},
+			Cursor:            cursorStore,
+			Worker:            workerAddr,
+			JobCounter:        jobCounter,
+			MaxConcurrent:     1,
+			ChunkSize:         2048,
+			Confirmations:     0,
+			SessionRetryLimit: 3,
+			PollInterval:      time.Second,
+			Logger:            opts.Logger,
 		}),
 	}
 	return h
