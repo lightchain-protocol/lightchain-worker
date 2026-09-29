@@ -6,6 +6,7 @@ import (
 	"io"
 	"log/slog"
 	"math/big"
+	"strings"
 	"testing"
 
 	"github.com/ethereum/go-ethereum/common"
@@ -545,4 +546,73 @@ func TestEnsureCapabilities_NoNamesNoDeclaration_NoOp(t *testing.T) {
 	mgr := NewManager(mock, testAddr, nil, newLogger())
 	mgr.EnsureCapabilities(context.Background(), nil)
 	assert.Zero(t, setCalls, "no transaction when the mask is already empty")
+}
+
+// capabilityBits registers "search" at bit 0 and, when selfContained is set,
+// "self-contained" at bit 1; any other name is unregistered.
+func capabilityBits(selfContained bool) func(context.Context, string) (*big.Int, error) {
+	return func(_ context.Context, name string) (*big.Int, error) {
+		switch {
+		case name == "search":
+			return big.NewInt(1), nil
+		case name == SelfContainedCapability && selfContained:
+			return big.NewInt(2), nil
+		}
+		return big.NewInt(0), nil
+	}
+}
+
+func TestDesiredCapabilities_DeclaresSelfContained(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		search bool
+		want   int64
+	}{
+		{"search off", false, 2},
+		{"search on", true, 3},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var setMask *big.Int
+			mock := &mockClient{
+				getCapabilityMaskFn: capabilityBits(true),
+				getWorkerCapabilitiesFn: func(context.Context, common.Address) (*big.Int, error) {
+					return big.NewInt(0), nil
+				},
+				setCapabilitiesFn: func(_ context.Context, mask *big.Int) error {
+					setMask = mask
+					return nil
+				},
+			}
+
+			NewManager(mock, testAddr, nil, newLogger()).EnsureCapabilities(context.Background(), DesiredCapabilities(tc.search))
+
+			require.NotNil(t, setMask)
+			assert.Zero(t, setMask.Cmp(big.NewInt(tc.want)), "declared mask %s", setMask)
+		})
+	}
+}
+
+// Before the owner registers "self-contained" the worker logs it and goes on
+// as before - including clearing a capability its configuration dropped.
+func TestDesiredCapabilities_SelfContainedNotRegistered(t *testing.T) {
+	var logs strings.Builder
+	logger := slog.New(slog.NewTextHandler(&logs, nil))
+	var setMask *big.Int
+	mock := &mockClient{
+		getCapabilityMaskFn: capabilityBits(false),
+		getWorkerCapabilitiesFn: func(context.Context, common.Address) (*big.Int, error) {
+			return big.NewInt(1), nil // search declared by an earlier run
+		},
+		setCapabilitiesFn: func(_ context.Context, mask *big.Int) error {
+			setMask = mask
+			return nil
+		},
+	}
+
+	NewManager(mock, testAddr, nil, logger).EnsureCapabilities(context.Background(), DesiredCapabilities(false))
+
+	assert.Contains(t, logs.String(), "capability not registered on-chain")
+	assert.Contains(t, logs.String(), SelfContainedCapability)
+	require.NotNil(t, setMask, "the dropped search bit must still be cleared")
+	assert.Zero(t, setMask.Sign())
 }

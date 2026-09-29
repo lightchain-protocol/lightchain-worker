@@ -169,6 +169,21 @@ func (m *RegistrationManager) Deregister(ctx context.Context) error {
 	return nil
 }
 
+// SelfContainedCapability is declared by every binary that serves
+// self-contained jobs (those carrying their whole conversation). Developer API
+// sessions require it, so only such a worker can claim them.
+const SelfContainedCapability = "self-contained"
+
+// DesiredCapabilities is the capability list this binary declares on chain:
+// self-contained always, search only when it is configured.
+func DesiredCapabilities(search bool) []string {
+	caps := []string{SelfContainedCapability}
+	if search {
+		caps = append(caps, "search")
+	}
+	return caps
+}
+
 // EnsureCapabilities syncs the worker's on-chain capability mask to the
 // desired capability names — the worker's configuration is the source of
 // truth, matching setCapabilities' overwrite (not merge) semantics. A worker
@@ -178,7 +193,7 @@ func (m *RegistrationManager) Deregister(ctx context.Context) error {
 //
 // Best-effort by design: every failure is logged and skipped, never fatal —
 // the worker must come up even when a capability is not yet registered
-// on-chain or the RPC read fails. If any desired name fails to resolve, the
+// on-chain or the RPC read fails. If any desired name's lookup fails, the
 // sync degrades to add-only (never clears bits on partial knowledge). The
 // on-chain claimSession check is the enforcement point, not this call.
 func (m *RegistrationManager) EnsureCapabilities(ctx context.Context, names []string) {
@@ -192,8 +207,9 @@ func (m *RegistrationManager) EnsureCapabilities(ctx context.Context, names []st
 			continue
 		}
 		if mask.Sign() == 0 {
+			// Known, not partial: an unregistered name has no bit to keep,
+			// so it must not stop a dropped capability from being cleared.
 			m.logger.Warn("capability not registered on-chain; skipping declaration", "name", name)
-			resolvedAll = false
 			continue
 		}
 		want.Or(want, mask)

@@ -127,14 +127,13 @@ func NewSortitionHarness(t testing.TB, opts SortitionOptions) *SortitionHarness 
 	}
 	t.Cleanup(chainClient.Close)
 
-	// Production startup path (service.go): declare capabilities implied by the
-	// search configuration, then read the final mask back for the watcher.
+	// Production startup path (service.go): declare this binary's capabilities,
+	// search when configured, then read the final mask back for the watcher.
 	var searcher search.Searcher
-	var desiredCaps []string
 	if opts.TavilyURL != "" {
 		searcher = search.NewTavilyClient(opts.TavilyURL, "workertest-key", 10*time.Second)
-		desiredCaps = append(desiredCaps, "search")
 	}
+	desiredCaps := registration.DesiredCapabilities(opts.TavilyURL != "")
 	capCtx, capCancel := context.WithTimeout(context.Background(), 30*time.Second)
 	registration.NewManager(chainClient, workerAddr, nil, opts.Logger).EnsureCapabilities(capCtx, desiredCaps)
 	ownCaps, err := chainClient.GetWorkerCapabilities(capCtx, workerAddr)

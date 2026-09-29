@@ -773,15 +773,13 @@ func New(cfg *config.Config) (*Service, error) {
 			chainClient.Close()
 			return nil, fmt.Errorf("open sortition cursor store: %w", csErr)
 		}
-		// Best-effort capability self-declaration (same predicate that
-		// advertises "search" in the heartbeat), then one read of the final mask
-		// for the watcher's politeness skip. Every failure degrades to an empty
-		// mask — unconstrained requests stay claimable and the on-chain
-		// claimSession check remains the guarantee for constrained ones.
-		var desiredCaps []string
-		if cfg.SearchEnabled && cfg.TavilyAPIKey != "" {
-			desiredCaps = append(desiredCaps, "search")
-		}
+		// Best-effort capability self-declaration ("self-contained" always,
+		// "search" on the same predicate that advertises it in the heartbeat),
+		// then one read of the final mask for the watcher's politeness skip.
+		// Every failure degrades to an empty mask — unconstrained requests
+		// stay claimable and the on-chain claimSession check remains the
+		// guarantee for constrained ones.
+		desiredCaps := registration.DesiredCapabilities(cfg.SearchEnabled && cfg.TavilyAPIKey != "")
 		capCtx, capCancel := context.WithTimeout(context.Background(), 30*time.Second)
 		registration.NewManager(chainClient, workerAddr, nil, logger).EnsureCapabilities(capCtx, desiredCaps)
 		capCancel()
