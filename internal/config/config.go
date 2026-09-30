@@ -314,7 +314,7 @@ type Config struct {
 	SortitionConfirmations uint64
 	// SortitionHistoryLookbackBlocks bounds the JobSubmitted scan the job
 	// handler uses in sortition mode to find a chat job's prior job IDs for
-	// conversation history. Defaults to 50000.
+	// conversation history. Defaults to 50000, also when set to 0.
 	SortitionHistoryLookbackBlocks uint64
 	// SortitionSessionLookbackBlocks is how far behind its persisted cursor the
 	// SessionWatcher re-scans on its first pass after a start, so requests it had
