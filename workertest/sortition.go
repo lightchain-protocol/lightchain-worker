@@ -169,9 +169,6 @@ func NewSortitionHarness(t testing.TB, opts SortitionOptions) *SortitionHarness 
 			ModelIDToName:       opts.ModelIDToName,
 			ChainID:             big.NewInt(opts.ChainID),
 			JobRegistryAddr:     opts.JobRegistryAddress,
-
-			// Sortition mode: the handler lists a chat job's prior jobs.
-			HistoryLookbackBlocks: 5000,
 		},
 		nil, // publisher — fallback wires RedisResponsePublisher from RedisClient
 		checkpoints,
@@ -179,6 +176,10 @@ func NewSortitionHarness(t testing.TB, opts SortitionOptions) *SortitionHarness 
 		metrics.DeliveryAsynq, // pure sortition keeps the asynq delivery label (service.go parity)
 		searcher,
 	)
+
+	// Sortition mode (service.go parity): the handler lists a chat job's
+	// prior jobs from the chain.
+	handler.SetPriorJobLister(chainClient, 5000)
 
 	cursorStore, err := sortition.NewCursorStore(t.TempDir())
 	if err != nil {

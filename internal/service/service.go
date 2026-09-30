@@ -479,7 +479,7 @@ func New(cfg *config.Config) (*Service, error) {
 	// Capability tokens advertised in every heartbeat, Redis or gateway.
 	capabilities := []string{}
 	if cfg.SearchEnabled && cfg.TavilyAPIKey != "" {
-		capabilities = append(capabilities, "search")
+		capabilities = append(capabilities, registration.SearchCapability)
 	}
 
 	// External profile: replace the direct-Redis publisher with the gateway
@@ -503,13 +503,6 @@ func New(cfg *config.Config) (*Service, error) {
 		extStreamPub = gw.NewStreamPublisher(extGwClient, logger)
 		publisher = extStreamPub
 		deliveryLabel = metrics.DeliveryGateway
-	}
-
-	// Sortition mode has no dispatcher to name a chat job's prior jobs, so
-	// the handler lists them from the chain.
-	var historyLookback uint64
-	if cfg.SortitionEnabled {
-		historyLookback = cfg.SortitionHistoryLookbackBlocks
 	}
 
 	handler := pipeline.NewJobHandler(
@@ -548,8 +541,6 @@ func New(cfg *config.Config) (*Service, error) {
 			TTSTimeout:           cfg.TTSTimeout,
 			SearchMaxResults:    cfg.SearchMaxResults,
 			SearchTimeout:       cfg.SearchTimeout,
-
-			HistoryLookbackBlocks: historyLookback,
 		},
 		publisher, // nil for internal profiles — fallback wires RedisResponsePublisher
 		checkpoints,
@@ -803,6 +794,10 @@ func New(cfg *config.Config) (*Service, error) {
 			logger.Warn("worker capability mask read failed; watcher runs with empty mask", "error", capErr)
 			ownCaps = big.NewInt(0)
 		}
+
+		// No dispatcher names a chat job's prior jobs here; the handler
+		// lists them from the chain.
+		handler.SetPriorJobLister(chainClient, cfg.SortitionHistoryLookbackBlocks)
 
 		checker := ecdhKeyChecker{key: ecdhKey}
 		sessionWatcher = sortition.NewSessionWatcher(sortition.SessionWatcherOpts{
