@@ -797,7 +797,7 @@ func New(cfg *config.Config) (*Service, error) {
 
 		// No dispatcher names a chat job's prior jobs here; the handler
 		// lists them from the chain.
-		handler.SetPriorJobLister(chainClient, cfg.SortitionHistoryLookbackBlocks)
+		handler.SetPriorJobLister(chainClient)
 
 		checker := ecdhKeyChecker{key: ecdhKey}
 		sessionWatcher = sortition.NewSessionWatcher(sortition.SessionWatcherOpts{

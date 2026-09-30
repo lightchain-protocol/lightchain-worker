@@ -179,7 +179,7 @@ func NewSortitionHarness(t testing.TB, opts SortitionOptions) *SortitionHarness 
 
 	// Sortition mode (service.go parity): the handler lists a chat job's
 	// prior jobs from the chain.
-	handler.SetPriorJobLister(chainClient, 5000)
+	handler.SetPriorJobLister(chainClient)
 
 	cursorStore, err := sortition.NewCursorStore(t.TempDir())
 	if err != nil {

@@ -26,6 +26,7 @@ import (
 	pkgcrypto "github.com/lightchain/pkg/crypto"
 	"github.com/lightchain/pkg/promptenv"
 	"github.com/lightchain/pkg/searchaug"
+	"github.com/lightchain/pkg/sessionhistory"
 	pkgtypes "github.com/lightchain/pkg/types"
 
 	"github.com/lightchain/worker/internal/metrics"
@@ -208,12 +209,6 @@ type HandlerConfig struct {
 	SearchTimeout       time.Duration
 }
 
-// priorJobLister lists a session's earlier jobs from the chain; see
-// SetPriorJobLister. *chain.ChainClient satisfies it.
-type priorJobLister interface {
-	GetPriorSessionJobIDs(ctx context.Context, sessionID, currentJobID, fromBlock, toBlock uint64) ([]uint64, error)
-}
-
 // ResponsePublisher publishes encrypted responses for real-time delivery.
 // Implementations: RedisResponsePublisher (direct Redis PUBLISH) and
 // gateway-based publisher (POST to worker-gateway).
@@ -314,10 +309,9 @@ type JobHandler struct {
 	// (TTS). Nil leaves every voice path inert.
 	voiceEngine VoiceEngine
 	// priorJobs is set in sortition mode (via SetPriorJobLister) to list a
-	// chat job's earlier jobs, historyLookback blocks back, when the payload
-	// names none. Nil leaves history to the payload.
-	priorJobs       priorJobLister
-	historyLookback uint64
+	// chat job's earlier jobs when the payload names none. Nil leaves history
+	// to the payload.
+	priorJobs sessionhistory.Lister
 	// keyFetchGroup coalesces concurrent cache-miss derivations for the same
 	// session so that N parallel jobs trigger exactly one chain RPC. Only
 	// getOrDeriveSessionKey uses it; refreshSessionKey deliberately bypasses
@@ -332,15 +326,11 @@ func (h *JobHandler) SetReleaseTracker(t ReleaseTracker) {
 }
 
 // SetPriorJobLister has the handler list a chat job's earlier jobs in its
-// session from the chain, lookbackBlocks back (50000 when zero), whenever the
-// payload names none. Sortition mode needs it: there is no dispatcher to name
-// them. Call before serving jobs.
-func (h *JobHandler) SetPriorJobLister(l priorJobLister, lookbackBlocks uint64) {
-	if lookbackBlocks == 0 {
-		lookbackBlocks = 50000 // ~1.15 days at 2s blocks; covers any realistic session
-	}
+// session from the chain, through the lookup the disputer shares, whenever
+// the payload names none. Sortition mode needs it: there is no dispatcher to
+// name them. Call before serving jobs.
+func (h *JobHandler) SetPriorJobLister(l sessionhistory.Lister) {
 	h.priorJobs = l
-	h.historyLookback = lookbackBlocks
 }
 
 // NewJobHandler creates a handler wired with all dependencies. publisher
@@ -1251,31 +1241,10 @@ func (h *JobHandler) runInferencePipeline(
 
 	// A self-contained job carries its whole conversation, so the session's
 	// earlier jobs are never looked up: they may be other conversations.
-	priorJobIDs := p.PriorJobIDs
-	if envelope.SelfContained() {
-		priorJobIDs = nil
-	} else if len(priorJobIDs) == 0 {
-		priorJobIDs = h.listPriorJobs(infCtx, logger, &p)
-	}
 	var history []promptenv.Message
-	if len(priorJobIDs) > 0 {
-		histStart := time.Now()
-		var hErr error
-		history, hErr = h.buildConversationHistory(infCtx, priorJobIDs, sessionKey)
-		if hErr != nil {
-			logger.Warn(
-				"failed to build conversation history, falling back to single prompt",
-				"stage", "inference",
-				"error", hErr,
-			)
-			history = nil
-		} else {
-			logger.Info("conversation history built",
-				"stage", "build_history",
-				"priorJobs", len(priorJobIDs),
-				"historyTurns", len(history),
-				"durationMs", time.Since(histStart).Milliseconds(),
-			)
+	if !envelope.SelfContained() {
+		if history, err = h.conversationHistory(infCtx, logger, &p, sessionKey); err != nil {
+			return nil, 0, fmt.Errorf("stage 5 (build history): %w", err)
 		}
 	}
 
@@ -2075,88 +2044,54 @@ func responseMismatchDigest(
 	return crypto.Keccak256(encoded), nil
 }
 
-// listPriorJobs lists the session's jobs submitted before p within the
-// configured look-back, for a payload that names none. Best-effort: a failed
-// listing serves the job single-turn.
-func (h *JobHandler) listPriorJobs(ctx context.Context, logger *slog.Logger, p *JobPayload) []uint64 {
-	if h.priorJobs == nil {
-		return nil
+// conversationHistory rebuilds the turns before p in its session: the jobs
+// the payload names, else the ones the shared lookup finds on chain. The
+// disputer rebuilds the same turns through the same lookup to re-run the job,
+// so a failure here fails the job rather than serving it on a history the
+// disputer would not reproduce.
+func (h *JobHandler) conversationHistory(
+	ctx context.Context,
+	logger *slog.Logger,
+	p *JobPayload,
+	sessionKey []byte,
+) ([]promptenv.Message, error) {
+	start := time.Now()
+	ids := p.PriorJobIDs
+	if len(ids) == 0 && h.priorJobs != nil {
+		var err error
+		if ids, err = sessionhistory.PriorJobs(ctx, h.priorJobs, p.SessionID, p.JobID, p.BlockNumber); err != nil {
+			return nil, fmt.Errorf("list prior jobs: %w", err)
+		}
 	}
-	var from uint64
-	if p.BlockNumber > h.historyLookback {
-		from = p.BlockNumber - h.historyLookback
+	if len(ids) == 0 {
+		return nil, nil
 	}
-	ids, err := h.priorJobs.GetPriorSessionJobIDs(ctx, p.SessionID, p.JobID, from, p.BlockNumber)
+	history, err := h.buildConversationHistory(ctx, ids, sessionKey)
 	if err != nil {
-		logger.Warn(
-			"prior session jobs lookup failed; serving single-turn",
-			"stage", "build_history",
-			"error", err,
-		)
-		return nil
+		return nil, err
 	}
-	return ids
+	logger.Info(
+		"conversation history built",
+		"stage", "build_history",
+		"priorJobs", len(ids),
+		"historyTurns", len(history),
+		"durationMs", time.Since(start).Milliseconds(),
+	)
+	return history, nil
 }
 
-// buildConversationHistory fetches prior jobs' prompt and response blobs,
-// decrypts them, and assembles an ordered conversation.
+// buildConversationHistory replays priorJobIDs through the shared history
+// rebuild the disputer uses too.
 //
 // Security: the prior job IDs come from the dispatcher or from this session's
-// JobSubmitted events on chain (never user input). Additionally, blobs are
-// decrypted with the current session's key â€” if a job ID belongs to a
-// different session, decryption will fail, preventing cross-session data
-// leakage.
+// JobSubmitted events on chain (never user input), and blobs decrypt only
+// with the current session's key.
 func (h *JobHandler) buildConversationHistory(
 	ctx context.Context,
 	priorJobIDs []uint64,
 	sessionKey []byte,
 ) ([]promptenv.Message, error) {
-	var messages []promptenv.Message
-
-	for _, jobID := range priorJobIDs {
-		promptHash, responseHash, submitBlock, completionBlock, err := h.chainClient.GetJobBlobInfo(ctx, jobID)
-		if err != nil {
-			return nil, fmt.Errorf("get blob hashes for job %d: %w", jobID, err)
-		}
-
-		// Fetch and decrypt prompt. Post-audit each job carries a
-		// single prompt blob; the on-chain tx submission lives in submitBlock.
-		if promptHash != (common.Hash{}) {
-			promptBlob, err := h.blobFetcher.FetchBlob(ctx, promptHash, submitBlock)
-			if err != nil {
-				return nil, fmt.Errorf("fetch prompt blob for job %d: %w", jobID, err)
-			}
-			promptText, err := pkgcrypto.Decrypt(sessionKey, promptBlob)
-			if err != nil {
-				return nil, fmt.Errorf("decrypt prompt for job %d: %w", jobID, err)
-			}
-			// Replayed by the shared package, as the disputer replays it: a
-			// search prompt as its question, an envelope as its text and
-			// images rather than raw JSON with base64 payloads that waste
-			// num_ctx. A self-contained job was another conversation in
-			// this session, so it and its answer are left out.
-			turn, ok := promptenv.Replay(promptText)
-			if !ok {
-				continue
-			}
-			messages = append(messages, turn)
-		}
-
-		// Fetch and decrypt response (single blob, lives in completeJob TX block).
-		if responseHash != (common.Hash{}) {
-			responseBlob, err := h.blobFetcher.FetchBlob(ctx, responseHash, completionBlock)
-			if err != nil {
-				return nil, fmt.Errorf("fetch response blob for job %d: %w", jobID, err)
-			}
-			responseText, err := pkgcrypto.Decrypt(sessionKey, responseBlob)
-			if err != nil {
-				return nil, fmt.Errorf("decrypt response for job %d: %w", jobID, err)
-			}
-			messages = append(messages, promptenv.Message{Role: "assistant", Content: searchaug.DecodeResponse(responseText).Answer})
-		}
-	}
-
-	return messages, nil
+	return sessionhistory.Build(ctx, h.chainClient, h.blobFetcher, sessionKey, priorJobIDs)
 }
 
 func (h *JobHandler) resolveModelName(modelID string) (string, error) {
