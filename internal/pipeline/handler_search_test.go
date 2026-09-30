@@ -44,6 +44,7 @@ type recordingPublisher struct {
 	responseCalled bool
 	responseAt     time.Time
 	chunkSeqs      []uint32
+	errorFrames    int
 }
 
 func (r *recordingPublisher) PublishMetadata(_ context.Context, _, _ uint64, _ string, _ []byte) {
@@ -60,7 +61,11 @@ func (r *recordingPublisher) PublishResponse(_ context.Context, _, _ uint64, _, 
 	r.responseAt = time.Now()
 }
 
-func (r *recordingPublisher) PublishError(context.Context, uint64, uint64, string) {}
+func (r *recordingPublisher) PublishError(context.Context, uint64, uint64, string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.errorFrames++
+}
 
 func (r *recordingPublisher) SupportsChunks() bool { return true }
 

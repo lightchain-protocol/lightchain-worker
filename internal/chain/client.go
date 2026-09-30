@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"log/slog"
 	"math/big"
-	"sort"
 	"sync"
 	"time"
 
@@ -18,6 +17,7 @@ import (
 	"github.com/ethereum/go-ethereum/ethclient"
 
 	"github.com/lightchain/pkg/chain/bindings"
+	"github.com/lightchain/pkg/sessionhistory"
 )
 
 // defaultDisputeWindowCacheTTL is used when SetDisputeWindowCacheTTL has not
@@ -1111,40 +1111,14 @@ func (c *ChainClient) FilterJobSubmitted(ctx context.Context, fromBlock, toBlock
 	return out, nil
 }
 
-// GetPriorSessionJobIDs returns the ascending list of job IDs submitted for
-// sessionID strictly before currentJobID, scanning JobSubmitted events (indexed
-// by sessionId) in [fromBlock, toBlock]. Used by the sortition JobWatcher to
-// reconstruct the conversation-history job list the dispatcher used to supply.
-func (c *ChainClient) GetPriorSessionJobIDs(ctx context.Context, sessionID, currentJobID, fromBlock, toBlock uint64) ([]uint64, error) {
-	if toBlock < fromBlock {
-		return nil, fmt.Errorf("GetPriorSessionJobIDs: toBlock %d < fromBlock %d", toBlock, fromBlock)
-	}
+// SessionJobIDs lists the ids in sessionID's JobSubmitted events in blocks
+// [fromBlock, toBlock], serving the history lookup the handler shares with
+// the disputer.
+func (c *ChainClient) SessionJobIDs(ctx context.Context, sessionID, fromBlock, toBlock uint64) ([]uint64, error) {
 	if err := c.requireJobRegistry(); err != nil {
 		return nil, err
 	}
-	end := toBlock
-	opts := &bind.FilterOpts{Context: ctx, Start: fromBlock, End: &end}
-	sid := []*big.Int{new(big.Int).SetUint64(sessionID)}
-	iter, err := c.jobRegistry.FilterJobSubmitted(opts, nil, sid)
-	if err != nil {
-		return nil, fmt.Errorf("filter JobSubmitted session %d [%d,%d]: %w", sessionID, fromBlock, toBlock, err)
-	}
-	defer iter.Close()
-	var out []uint64
-	for iter.Next() {
-		ev := iter.Event
-		if ev == nil || ev.JobId == nil {
-			continue
-		}
-		if jid := ev.JobId.Uint64(); jid < currentJobID {
-			out = append(out, jid)
-		}
-	}
-	if err := iter.Error(); err != nil {
-		return nil, fmt.Errorf("iterate JobSubmitted session %d: %w", sessionID, err)
-	}
-	sort.Slice(out, func(i, j int) bool { return out[i] < out[j] })
-	return out, nil
+	return sessionhistory.FilterSessionJobs(ctx, &c.jobRegistry.JobRegistryFilterer, sessionID, fromBlock, toBlock)
 }
 
 // GetSessionInfo fetches session metadata for the given session ID from the

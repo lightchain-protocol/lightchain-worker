@@ -56,11 +56,11 @@ func (c *chatOnlyInference) ChatStream(_ context.Context, _ string, msgs []ollam
 // listingChainClient adds the prior-job listing sortition mode wires in.
 type listingChainClient struct {
 	mockChainClient
-	listFn func(ctx context.Context, sessionID, currentJobID, fromBlock, toBlock uint64) ([]uint64, error)
+	listFn func(ctx context.Context, sessionID, fromBlock, toBlock uint64) ([]uint64, error)
 }
 
-func (c *listingChainClient) GetPriorSessionJobIDs(ctx context.Context, sessionID, currentJobID, fromBlock, toBlock uint64) ([]uint64, error) {
-	return c.listFn(ctx, sessionID, currentJobID, fromBlock, toBlock)
+func (c *listingChainClient) SessionJobIDs(ctx context.Context, sessionID, fromBlock, toBlock uint64) ([]uint64, error) {
+	return c.listFn(ctx, sessionID, fromBlock, toBlock)
 }
 
 // jobRig serves one job over mocks: blobs maps a blob hash to the plaintext
@@ -70,6 +70,7 @@ func (c *listingChainClient) GetPriorSessionJobIDs(ctx context.Context, sessionI
 type jobRig struct {
 	handler *JobHandler
 	chain   *listingChainClient
+	pub     *recordingPublisher
 	payload JobPayload
 	blobs   map[common.Hash]string
 	priors  map[uint64][2]common.Hash
@@ -81,6 +82,7 @@ func newJobRig(t *testing.T, prompt string, inference InferenceClient, stream bo
 	ecdhKey := testECDHKey(t)
 	encSessionKey := encryptSessionKeyForWorker(t, sessionKey, ecdhKey)
 	r := &jobRig{
+		pub:     &recordingPublisher{},
 		payload: testPayload(t),
 		blobs:   map[common.Hash]string{},
 		priors:  map[uint64][2]common.Hash{},
@@ -101,7 +103,7 @@ func newJobRig(t *testing.T, prompt string, inference InferenceClient, stream bo
 				return h[0], h[1], 10, 11, nil
 			},
 		},
-		listFn: func(context.Context, uint64, uint64, uint64, uint64) ([]uint64, error) {
+		listFn: func(context.Context, uint64, uint64, uint64) ([]uint64, error) {
 			t.Error("unexpected listing of the session's prior jobs")
 			return nil, errors.New("prior job listing")
 		},
@@ -128,7 +130,7 @@ func newJobRig(t *testing.T, prompt string, inference InferenceClient, stream bo
 			StreamEnabled:     stream,
 			StreamChunkTokens: 1,
 		},
-		&recordingPublisher{},
+		r.pub,
 		nil,
 		testMetrics(t),
 		metrics.DeliveryAsynq,
@@ -161,7 +163,7 @@ func TestHandleTask_SelfContainedJobChatsWithExactlyItsMessages(t *testing.T) {
 				t.Parallel()
 				inference := &chatOnlyInference{t: t}
 				r := newJobRig(t, f.Envelope, inference, stream)
-				r.handler.SetPriorJobLister(r.chain, 1000)
+				r.handler.SetPriorJobLister(r.chain)
 
 				require.NoError(t, r.run(t))
 
@@ -253,66 +255,74 @@ func TestHandleTask_HistoryReplaysPriorPromptsLikeTheDisputer(t *testing.T) {
 	assert.Equal(t, want, chat)
 }
 
-// Sortition mode has no dispatcher to name a chat job's earlier turns, so
-// the handler lists them from the chain over the look-back window and
-// rebuilds the conversation. A zero look-back means the default, not off.
-func TestHandleTask_ChatJobListsPriorJobsForHistory(t *testing.T) {
+// On a busy chain a session's earlier jobs sit far more than 50 job ids behind
+// the one being served. Sortition mode has no dispatcher to name them, so the
+// handler finds them on chain through the shared lookup and serves the job on
+// their history: exactly the history the disputer rebuilds for the same
+// fixture.
+func TestHandleJobPayload_ChatJobOnABusyChainServesTheSessionsHistory(t *testing.T) {
 	t.Parallel()
-
-	for _, tc := range []struct {
-		lookback, block, wantFrom uint64
-	}{
-		{lookback: 1000, block: 1500, wantFrom: 500},
-		{lookback: 0, block: 60000, wantFrom: 10000},
-	} {
-		t.Run(fmt.Sprintf("lookback=%d", tc.lookback), func(t *testing.T) {
-			t.Parallel()
-			var chat []ollama.ChatMessage
-			oll := &mockOllama{chatFn: func(_ context.Context, _ string, msgs []ollama.ChatMessage) (string, error) {
-				chat = msgs
-				return "second answer", nil
-			}}
-			r := newJobRig(t, "second question", oll, false)
-			r.addPriorJob(7, "first question", "first answer")
-			r.payload.BlockNumber = tc.block
-			var listed []uint64
-			r.chain.listFn = func(_ context.Context, sessionID, currentJobID, fromBlock, toBlock uint64) ([]uint64, error) {
-				listed = []uint64{sessionID, currentJobID, fromBlock, toBlock}
-				return []uint64{7}, nil
-			}
-			r.handler.SetPriorJobLister(r.chain, tc.lookback)
-
-			require.NoError(t, r.run(t))
-
-			assert.Equal(t, []uint64{r.payload.SessionID, r.payload.JobID, tc.wantFrom, tc.block}, listed,
-				"the listing covers the look-back window up to the job's own block")
-			assert.Equal(t, []ollama.ChatMessage{
-				{Role: "user", Content: "first question"},
-				{Role: "assistant", Content: "first answer"},
-				{Role: "user", Content: "second question"},
-			}, chat)
-		})
+	s := promptenvtest.BusySession
+	var chat []ollama.ChatMessage
+	oll := &mockOllama{chatFn: func(_ context.Context, _ string, msgs []ollama.ChatMessage) (string, error) {
+		chat = msgs
+		return "next answer", nil
+	}}
+	r := newJobRig(t, s.Current.Prompt, oll, false)
+	r.payload.JobID, r.payload.SessionID, r.payload.BlockNumber = s.Current.ID, s.Current.SessionID, s.Current.SubmitBlock
+	for _, j := range s.Chain {
+		r.addPriorJob(j.ID, j.Prompt, j.Answer)
 	}
+	r.chain.listFn = func(_ context.Context, sessionID, fromBlock, toBlock uint64) ([]uint64, error) {
+		return s.JobSubmitted(sessionID, fromBlock, toBlock), nil
+	}
+	r.handler.SetPriorJobLister(r.chain)
+
+	require.NoError(t, r.handler.HandleJobPayload(context.Background(), r.payload))
+
+	want := append(toChatMessages(s.History), ollama.ChatMessage{Role: "user", Content: s.Current.Prompt})
+	assert.Equal(t, want, chat)
 }
 
-// The listing is best-effort: when it fails the job is still served,
-// single-turn.
-func TestHandleTask_PriorJobListingFailureServesSingleTurn(t *testing.T) {
+// A history the worker cannot rebuild fails the job: the consumer gets an
+// error frame, and the job is refunded or times out. Serving it on no history
+// instead would leave an answer the disputer cannot reproduce: it rebuilds
+// the whole history to re-run the job.
+func TestHandleJobPayload_HistoryFailureFailsTheJob(t *testing.T) {
 	t.Parallel()
-	var prompt string
-	oll := &mockOllama{generateFn: func(_ context.Context, _, p string) (string, error) {
-		prompt = p
-		return "an answer", nil
-	}}
-	r := newJobRig(t, "second question", oll, false)
-	r.chain.listFn = func(context.Context, uint64, uint64, uint64, uint64) ([]uint64, error) {
-		return nil, errors.New("rpc boom")
+
+	for name, breakChain := range map[string]func(r *jobRig){
+		"listing the session's jobs fails": func(r *jobRig) {
+			r.chain.listFn = func(context.Context, uint64, uint64, uint64) ([]uint64, error) {
+				return nil, errors.New("rpc boom")
+			}
+		},
+		"reading an earlier job fails": func(r *jobRig) {
+			r.chain.listFn = func(context.Context, uint64, uint64, uint64) ([]uint64, error) {
+				return []uint64{7}, nil
+			}
+			r.chain.getJobBlobInfoFn = func(context.Context, uint64) (common.Hash, common.Hash, uint64, uint64, error) {
+				return common.Hash{}, common.Hash{}, 0, 0, errors.New("rpc boom")
+			}
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			model := &mockOllama{
+				generateFn: func(context.Context, string, string) (string, error) {
+					t.Error("the job must not be served without its history")
+					return "", nil
+				},
+			}
+			r := newJobRig(t, "second question", model, false)
+			breakChain(r)
+			r.handler.SetPriorJobLister(r.chain)
+
+			require.Error(t, r.handler.HandleJobPayload(context.Background(), r.payload))
+
+			assert.Equal(t, 1, r.pub.errorFrames, "the consumer must be told the job failed")
+		})
 	}
-	r.handler.SetPriorJobLister(r.chain, 1000)
-
-	require.NoError(t, r.run(t))
-
-	assert.Equal(t, "second question", prompt)
 }
 
 // toChatMessages spells out what the model is expected to receive for a

@@ -312,10 +312,6 @@ type Config struct {
 	SortitionChunkSize     uint64
 	SortitionPollInterval  time.Duration
 	SortitionConfirmations uint64
-	// SortitionHistoryLookbackBlocks bounds the JobSubmitted scan the job
-	// handler uses in sortition mode to find a chat job's prior job IDs for
-	// conversation history. Defaults to 50000, also when set to 0.
-	SortitionHistoryLookbackBlocks uint64
 	// SortitionSessionLookbackBlocks is how far behind its persisted cursor the
 	// SessionWatcher re-scans on its first pass after a start, so requests it had
 	// discovered but not yet been eligible for are not forgotten by a restart.
@@ -558,7 +554,6 @@ func Load() (*Config, error) {
 	cfg.SortitionChunkSize = parseUint64("SORTITION_CHUNK_SIZE", 5000, &errs)
 	cfg.SortitionPollInterval = parseDuration("SORTITION_POLL_INTERVAL", "4s", &errs)
 	cfg.SortitionConfirmations = parseUint64("SORTITION_CONFIRMATIONS", 0, &errs)
-	cfg.SortitionHistoryLookbackBlocks = parseUint64("SORTITION_HISTORY_LOOKBACK_BLOCKS", 50000, &errs)
 	cfg.SortitionSessionLookbackBlocks = parseUint64("SORTITION_SESSION_LOOKBACK_BLOCKS", 2000, &errs)
 	cfg.SortitionSessionRetryLimit = parseInt("SORTITION_SESSION_RETRY_LIMIT", 10, &errs)
 
