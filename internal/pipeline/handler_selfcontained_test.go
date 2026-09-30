@@ -259,7 +259,7 @@ func TestHandleTask_HistoryReplaysPriorPromptsLikeTheDisputer(t *testing.T) {
 		r.payload.PriorJobIDs = append(r.payload.PriorJobIDs, id)
 		if !f.Skipped {
 			want = append(want,
-				ollama.ChatMessage{Role: "user", Content: f.Turn},
+				ollama.ChatMessage{Role: "user", Content: f.Turn, Images: f.Images},
 				ollama.ChatMessage{Role: "assistant", Content: answer})
 		}
 	}
@@ -293,8 +293,7 @@ func TestHandleJobPayload_ChatJobOnABusyChainServesTheSessionsHistory(t *testing
 
 	require.NoError(t, r.handler.HandleJobPayload(context.Background(), r.payload))
 
-	want := append(toChatMessages(s.History), ollama.ChatMessage{Role: "user", Content: s.Current.Prompt})
-	assert.Equal(t, want, chat)
+	assert.Equal(t, toChatMessages(s.Messages), chat)
 }
 
 // The dispatcher names a chat job's earlier jobs from its own best-effort
@@ -319,8 +318,7 @@ func TestHandleTask_ChainLookupWinsOverPriorJobsNamedInThePayload(t *testing.T) 
 
 	require.NoError(t, r.run(t))
 
-	want := append(toChatMessages(s.History), ollama.ChatMessage{Role: "user", Content: s.Current.Prompt})
-	assert.Equal(t, want, chat)
+	assert.Equal(t, toChatMessages(s.Messages), chat)
 }
 
 // A history the worker cannot rebuild fails the job: the consumer gets an
@@ -369,7 +367,7 @@ func TestHandleJobPayload_HistoryFailureFailsTheJob(t *testing.T) {
 func toChatMessages(msgs []promptenv.Message) []ollama.ChatMessage {
 	out := make([]ollama.ChatMessage, 0, len(msgs))
 	for _, m := range msgs {
-		out = append(out, ollama.ChatMessage{Role: m.Role, Content: m.Content})
+		out = append(out, ollama.ChatMessage{Role: m.Role, Content: m.Content, Images: m.Images})
 	}
 	return out
 }
