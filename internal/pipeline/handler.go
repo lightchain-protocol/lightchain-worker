@@ -206,18 +206,10 @@ type HandlerConfig struct {
 	TTSTimeout  time.Duration
 	SearchMaxResults    int
 	SearchTimeout       time.Duration
-
-	// HistoryLookbackBlocks, when non-zero, has the handler list a chat
-	// job's earlier jobs in its session from the chain (JobSubmitted events
-	// this many blocks back) when the payload names none. Sortition mode sets
-	// it: there is no dispatcher to supply PriorJobIDs. Zero leaves history
-	// to the payload.
-	HistoryLookbackBlocks uint64
 }
 
-// priorJobLister is the optional chain-client extension that lists a
-// session's earlier jobs, satisfied by *chain.ChainClient. A client without
-// it serves payloads that name no prior jobs single-turn.
+// priorJobLister lists a session's earlier jobs from the chain; see
+// SetPriorJobLister. *chain.ChainClient satisfies it.
 type priorJobLister interface {
 	GetPriorSessionJobIDs(ctx context.Context, sessionID, currentJobID, fromBlock, toBlock uint64) ([]uint64, error)
 }
@@ -321,6 +313,11 @@ type JobHandler struct {
 	// (STT) and stage 6b can deliver a spoken rendering of the response
 	// (TTS). Nil leaves every voice path inert.
 	voiceEngine VoiceEngine
+	// priorJobs is set in sortition mode (via SetPriorJobLister) to list a
+	// chat job's earlier jobs, historyLookback blocks back, when the payload
+	// names none. Nil leaves history to the payload.
+	priorJobs       priorJobLister
+	historyLookback uint64
 	// keyFetchGroup coalesces concurrent cache-miss derivations for the same
 	// session so that N parallel jobs trigger exactly one chain RPC. Only
 	// getOrDeriveSessionKey uses it; refreshSessionKey deliberately bypasses
@@ -332,6 +329,18 @@ type JobHandler struct {
 // Service wiring calls this once before Run; tests may leave it nil.
 func (h *JobHandler) SetReleaseTracker(t ReleaseTracker) {
 	h.releaseTracker = t
+}
+
+// SetPriorJobLister has the handler list a chat job's earlier jobs in its
+// session from the chain, lookbackBlocks back (50000 when zero), whenever the
+// payload names none. Sortition mode needs it: there is no dispatcher to name
+// them. Call before serving jobs.
+func (h *JobHandler) SetPriorJobLister(l priorJobLister, lookbackBlocks uint64) {
+	if lookbackBlocks == 0 {
+		lookbackBlocks = 50000 // ~1.15 days at 2s blocks; covers any realistic session
+	}
+	h.priorJobs = l
+	h.historyLookback = lookbackBlocks
 }
 
 // NewJobHandler creates a handler wired with all dependencies. publisher
@@ -1211,6 +1220,12 @@ func (h *JobHandler) runInferencePipeline(
 		}
 		return nil, 0, err
 	}
+	// The speech model reads one text aloud and has no chat call for a
+	// conversation, so a self-contained job for it can never be served.
+	if envelope.SelfContained() && h.cfg.SpeechModelName != "" && modelName == h.cfg.SpeechModelName {
+		return nil, 0, noRetry(fmt.Errorf("stage 5 (decode prompt): %w: the speech model takes text, not a conversation",
+			promptenv.ErrInvalidSelfContained))
+	}
 
 	// Deadline gate: an acknowledged job whose remaining window cannot
 	// cover generation plus settlement aborts here with a no-retry error,
@@ -1242,7 +1257,7 @@ func (h *JobHandler) runInferencePipeline(
 	} else if len(priorJobIDs) == 0 {
 		priorJobIDs = h.listPriorJobs(infCtx, logger, &p)
 	}
-	var history []ollama.ChatMessage
+	var history []promptenv.Message
 	if len(priorJobIDs) > 0 {
 		histStart := time.Now()
 		var hErr error
@@ -1420,7 +1435,7 @@ func (h *JobHandler) runInference(
 	client InferenceClient,
 	modelName string,
 	prompt promptEnvelope,
-	history []ollama.ChatMessage,
+	history []promptenv.Message,
 	streamer *chunkStreamer,
 ) (string, ollama.StreamStats, error) {
 	// A speech job's answer IS the recording, so it never reaches a language
@@ -1434,15 +1449,17 @@ func (h *JobHandler) runInference(
 		return h.runSpeechJob(ctx, logger, prompt.Text)
 	}
 
+	// The shared package decides chat or generate and what the chat gets,
+	// so the disputer re-runs the job on the same input.
+	messages := chatMessages(prompt.Conversation(history))
+
 	if streamer == nil {
 		var (
 			text string
 			err  error
 		)
-		// A self-contained job always chats, even for a single user turn,
-		// so the disputer re-runs it through the same call.
-		if len(history) > 0 || len(prompt.Images) > 0 || prompt.SelfContained() {
-			text, err = client.Chat(ctx, modelName, chatMessages(history, prompt))
+		if messages != nil {
+			text, err = client.Chat(ctx, modelName, messages)
 		} else {
 			text, err = client.Generate(ctx, modelName, prompt.Text)
 		}
@@ -1468,8 +1485,8 @@ func (h *JobHandler) runInference(
 		stats    ollama.StreamStats
 		err      error
 	)
-	if len(history) > 0 || len(prompt.Images) > 0 || prompt.SelfContained() {
-		response, stats, err = streamer.client.ChatStream(ctx, modelName, chatMessages(history, prompt), handlers)
+	if messages != nil {
+		response, stats, err = streamer.client.ChatStream(ctx, modelName, messages, handlers)
 	} else {
 		response, stats, err = streamer.client.GenerateStream(ctx, modelName, prompt.Text, prompt.Images, handlers)
 	}
@@ -1489,24 +1506,18 @@ func (h *JobHandler) runInference(
 	return response, stats, nil
 }
 
-// chatMessages appends the current prompt as the final user turn. Images ride
-// on that turn: Ollama attaches them to the most recent user message. A
-// self-contained job's messages are the whole conversation, as sent.
-func chatMessages(history []ollama.ChatMessage, prompt promptEnvelope) []ollama.ChatMessage {
-	if prompt.SelfContained() {
-		messages := make([]ollama.ChatMessage, 0, len(prompt.Messages))
-		for _, m := range prompt.Messages {
-			messages = append(messages, ollama.ChatMessage{Role: m.Role, Content: m.Content})
-		}
-		return messages
+// chatMessages converts the shared chat input to Ollama's messages; nil
+// stays nil (the generate call). Images ride on their user turn: Ollama
+// attaches them to that message.
+func chatMessages(msgs []promptenv.Message) []ollama.ChatMessage {
+	if msgs == nil {
+		return nil
 	}
-	messages := make([]ollama.ChatMessage, 0, len(history)+1)
-	messages = append(messages, history...)
-	return append(messages, ollama.ChatMessage{
-		Role:    "user",
-		Content: prompt.Text,
-		Images:  prompt.Images,
-	})
+	out := make([]ollama.ChatMessage, 0, len(msgs))
+	for _, m := range msgs {
+		out = append(out, ollama.ChatMessage{Role: m.Role, Content: m.Content, Images: m.Images})
+	}
+	return out
 }
 
 // ackConfirmation is the handle stage 1 hands to stage 1b when the
@@ -2068,17 +2079,17 @@ func responseMismatchDigest(
 // configured look-back, for a payload that names none. Best-effort: a failed
 // listing serves the job single-turn.
 func (h *JobHandler) listPriorJobs(ctx context.Context, logger *slog.Logger, p *JobPayload) []uint64 {
-	lister, ok := h.chainClient.(priorJobLister)
-	if !ok || h.cfg.HistoryLookbackBlocks == 0 {
+	if h.priorJobs == nil {
 		return nil
 	}
 	var from uint64
-	if p.BlockNumber > h.cfg.HistoryLookbackBlocks {
-		from = p.BlockNumber - h.cfg.HistoryLookbackBlocks
+	if p.BlockNumber > h.historyLookback {
+		from = p.BlockNumber - h.historyLookback
 	}
-	ids, err := lister.GetPriorSessionJobIDs(ctx, p.SessionID, p.JobID, from, p.BlockNumber)
+	ids, err := h.priorJobs.GetPriorSessionJobIDs(ctx, p.SessionID, p.JobID, from, p.BlockNumber)
 	if err != nil {
-		logger.Warn("prior session jobs lookup failed; serving single-turn",
+		logger.Warn(
+			"prior session jobs lookup failed; serving single-turn",
 			"stage", "build_history",
 			"error", err,
 		)
@@ -2090,16 +2101,17 @@ func (h *JobHandler) listPriorJobs(ctx context.Context, logger *slog.Logger, p *
 // buildConversationHistory fetches prior jobs' prompt and response blobs,
 // decrypts them, and assembles an ordered conversation.
 //
-// Security: PriorJobIDs comes from the trusted dispatcher (not user input).
-// Additionally, blobs are decrypted with the current session's key â€” if a job
-// ID belongs to a different session, decryption will fail, preventing
-// cross-session data leakage.
+// Security: the prior job IDs come from the dispatcher or from this session's
+// JobSubmitted events on chain (never user input). Additionally, blobs are
+// decrypted with the current session's key â€” if a job ID belongs to a
+// different session, decryption will fail, preventing cross-session data
+// leakage.
 func (h *JobHandler) buildConversationHistory(
 	ctx context.Context,
 	priorJobIDs []uint64,
 	sessionKey []byte,
-) ([]ollama.ChatMessage, error) {
-	var messages []ollama.ChatMessage
+) ([]promptenv.Message, error) {
+	var messages []promptenv.Message
 
 	for _, jobID := range priorJobIDs {
 		promptHash, responseHash, submitBlock, completionBlock, err := h.chainClient.GetJobBlobInfo(ctx, jobID)
@@ -2118,28 +2130,16 @@ func (h *JobHandler) buildConversationHistory(
 			if err != nil {
 				return nil, fmt.Errorf("decrypt prompt for job %d: %w", jobID, err)
 			}
-			// Prior prompts may be versioned envelopes. Decoding restores
-			// the actual question as the user turn's text and re-attaches
-			// its images, instead of dumping the raw JSON envelope -
-			// including full base64 image payloads - into the context as
-			// text, where it wastes prompt tokens against num_ctx and the
-			// vision model never sees the image as an image.
-			// A search envelope wraps the text the same way it does on the live
-			// turn, so unwrap it before the multimodal decode.
-			plain, _, dErr := searchaug.DecodePrompt(promptText)
-			var env promptEnvelope
-			if dErr == nil {
-				env, dErr = promptenv.Decode([]byte(plain))
+			// Replayed by the shared package, as the disputer replays it: a
+			// search prompt as its question, an envelope as its text and
+			// images rather than raw JSON with base64 payloads that waste
+			// num_ctx. A self-contained job was another conversation in
+			// this session, so it and its answer are left out.
+			turn, ok := promptenv.Replay(promptText)
+			if !ok {
+				continue
 			}
-			if dErr != nil {
-				// Practically unreachable: stages 4.5 and 5 reject the same
-				// malformed envelopes before a job can complete and land in
-				// history. Stay conservative and keep the raw text rather
-				// than drop the turn.
-				messages = append(messages, ollama.ChatMessage{Role: "user", Content: string(promptText)})
-			} else {
-				messages = append(messages, ollama.ChatMessage{Role: "user", Content: env.Text, Images: env.Images})
-			}
+			messages = append(messages, turn)
 		}
 
 		// Fetch and decrypt response (single blob, lives in completeJob TX block).
@@ -2152,7 +2152,7 @@ func (h *JobHandler) buildConversationHistory(
 			if err != nil {
 				return nil, fmt.Errorf("decrypt response for job %d: %w", jobID, err)
 			}
-			messages = append(messages, ollama.ChatMessage{Role: "assistant", Content: searchaug.DecodeResponse(responseText).Answer})
+			messages = append(messages, promptenv.Message{Role: "assistant", Content: searchaug.DecodeResponse(responseText).Answer})
 		}
 	}
 

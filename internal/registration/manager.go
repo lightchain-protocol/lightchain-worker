@@ -174,12 +174,15 @@ func (m *RegistrationManager) Deregister(ctx context.Context) error {
 // sessions require it, so only such a worker can claim them.
 const SelfContainedCapability = "self-contained"
 
+// SearchCapability is declared by a worker configured for web search.
+const SearchCapability = "search"
+
 // DesiredCapabilities is the capability list this binary declares on chain:
 // self-contained always, search only when it is configured.
 func DesiredCapabilities(search bool) []string {
 	caps := []string{SelfContainedCapability}
 	if search {
-		caps = append(caps, "search")
+		caps = append(caps, SearchCapability)
 	}
 	return caps
 }
