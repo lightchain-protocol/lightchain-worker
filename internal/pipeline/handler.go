@@ -2065,7 +2065,7 @@ func (h *JobHandler) conversationHistory(
 	if len(ids) == 0 {
 		return nil, nil
 	}
-	history, err := h.buildConversationHistory(ctx, ids, sessionKey)
+	history, err := h.buildConversationHistory(ctx, ids, sessionKey, p.BlockNumber)
 	if err != nil {
 		return nil, err
 	}
@@ -2079,8 +2079,8 @@ func (h *JobHandler) conversationHistory(
 	return history, nil
 }
 
-// buildConversationHistory replays priorJobIDs through the shared history
-// rebuild the disputer uses too.
+// buildConversationHistory replays priorJobIDs, for the job submitted in
+// submitBlock, through the shared history rebuild the disputer uses too.
 //
 // Security: the prior job IDs come from the dispatcher or from this session's
 // JobSubmitted events on chain (never user input), and blobs decrypt only
@@ -2089,8 +2089,9 @@ func (h *JobHandler) buildConversationHistory(
 	ctx context.Context,
 	priorJobIDs []uint64,
 	sessionKey []byte,
+	submitBlock uint64,
 ) ([]promptenv.Message, error) {
-	return sessionhistory.Build(ctx, h.chainClient, h.blobFetcher, sessionKey, priorJobIDs)
+	return sessionhistory.Build(ctx, h.chainClient, h.blobFetcher, sessionKey, priorJobIDs, submitBlock)
 }
 
 func (h *JobHandler) resolveModelName(modelID string) (string, error) {

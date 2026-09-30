@@ -562,7 +562,7 @@ func TestBuildConversationHistory_DecodesV2EnvelopeToAnswer(t *testing.T) {
 		nil,
 	)
 
-	msgs, err := handler.buildConversationHistory(context.Background(), []uint64{99}, sessionKey)
+	msgs, err := handler.buildConversationHistory(context.Background(), []uint64{99}, sessionKey, 1000)
 	require.NoError(t, err)
 	require.Len(t, msgs, 2, "expected one user + one assistant message")
 
@@ -813,7 +813,7 @@ func TestBuildConversationHistory_UnwrapsSearchEnvelope(t *testing.T) {
 		nil,
 	)
 
-	msgs, err := handler.buildConversationHistory(context.Background(), []uint64{99}, sessionKey)
+	msgs, err := handler.buildConversationHistory(context.Background(), []uint64{99}, sessionKey, 1000)
 	require.NoError(t, err)
 	require.Len(t, msgs, 2)
 	assert.Equal(t, "prior user question", msgs[0].Content, "user turn must be the unwrapped question")

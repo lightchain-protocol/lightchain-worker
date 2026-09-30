@@ -74,6 +74,8 @@ type jobRig struct {
 	payload JobPayload
 	blobs   map[common.Hash]string
 	priors  map[uint64][2]common.Hash
+	// answeredAt overrides the block a prior job's answer was mined in (11).
+	answeredAt map[uint64]uint64
 }
 
 func newJobRig(t *testing.T, prompt string, inference InferenceClient, stream bool) *jobRig {
@@ -82,10 +84,11 @@ func newJobRig(t *testing.T, prompt string, inference InferenceClient, stream bo
 	ecdhKey := testECDHKey(t)
 	encSessionKey := encryptSessionKeyForWorker(t, sessionKey, ecdhKey)
 	r := &jobRig{
-		pub:     &recordingPublisher{},
-		payload: testPayload(t),
-		blobs:   map[common.Hash]string{},
-		priors:  map[uint64][2]common.Hash{},
+		pub:        &recordingPublisher{},
+		payload:    testPayload(t),
+		blobs:      map[common.Hash]string{},
+		priors:     map[uint64][2]common.Hash{},
+		answeredAt: map[uint64]uint64{},
 	}
 	r.blobs[r.payload.PromptBlobHash] = prompt
 
@@ -100,7 +103,11 @@ func newJobRig(t *testing.T, prompt string, inference InferenceClient, stream bo
 					t.Errorf("unexpected lookup of prior job %d", jobID)
 					return common.Hash{}, common.Hash{}, 0, 0, errors.New("prior job lookup")
 				}
-				return h[0], h[1], 10, 11, nil
+				answered, ok := r.answeredAt[jobID]
+				if !ok {
+					answered = 11
+				}
+				return h[0], h[1], 10, answered, nil
 			},
 		},
 		listFn: func(context.Context, uint64, uint64, uint64) ([]uint64, error) {
@@ -143,6 +150,14 @@ func (r *jobRig) addPriorJob(id uint64, prompt, answer string) {
 	p, a := common.Hash{0xaa, byte(id)}, common.Hash{0xbb, byte(id)}
 	r.priors[id] = [2]common.Hash{p, a}
 	r.blobs[p], r.blobs[a] = prompt, answer
+}
+
+// addSessionJobs adds a fixture's jobs as the session's earlier jobs.
+func (r *jobRig) addSessionJobs(jobs []promptenvtest.SessionJob) {
+	for _, j := range jobs {
+		r.addPriorJob(j.ID, j.Prompt, j.Answer)
+		r.answeredAt[j.ID] = j.AnswerBlock
+	}
 }
 
 func (r *jobRig) run(t *testing.T) error {
@@ -270,9 +285,7 @@ func TestHandleJobPayload_ChatJobOnABusyChainServesTheSessionsHistory(t *testing
 	}}
 	r := newJobRig(t, s.Current.Prompt, oll, false)
 	r.payload.JobID, r.payload.SessionID, r.payload.BlockNumber = s.Current.ID, s.Current.SessionID, s.Current.SubmitBlock
-	for _, j := range s.Chain {
-		r.addPriorJob(j.ID, j.Prompt, j.Answer)
-	}
+	r.addSessionJobs(s.Chain)
 	r.chain.listFn = func(_ context.Context, sessionID, fromBlock, toBlock uint64) ([]uint64, error) {
 		return s.JobSubmitted(sessionID, fromBlock, toBlock), nil
 	}
@@ -297,9 +310,7 @@ func TestHandleTask_ChainLookupWinsOverPriorJobsNamedInThePayload(t *testing.T) 
 	}}
 	r := newJobRig(t, s.Current.Prompt, oll, false)
 	r.payload.JobID, r.payload.SessionID, r.payload.BlockNumber = s.Current.ID, s.Current.SessionID, s.Current.SubmitBlock
-	for _, j := range s.Chain {
-		r.addPriorJob(j.ID, j.Prompt, j.Answer)
-	}
+	r.addSessionJobs(s.Chain)
 	r.payload.PriorJobIDs = []uint64{s.Chain[2].ID}
 	r.chain.listFn = func(_ context.Context, sessionID, fromBlock, toBlock uint64) ([]uint64, error) {
 		return s.JobSubmitted(sessionID, fromBlock, toBlock), nil

@@ -498,7 +498,7 @@ func TestBuildConversationHistory_DecodesPromptEnvelopes(t *testing.T) {
 nil,
 	)
 
-	msgs, err := handler.buildConversationHistory(context.Background(), []uint64{7}, sessionKey)
+	msgs, err := handler.buildConversationHistory(context.Background(), []uint64{7}, sessionKey, 1000)
 	require.NoError(t, err)
 	require.Len(t, msgs, 2)
 
@@ -545,7 +545,7 @@ func TestBuildConversationHistory_PlainPromptsUnchanged(t *testing.T) {
 nil,
 			)
 
-			msgs, err := handler.buildConversationHistory(context.Background(), []uint64{9}, sessionKey)
+			msgs, err := handler.buildConversationHistory(context.Background(), []uint64{9}, sessionKey, 1000)
 			require.NoError(t, err)
 			require.Len(t, msgs, 1)
 			assert.Equal(t, plaintext, msgs[0].Content)
