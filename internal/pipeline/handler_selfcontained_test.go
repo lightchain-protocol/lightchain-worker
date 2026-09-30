@@ -284,6 +284,34 @@ func TestHandleJobPayload_ChatJobOnABusyChainServesTheSessionsHistory(t *testing
 	assert.Equal(t, want, chat)
 }
 
+// The dispatcher names a chat job's earlier jobs from its own best-effort
+// index, which the disputer cannot see. With the chain lookup wired the
+// handler ignores that list and serves the history the disputer rebuilds.
+func TestHandleTask_ChainLookupWinsOverPriorJobsNamedInThePayload(t *testing.T) {
+	t.Parallel()
+	s := promptenvtest.BusySession
+	var chat []ollama.ChatMessage
+	oll := &mockOllama{chatFn: func(_ context.Context, _ string, msgs []ollama.ChatMessage) (string, error) {
+		chat = msgs
+		return "next answer", nil
+	}}
+	r := newJobRig(t, s.Current.Prompt, oll, false)
+	r.payload.JobID, r.payload.SessionID, r.payload.BlockNumber = s.Current.ID, s.Current.SessionID, s.Current.SubmitBlock
+	for _, j := range s.Chain {
+		r.addPriorJob(j.ID, j.Prompt, j.Answer)
+	}
+	r.payload.PriorJobIDs = []uint64{s.Chain[2].ID}
+	r.chain.listFn = func(_ context.Context, sessionID, fromBlock, toBlock uint64) ([]uint64, error) {
+		return s.JobSubmitted(sessionID, fromBlock, toBlock), nil
+	}
+	r.handler.SetPriorJobLister(r.chain)
+
+	require.NoError(t, r.run(t))
+
+	want := append(toChatMessages(s.History), ollama.ChatMessage{Role: "user", Content: s.Current.Prompt})
+	assert.Equal(t, want, chat)
+}
+
 // A history the worker cannot rebuild fails the job: the consumer gets an
 // error frame, and the job is refunded or times out. Serving it on no history
 // instead would leave an answer the disputer cannot reproduce: it rebuilds

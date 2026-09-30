@@ -552,6 +552,9 @@ func New(cfg *config.Config) (*Service, error) {
 	if voiceEngine != nil {
 		handler.SetVoiceEngine(voiceEngine)
 	}
+	// A chat job's earlier jobs come from the chain on every intake, as the
+	// disputer finds them to re-run the job, never from a dispatcher's index.
+	handler.SetPriorJobLister(chainClient)
 
 	// --- Gateway mode: skip Asynq and direct Redis heartbeat ---
 	// SortitionEnabled takes precedence: if both are set we already warned above
@@ -633,6 +636,7 @@ func New(cfg *config.Config) (*Service, error) {
 		if voiceEngine != nil {
 			gwHandler.SetVoiceEngine(voiceEngine)
 		}
+		gwHandler.SetPriorJobLister(chainClient)
 
 		logger.Info(
 			"worker service initialized (gateway mode)",
@@ -794,10 +798,6 @@ func New(cfg *config.Config) (*Service, error) {
 			logger.Warn("worker capability mask read failed; watcher runs with empty mask", "error", capErr)
 			ownCaps = big.NewInt(0)
 		}
-
-		// No dispatcher names a chat job's prior jobs here; the handler
-		// lists them from the chain.
-		handler.SetPriorJobLister(chainClient)
 
 		checker := ecdhKeyChecker{key: ecdhKey}
 		sessionWatcher = sortition.NewSessionWatcher(sortition.SessionWatcherOpts{
