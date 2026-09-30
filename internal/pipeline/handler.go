@@ -308,9 +308,8 @@ type JobHandler struct {
 	// (STT) and stage 6b can deliver a spoken rendering of the response
 	// (TTS). Nil leaves every voice path inert.
 	voiceEngine VoiceEngine
-	// priorJobs is set in sortition mode (via SetPriorJobLister) to list a
-	// chat job's earlier jobs when the payload names none. Nil leaves history
-	// to the payload.
+	// priorJobs (via SetPriorJobLister) lists a chat job's earlier jobs from
+	// the chain. Nil leaves history to the payload.
 	priorJobs sessionhistory.Lister
 	// keyFetchGroup coalesces concurrent cache-miss derivations for the same
 	// session so that N parallel jobs trigger exactly one chain RPC. Only
@@ -326,9 +325,8 @@ func (h *JobHandler) SetReleaseTracker(t ReleaseTracker) {
 }
 
 // SetPriorJobLister has the handler list a chat job's earlier jobs in its
-// session from the chain, through the lookup the disputer shares, whenever
-// the payload names none. Sortition mode needs it: there is no dispatcher to
-// name them. Call before serving jobs.
+// session from the chain, through the lookup the disputer shares, instead of
+// taking the ones a dispatcher's payload names. Call before serving jobs.
 func (h *JobHandler) SetPriorJobLister(l sessionhistory.Lister) {
 	h.priorJobs = l
 }
@@ -2044,10 +2042,11 @@ func responseMismatchDigest(
 	return crypto.Keccak256(encoded), nil
 }
 
-// conversationHistory rebuilds the turns before p in its session: the jobs
-// the payload names, else the ones the shared lookup finds on chain. The
-// disputer rebuilds the same turns through the same lookup to re-run the job,
-// so a failure here fails the job rather than serving it on a history the
+// conversationHistory rebuilds the turns before p in its session from the
+// jobs the shared lookup finds on chain, the lookup the disputer re-runs the
+// job with. The jobs a dispatcher's payload names are used only when no
+// lookup is wired: they come from its own index, which the disputer cannot
+// see. A failure fails the job rather than serving it on a history the
 // disputer would not reproduce.
 func (h *JobHandler) conversationHistory(
 	ctx context.Context,
@@ -2057,7 +2056,7 @@ func (h *JobHandler) conversationHistory(
 ) ([]promptenv.Message, error) {
 	start := time.Now()
 	ids := p.PriorJobIDs
-	if len(ids) == 0 && h.priorJobs != nil {
+	if h.priorJobs != nil {
 		var err error
 		if ids, err = sessionhistory.PriorJobs(ctx, h.priorJobs, p.SessionID, p.JobID, p.BlockNumber); err != nil {
 			return nil, fmt.Errorf("list prior jobs: %w", err)
