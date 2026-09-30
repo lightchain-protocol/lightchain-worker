@@ -1155,9 +1155,15 @@ func (h *JobHandler) runInferencePipeline(
 	// any search failure proceeds with the original prompt and emits no sources.
 	// Sources are stashed here and published AFTER inference (see end of function)
 	// so the UI renders "Sources" beneath the answer, not above it.
-	promptText, searchEnabled, decErr := searchaug.DecodePrompt(prompt)
+	promptText, searchEnabled, decErr := promptenv.UnwrapSearch(prompt)
 	if decErr != nil {
-		return nil, 0, fmt.Errorf("stage 4 (decode prompt envelope): %w", decErr)
+		decErr = fmt.Errorf("stage 4 (decode prompt envelope): %w", decErr)
+		// A self-contained job in the search wrapper fails the same way on
+		// every attempt.
+		if errors.Is(decErr, promptenv.ErrInvalidSelfContained) {
+			return nil, 0, noRetry(decErr)
+		}
+		return nil, 0, decErr
 	}
 	var searchSources []searchaug.Source
 	if searchEnabled && h.searcher != nil {
