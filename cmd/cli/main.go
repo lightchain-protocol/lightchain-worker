@@ -159,8 +159,9 @@ watch flags:
   --worker <address>    Watch this address (default: the address field of
                         WORKER_KEYSTORE_PATH, read without the password).
 watch reads the worker's env file plus WATCH_WEBHOOK_URL (required),
-WATCH_INTERVAL (30s), WATCH_COOLDOWN (1h: minimum gap between alerts for
-one check) and WATCH_NO_CLAIM_AFTER (2h; 0 disables; needs
+WATCH_INTERVAL (30s), WATCH_COOLDOWN (1h: minimum gap between repeat
+alerts for a check that stays failing) and WATCH_MISSED_CLAIMS (3: sessions
+in a row lost to other workers while eligible; 0 disables; needs
 SESSION_MANAGER_ADDRESS). systemd unit and install steps: deploy/lightchain-worker-watch@.service.`)
 }
 

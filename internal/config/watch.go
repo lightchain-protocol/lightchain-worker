@@ -18,10 +18,12 @@ type WatchConfig struct {
 	WebhookURL   string
 	Interval     time.Duration
 	Cooldown     time.Duration
-	NoClaimAfter time.Duration // 0 disables the claims check
+	MissedClaims int // missed claims in a row before alerting; 0 disables
 
-	MetricsAddr           string
-	HeartbeatInterval     time.Duration
+	MetricsAddr       string
+	HeartbeatInterval time.Duration
+	// RedisURL defaults like the sidecar's; RegistrationConfig.RedisURL has no
+	// default because drain/undrain must be pointed at Redis explicitly.
 	RedisURL              string
 	RedisPassword         string
 	SessionManagerAddress common.Address // zero = no claims check
@@ -35,7 +37,7 @@ func LoadWatch() (*WatchConfig, error) {
 		WebhookURL:        os.Getenv("WATCH_WEBHOOK_URL"),
 		Interval:          parseDuration("WATCH_INTERVAL", "30s", &errs),
 		Cooldown:          parseDuration("WATCH_COOLDOWN", "1h", &errs),
-		NoClaimAfter:      parseDuration("WATCH_NO_CLAIM_AFTER", "2h", &errs),
+		MissedClaims:      parseInt("WATCH_MISSED_CLAIMS", 3, &errs),
 		MetricsAddr:       envOrDefault("WORKER_METRICS_ADDR", "127.0.0.1:9101"),
 		HeartbeatInterval: parseDuration("HEARTBEAT_INTERVAL", "10s", &errs),
 		RedisURL:          envOrDefault("REDIS_URL", "redis://localhost:6379"),
@@ -53,8 +55,8 @@ func LoadWatch() (*WatchConfig, error) {
 	if cfg.Cooldown < 0 {
 		errs = append(errs, "WATCH_COOLDOWN: must be >= 0")
 	}
-	if cfg.NoClaimAfter < 0 {
-		errs = append(errs, "WATCH_NO_CLAIM_AFTER: must be >= 0")
+	if cfg.MissedClaims < 0 {
+		errs = append(errs, "WATCH_MISSED_CLAIMS: must be >= 0")
 	}
 	if cfg.HeartbeatInterval <= 0 {
 		errs = append(errs, "HEARTBEAT_INTERVAL: must be positive")

@@ -30,13 +30,21 @@ type WatchChain interface {
 	Head(ctx context.Context) (chain.HeadInfo, error)
 	IsWorkerRegistered(ctx context.Context, worker common.Address) (bool, error)
 	IsWorkerSuspended(ctx context.Context, worker common.Address) (bool, error)
+	GetSuspendedUntil(ctx context.Context, worker common.Address) (*big.Int, error)
 	GetWorkerStake(ctx context.Context, worker common.Address) (*big.Int, error)
 	GetMinWorkerStake(ctx context.Context) (*big.Int, error)
-	// CountSessionClaims counts SessionClaimed events for worker in [from, to].
-	CountSessionClaims(ctx context.Context, worker common.Address, from, to uint64) (int, error)
-	// CountSessionRequests counts SessionRequested events for any of models
-	// (all models when empty) in [from, to].
-	CountSessionRequests(ctx context.Context, models [][32]byte, from, to uint64) (int, error)
+	// SessionClaims lists the SessionClaimed logs of every worker in [from, to].
+	SessionClaims(ctx context.Context, from, to uint64) ([]SessionClaim, error)
+	// EligibleAt reads SessionManager.eligibleNow(reqID, worker) as of block.
+	EligibleAt(ctx context.Context, reqID uint64, worker common.Address, block uint64) (bool, error)
+	RequiredCapabilities(ctx context.Context, reqID uint64) (*big.Int, error)
+}
+
+// SessionClaim is one SessionClaimed log.
+type SessionClaim struct {
+	ReqID  uint64
+	Worker common.Address
+	Block  uint64
 }
 
 // HeartbeatReader is the one Redis read `watch` makes: the worker's
@@ -53,7 +61,6 @@ type WatchHandler struct {
 	Chain      WatchChain
 	WorkerAddr common.Address
 	ChainID    int64
-	ModelIDs   [][32]byte
 
 	LivenessURL string // the worker's /healthz; "" = skip
 	OllamaURL   string
@@ -61,13 +68,16 @@ type WatchHandler struct {
 	// the worker-gateway instead of Redis.
 	Heartbeat       HeartbeatReader
 	HeartbeatMaxAge time.Duration
-	// NoClaimAfter alerts when session requests for the worker's models have
-	// gone unclaimed by it this long. 0 = skip (no SessionManager).
-	NoClaimAfter time.Duration
+	// MissedClaims alerts after this many sessions in a row went to other
+	// workers while this one had been eligible for them. 0 = skip (no
+	// SessionManager).
+	MissedClaims int
 
 	WebhookURL string
-	Interval   time.Duration
-	// Cooldown is the minimum gap between two alerts for the same check.
+	// Interval between ticks; one tick's checks must finish within it.
+	Interval time.Duration
+	// Cooldown is the minimum gap between repeat alerts for a check that
+	// stays failing. A new failure after a recovery always alerts.
 	Cooldown time.Duration
 
 	HTTP   *http.Client     // nil = 10 s default
@@ -78,17 +88,22 @@ type WatchHandler struct {
 	claims claimTracker
 }
 
-// claimTracker follows SessionRequested / SessionClaimed incrementally, one
-// block range per tick, so each tick reads only the blocks since the last.
+// claimTracker follows SessionClaimed incrementally, one block range per
+// tick, so each tick reads only the blocks since the last.
 type claimTracker struct {
-	scanned      uint64    // last block scanned; 0 = not started
-	pending      int       // requests for the worker's models since its last claim
-	pendingSince time.Time // when the first of those was seen
+	scanned uint64 // last block scanned; 0 = not started
+	missed  int    // sessions missed since the worker's last own claim
 }
 
-// maxClaimScan caps one tick's log range, like the sortition watcher's
-// default chunk size.
-const maxClaimScan = 5000
+const (
+	// claimGraceBlocks: a worker eligible this many blocks before another
+	// worker claimed has had time to poll and claim itself (sortition polls
+	// every few seconds), so losing that request is a miss, not bad luck.
+	claimGraceBlocks = 5
+	// maxClaimScan caps one tick's log range. The eligibility reads are
+	// historical, and a full node keeps state for only ~128 recent blocks.
+	maxClaimScan = 100
+)
 
 // checkState is what the operator was last told about one check.
 type checkState struct {
@@ -112,23 +127,28 @@ func (h *WatchHandler) Run(ctx context.Context) {
 }
 
 // Tick runs every check once and sends the messages their changes call for.
+// The checks share a budget of one Interval so a hung endpoint cannot stall
+// the daemon; messages go out on ctx itself.
 func (h *WatchHandler) Tick(ctx context.Context) {
+	checkCtx, cancel := context.WithTimeout(ctx, h.Interval)
+	defer cancel()
+
 	if h.LivenessURL != "" {
-		h.report(ctx, "liveness", h.probe(ctx, h.LivenessURL))
+		h.observe(ctx, "liveness", h.probe(checkCtx, h.LivenessURL))
 	}
 	if h.Heartbeat != nil {
-		h.report(ctx, "heartbeat", h.checkHeartbeat(ctx))
+		h.observe(ctx, "heartbeat", h.checkHeartbeat(checkCtx))
 	}
-	h.report(ctx, "ollama", h.probe(ctx, strings.TrimRight(h.OllamaURL, "/")+"/api/tags"))
+	h.observe(ctx, "ollama", h.probe(checkCtx, strings.TrimRight(h.OllamaURL, "/")+"/api/tags"))
 
-	findings, err := h.chainFindings(ctx)
+	findings, err := h.chainFindings(checkCtx)
 	if err != nil {
 		// The chain checks keep their state: an unreadable chain is not a recovery.
-		h.report(ctx, "rpc", fmt.Sprintf("chain read failed: %v", err))
+		h.observe(ctx, "rpc", fmt.Sprintf("chain read failed: %v", err))
 		return
 	}
 	for _, f := range findings {
-		h.report(ctx, f.check, f.problem)
+		h.observe(ctx, f.check, f.problem)
 	}
 }
 
@@ -162,7 +182,16 @@ func (h *WatchHandler) chainFindings(ctx context.Context) ([]finding, error) {
 	}
 	f := finding{check: "suspended"}
 	if suspended {
-		f.problem = "worker is suspended by WorkerRegistry — it cannot claim until the cooldown ends (getSuspendedUntil)"
+		until, err := h.Chain.GetSuspendedUntil(ctx, h.WorkerAddr)
+		if err != nil {
+			return nil, err
+		}
+		end := time.Unix(until.Int64(), 0).UTC().Format(time.RFC3339)
+		if until.Int64() > head.Timestamp {
+			f.problem = fmt.Sprintf("worker is suspended by WorkerRegistry until %s; after that it must send reinstate() to claim again", end)
+		} else {
+			f.problem = fmt.Sprintf("suspension cooldown ended %s but the worker is still suspended — it must send reinstate() to claim again", end)
+		}
 	}
 	out = append(out, f)
 
@@ -180,7 +209,7 @@ func (h *WatchHandler) chainFindings(ctx context.Context) ([]finding, error) {
 	}
 	out = append(out, f)
 
-	if h.NoClaimAfter > 0 {
+	if h.MissedClaims > 0 {
 		problem, err := h.checkClaims(ctx, head.Number)
 		if err != nil {
 			return nil, err
@@ -190,8 +219,10 @@ func (h *WatchHandler) chainFindings(ctx context.Context) ([]finding, error) {
 	return out, nil
 }
 
-// checkClaims scans the blocks since the last tick for the worker's claims
-// and for requests it could have claimed. The first tick starts at head.
+// checkClaims scans the SessionClaimed logs since the last tick. The
+// worker's own claim clears the count; another worker's claim on a request
+// this worker had long been eligible for adds a miss. The first tick
+// starts at head.
 func (h *WatchHandler) checkClaims(ctx context.Context, head uint64) (string, error) {
 	c := &h.claims
 	if c.scanned == 0 {
@@ -200,34 +231,53 @@ func (h *WatchHandler) checkClaims(ctx context.Context, head uint64) (string, er
 	if head > c.scanned {
 		from := c.scanned + 1
 		// ponytail: after a long RPC outage the oldest blocks are skipped, not
-		// chunked; the rpc check has already alerted for that gap.
+		// chunked; their historical state is gone anyway.
 		if head-from >= maxClaimScan {
 			from = head - maxClaimScan + 1
 		}
-		claimed, err := h.Chain.CountSessionClaims(ctx, h.WorkerAddr, from, head)
+		claims, err := h.Chain.SessionClaims(ctx, from, head)
 		if err != nil {
 			return "", err
 		}
-		requested, err := h.Chain.CountSessionRequests(ctx, h.ModelIDs, from, head)
-		if err != nil {
-			return "", err
+		for _, cl := range claims {
+			switch {
+			case cl.Worker == h.WorkerAddr:
+				c.missed = 0
+			case h.missedClaim(ctx, cl):
+				c.missed++
+			}
 		}
 		c.scanned = head
-		switch {
-		case claimed > 0:
-			c.pending, c.pendingSince = 0, time.Time{}
-		case requested > 0:
-			if c.pending == 0 {
-				c.pendingSince = h.now()
-			}
-			c.pending += requested
-		}
 	}
-	if c.pending > 0 && h.now().Sub(c.pendingSince) >= h.NoClaimAfter {
-		return fmt.Sprintf("no session claimed in %s despite %d session request(s) for its models — check the worker's logs for claim errors",
-			h.now().Sub(c.pendingSince).Round(time.Second), c.pending), nil
+	if c.missed >= h.MissedClaims {
+		return fmt.Sprintf("%d session(s) in a row went to other workers although this worker was sortition-eligible "+
+			"for each at least %d blocks earlier — it is not claiming; check the worker's logs", c.missed, claimGraceBlocks), nil
 	}
 	return "", nil
+}
+
+// missedClaim reports whether the worker was eligible for cl's request
+// claimGraceBlocks before another worker claimed it. Requests that need a
+// capability are not judged (eligibleNow does not check capabilities), and
+// a failed read counts as no miss so pruned state cannot raise an alert.
+func (h *WatchHandler) missedClaim(ctx context.Context, cl SessionClaim) bool {
+	if cl.Block <= claimGraceBlocks {
+		return false
+	}
+	caps, err := h.Chain.RequiredCapabilities(ctx, cl.ReqID)
+	if err != nil {
+		h.Logger.Warn("watch: read required capabilities", "req", cl.ReqID, "error", err)
+		return false
+	}
+	if caps.Sign() != 0 {
+		return false
+	}
+	eligible, err := h.Chain.EligibleAt(ctx, cl.ReqID, h.WorkerAddr, cl.Block-claimGraceBlocks)
+	if err != nil {
+		h.Logger.Warn("watch: read historical eligibility", "req", cl.ReqID, "error", err)
+		return false
+	}
+	return eligible
 }
 
 func (h *WatchHandler) checkHeartbeat(ctx context.Context) string {
@@ -258,11 +308,11 @@ func (h *WatchHandler) probe(ctx context.Context, target string) string {
 	return ""
 }
 
-// report applies one check result: alert on failure unless this check
-// alerted within the cooldown, recover once after an alert. State only
-// advances when the webhook accepted the message, so a failed post is
-// retried on the next tick.
-func (h *WatchHandler) report(ctx context.Context, check, problem string) {
+// observe applies one check result: alert on the transition to failing,
+// repeat at most once per Cooldown while it stays failing, and send one
+// recovery after an alert. State only advances when the webhook accepted
+// the message, so a failed post is retried on the next tick.
+func (h *WatchHandler) observe(ctx context.Context, check, problem string) {
 	if h.checks == nil {
 		h.checks = map[string]*checkState{}
 	}
@@ -278,32 +328,27 @@ func (h *WatchHandler) report(ctx context.Context, check, problem string) {
 			st.since = now
 			h.Logger.Warn("watch check failing", "check", check, "problem", problem)
 		}
-		if now.Sub(st.lastAlert) < h.Cooldown {
+		if st.alerted && now.Sub(st.lastAlert) < h.Cooldown {
 			return
 		}
 		title := check + " failing"
 		if st.alerted {
 			title = fmt.Sprintf("%s still failing (%s)", check, now.Sub(st.since).Round(time.Second))
 		}
-		if h.notify(ctx, "ALERT", check, title, problem, colorAlert) {
+		if h.notify(ctx, check, title, problem, false) {
 			st.alerted, st.lastAlert = true, now
 		}
 	case !st.since.IsZero():
 		h.Logger.Info("watch check recovered", "check", check)
 		if st.alerted {
 			desc := fmt.Sprintf("back to normal after %s", now.Sub(st.since).Round(time.Second))
-			if !h.notify(ctx, "RECOVERED", check, check+" recovered", desc, colorRecovered) {
+			if !h.notify(ctx, check, check+" recovered", desc, true) {
 				return
 			}
 		}
 		st.alerted, st.since = false, time.Time{}
 	}
 }
-
-const (
-	colorAlert     = 0xE74C3C
-	colorRecovered = 0x2ECC71
-)
 
 type webhookMessage struct {
 	Content string         `json:"content"`
@@ -318,7 +363,11 @@ type webhookEmbed struct {
 }
 
 // notify posts one message and reports whether the webhook accepted it.
-func (h *WatchHandler) notify(ctx context.Context, kind, check, title, desc string, color int) bool {
+func (h *WatchHandler) notify(ctx context.Context, check, title, desc string, recovered bool) bool {
+	kind, color := "ALERT", 0xE74C3C
+	if recovered {
+		kind, color = "RECOVERED", 0x2ECC71
+	}
 	msg := webhookMessage{
 		Content: fmt.Sprintf("**%s** %s — worker %s on %s (chain %d)",
 			kind, check, h.WorkerAddr.Hex(), networkName(h.ChainID), h.ChainID),
@@ -340,11 +389,7 @@ func (h *WatchHandler) notify(ctx context.Context, kind, check, title, desc stri
 		return false
 	}
 	req.Header.Set("Content-Type", "application/json")
-	c := h.HTTP
-	if c == nil {
-		c = &http.Client{Timeout: 10 * time.Second}
-	}
-	resp, err := c.Do(req)
+	resp, err := httpClient(h.HTTP).Do(req)
 	if err != nil {
 		// *url.Error carries the URL, and a webhook URL's path is its secret.
 		var uerr *url.Error
@@ -403,11 +448,13 @@ type ReadOnlyChain struct {
 	backend  WatchBackend
 	registry *bindings.WorkerRegistryCaller
 	aiConfig *bindings.AIConfigCaller
-	sessions *bindings.SessionManagerFilterer // nil without a SessionManager
+	// Both nil without a SessionManager.
+	sessions    *bindings.SessionManagerCaller
+	sessionLogs *bindings.SessionManagerFilterer
 }
 
 // NewReadOnlyChain binds the contracts watch reads. sessionManager may be
-// the zero address, in which case the Count* methods must not be called.
+// the zero address, in which case the session methods must not be called.
 func NewReadOnlyChain(backend WatchBackend, registry, aiConfig, sessionManager common.Address) (*ReadOnlyChain, error) {
 	c := &ReadOnlyChain{backend: backend}
 	var err error
@@ -418,7 +465,10 @@ func NewReadOnlyChain(backend WatchBackend, registry, aiConfig, sessionManager c
 		return nil, err
 	}
 	if sessionManager != (common.Address{}) {
-		if c.sessions, err = bindings.NewSessionManagerFilterer(sessionManager, backend); err != nil {
+		if c.sessions, err = bindings.NewSessionManagerCaller(sessionManager, backend); err != nil {
+			return nil, err
+		}
+		if c.sessionLogs, err = bindings.NewSessionManagerFilterer(sessionManager, backend); err != nil {
 			return nil, err
 		}
 	}
@@ -430,6 +480,9 @@ func (c *ReadOnlyChain) Head(ctx context.Context) (chain.HeadInfo, error) {
 	h, err := c.backend.HeaderByNumber(ctx, nil)
 	if err != nil {
 		return chain.HeadInfo{}, fmt.Errorf("latest header: %w", err)
+	}
+	if h.Number == nil {
+		return chain.HeadInfo{}, errors.New("latest header has no block number")
 	}
 	return chain.HeadInfo{Number: h.Number.Uint64(), Timestamp: int64(h.Time)}, nil
 }
@@ -444,6 +497,11 @@ func (c *ReadOnlyChain) IsWorkerSuspended(ctx context.Context, worker common.Add
 	return c.registry.IsWorkerSuspended(&bind.CallOpts{Context: ctx}, worker)
 }
 
+// GetSuspendedUntil reads WorkerRegistry.getSuspendedUntil.
+func (c *ReadOnlyChain) GetSuspendedUntil(ctx context.Context, worker common.Address) (*big.Int, error) {
+	return c.registry.GetSuspendedUntil(&bind.CallOpts{Context: ctx}, worker)
+}
+
 // GetWorkerStake reads WorkerRegistry.getWorkerStake.
 func (c *ReadOnlyChain) GetWorkerStake(ctx context.Context, worker common.Address) (*big.Int, error) {
 	return c.registry.GetWorkerStake(&bind.CallOpts{Context: ctx}, worker)
@@ -454,36 +512,27 @@ func (c *ReadOnlyChain) GetMinWorkerStake(ctx context.Context) (*big.Int, error)
 	return c.aiConfig.GetMinWorkerStake(&bind.CallOpts{Context: ctx})
 }
 
-// CountSessionClaims counts the worker's SessionClaimed logs, filtered on
-// the indexed worker topic by the node.
-func (c *ReadOnlyChain) CountSessionClaims(ctx context.Context, worker common.Address, from, to uint64) (int, error) {
-	it, err := c.sessions.FilterSessionClaimed(&bind.FilterOpts{Context: ctx, Start: from, End: &to}, nil, []common.Address{worker})
+// SessionClaims lists SessionClaimed logs in [from, to].
+func (c *ReadOnlyChain) SessionClaims(ctx context.Context, from, to uint64) ([]SessionClaim, error) {
+	it, err := c.sessionLogs.FilterSessionClaimed(&bind.FilterOpts{Context: ctx, Start: from, End: &to}, nil, nil)
 	if err != nil {
-		return 0, fmt.Errorf("filter SessionClaimed [%d,%d]: %w", from, to, err)
+		return nil, fmt.Errorf("filter SessionClaimed [%d,%d]: %w", from, to, err)
 	}
-	return countLogs(it)
-}
-
-// CountSessionRequests counts SessionRequested logs for models (indexed
-// topic; every model when empty).
-func (c *ReadOnlyChain) CountSessionRequests(ctx context.Context, models [][32]byte, from, to uint64) (int, error) {
-	it, err := c.sessions.FilterSessionRequested(&bind.FilterOpts{Context: ctx, Start: from, End: &to}, nil, nil, models)
-	if err != nil {
-		return 0, fmt.Errorf("filter SessionRequested [%d,%d]: %w", from, to, err)
-	}
-	return countLogs(it)
-}
-
-func countLogs(it interface {
-	Next() bool
-	Error() error
-	Close() error
-},
-) (int, error) {
 	defer func() { _ = it.Close() }()
-	n := 0
+	var out []SessionClaim
 	for it.Next() {
-		n++
+		out = append(out, SessionClaim{ReqID: it.Event.ReqId.Uint64(), Worker: it.Event.Worker, Block: it.Event.Raw.BlockNumber})
 	}
-	return n, it.Error()
+	return out, it.Error()
+}
+
+// EligibleAt reads SessionManager.eligibleNow against the state of block.
+func (c *ReadOnlyChain) EligibleAt(ctx context.Context, reqID uint64, worker common.Address, block uint64) (bool, error) {
+	opts := &bind.CallOpts{Context: ctx, BlockNumber: new(big.Int).SetUint64(block)}
+	return c.sessions.EligibleNow(opts, new(big.Int).SetUint64(reqID), worker)
+}
+
+// RequiredCapabilities reads SessionManager.getRequiredCapabilities.
+func (c *ReadOnlyChain) RequiredCapabilities(ctx context.Context, reqID uint64) (*big.Int, error) {
+	return c.sessions.GetRequiredCapabilities(&bind.CallOpts{Context: ctx}, new(big.Int).SetUint64(reqID))
 }

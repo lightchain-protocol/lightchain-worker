@@ -428,14 +428,19 @@ func (h *PreflightHandler) checkBeacon(ctx context.Context, r *report) {
 }
 
 func httpGet(ctx context.Context, c *http.Client, url string) (*http.Response, error) {
-	if c == nil {
-		c = &http.Client{Timeout: 10 * time.Second}
-	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, http.NoBody)
 	if err != nil {
 		return nil, err
 	}
-	return c.Do(req)
+	return httpClient(c).Do(req)
+}
+
+// httpClient returns c, or a client with a 10 s timeout when c is nil.
+func httpClient(c *http.Client) *http.Client {
+	if c == nil {
+		return &http.Client{Timeout: 10 * time.Second}
+	}
+	return c
 }
 
 func networkName(chainID int64) string {
