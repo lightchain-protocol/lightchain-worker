@@ -10,8 +10,12 @@
 # Environment:
 #   LIGHTCHAIN_WORKER_VERSION   release tag to install (default: latest)
 #   LIGHTCHAIN_WORKER_RELEASES  releases base URL (default: the GitHub releases;
-#                               a mirror or a file:// directory works too)
+#                               a mirror works, and so does a file:// directory
+#                               when curl is installed)
 #   INSTALL_DIR                 where the binary goes (default: /usr/local/bin)
+#
+# sudo drops the caller's environment, so pass these after it:
+#   curl -fsSL …/install.sh | sudo LIGHTCHAIN_WORKER_VERSION=v1.2.3 sh
 set -eu
 
 releases=${LIGHTCHAIN_WORKER_RELEASES:-https://github.com/lightchain-protocol/lightchain-worker/releases}
@@ -51,16 +55,20 @@ fetch() {
 	fi || die "download failed: $1"
 }
 
+# Runs in $(…): die exits the subshell, and set -e then stops the script.
 sha256() {
 	if command -v sha256sum >/dev/null 2>&1; then
-		sha256sum "$1"
+		sha256sum "$1" | cut -d ' ' -f 1
+	elif command -v shasum >/dev/null 2>&1; then
+		shasum -a 256 "$1" | cut -d ' ' -f 1
 	else
-		shasum -a 256 "$1"
-	fi | cut -d ' ' -f 1
+		die "needs sha256sum or shasum to verify the download"
+	fi
 }
 
 tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
+trap 'exit 1' INT TERM
 fetch "$base/$asset" "$tmp/$asset"
 fetch "$base/checksums.txt" "$tmp/checksums.txt"
 
@@ -70,9 +78,9 @@ got=$(sha256 "$tmp/$asset")
 [ "$got" = "$want" ] || die "checksum mismatch for $asset (got $got, expected $want); nothing installed"
 
 # Copy next to the target, then rename: replacing a running binary in place fails.
+chmod 0755 "$tmp/$asset"
 mkdir -p "$install_dir" 2>/dev/null || true
 cp "$tmp/$asset" "$install_dir/.lightchain-worker.new" 2>/dev/null ||
 	die "cannot write to $install_dir; run with sudo or set INSTALL_DIR"
-chmod 0755 "$install_dir/.lightchain-worker.new"
 mv -f "$install_dir/.lightchain-worker.new" "$install_dir/lightchain-worker"
 echo "installed $install_dir/lightchain-worker ($version, $os/$arch, sha256 $got)"

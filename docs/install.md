@@ -8,7 +8,7 @@ A worker claims jobs on-chain through sortition, runs them on your own [Ollama](
 
 - A Linux host (amd64 or arm64) with a GPU, running Ollama. macOS builds exist too, but serving wants a Linux GPU box.
 - Outbound HTTPS and WSS access.
-- Testnet LCAI: **5,000 LCAI** stake (the on-chain minimum, `AIConfig.getMinWorkerStake()`) plus about **50 LCAI** for gas. Ask the LightChain team or the community channels for testnet LCAI.
+- Testnet LCAI: **5,000 LCAI** stake (the on-chain minimum, `AIConfig.getMinWorkerStake()`) plus a gas buffer of about **50 LCAI**, so about **5,060 LCAI** in all. Ask the LightChain team or the community channels for testnet LCAI.
 
 ## 1. Install the CLI
 
@@ -16,7 +16,7 @@ A worker claims jobs on-chain through sortition, runs them on your own [Ollama](
 curl -fsSL https://github.com/lightchain-protocol/lightchain-worker/releases/latest/download/install.sh | sudo sh
 ```
 
-The installer picks the build for your OS and CPU, checks its SHA-256 against the release's `checksums.txt`, and installs `/usr/local/bin/lightchain-worker`. It does nothing else: no service, no config, no keys. Set `LIGHTCHAIN_WORKER_VERSION=v1.2.3` to pin a release, or `INSTALL_DIR` to install elsewhere.
+The installer picks the build for your OS and CPU, checks its SHA-256 against the release's `checksums.txt`, and installs `/usr/local/bin/lightchain-worker`. It does nothing else: no service, no config, no keys. To pin a release or install elsewhere, pass `LIGHTCHAIN_WORKER_VERSION` or `INSTALL_DIR` after `sudo`, which drops the caller's environment: `… | sudo LIGHTCHAIN_WORKER_VERSION=v1.2.3 sh`.
 
 To check the installer before you run it, download `install.sh` and `checksums.txt` from the same release and compare `sha256sum install.sh` with its line in `checksums.txt`.
 
@@ -62,6 +62,9 @@ ENCRYPTION_KEYSTORE_PATH=/etc/lightchain/worker/encryption.key
 SUPPORTED_MODELS=llama3-8b
 OLLAMA_URL=http://localhost:11434
 
+# how long a stop waits for in-flight jobs (keep it under the unit's TimeoutStopSec)
+SHUTDOWN_TIMEOUT=240s
+
 # state that must survive restarts
 SESSION_KEY_FILE=/var/lib/lightchain-worker/session-keys.enc
 SORTITION_STATE_DIR=/var/lib/lightchain-worker/sortition-state
@@ -95,7 +98,7 @@ lcw init
    init: worker 0x7E7D…2838 holds 0 LCAI; registering stakes 5000 LCAI and needs gas on top — send at least 5050 LCAI to it, then re-run `lightchain-worker init`
    ```
 
-   Fund the address and run `lcw init` again. It asks you to confirm the stake, then registers the worker. That publishes the encryption key (created now at `ENCRYPTION_KEYSTORE_PATH`), stakes the minimum, and adds your models. Set `WORKER_STAKE` (in wei) only to stake more than the minimum.
+   Fund the address and run `lcw init` again. Send a little more than the minimum it names, since registering spends some gas; otherwise preflight later warns that the balance is below the 50 LCAI buffer. It asks you to confirm the stake, then registers the worker. That publishes the encryption key (created now at `ENCRYPTION_KEYSTORE_PATH`), stakes the minimum, and adds your models. Set `WORKER_STAKE` (in wei) only to stake more than the minimum.
 3. **Add models.** Any model in `SUPPORTED_MODELS` that the worker does not serve on-chain yet is added. To serve another model later, pull it, append it to `SUPPORTED_MODELS`, and run `lcw init` again.
 4. **Preflight.** The read-only go-live check runs last: RPC and chain id, registration, suspension, stake, balance, encryption key against the on-chain key, each model's on-chain state, gateway login, Ollama tags and the beacon API. Each failing line says what to fix. A ready worker ends like this:
 
@@ -157,7 +160,7 @@ On its first start the worker reads the chain's session history to set its curso
 | Add a model | `ollama pull NAME`, append it to `SUPPORTED_MODELS`, `lcw init`, `sudo systemctl restart lightchain-worker` |
 | Earnings | `lcw balance`; `lcw withdraw` moves them to the worker address |
 | Upgrade | re-run the installer, then `sudo systemctl restart lightchain-worker` |
-| Stop | `sudo systemctl stop lightchain-worker` drains first: no new sessions, in-flight jobs finish |
+| Stop | `sudo systemctl stop lightchain-worker` drains first: no new sessions, and in-flight jobs get up to `SHUTDOWN_TIMEOUT` to finish |
 | Leave | stop the service, then `lcw deregister` returns the stake once no jobs are active |
 
 Fees accrue in JobRegistry, and the worker settles them to its balance after the dispute window. Timeouts and lost disputes slash a share of the minimum stake, and three offenses suspend the worker for a cooldown. Keep the host up and the models loaded, and avoid killing the service mid-job.
@@ -196,9 +199,11 @@ services:
 
 ```bash
 sudo chown -R 1000 /etc/lightchain/worker /var/lib/lightchain-worker
-docker compose run --rm --entrypoint /bin/lightchain-worker worker init
-docker compose up -d
+sudo docker compose run --rm --entrypoint /bin/lightchain-worker worker init
+sudo docker compose up -d
 ```
+
+`sudo` is needed because the env file is readable by its owner only.
 
 `init` in the container needs an image built from a worker release that has the command.
 
