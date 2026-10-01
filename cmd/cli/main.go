@@ -19,6 +19,7 @@
 //	deregister  Deregister worker and withdraw stake
 //	status      Check on-chain registration status
 //	preflight   Read-only go-live checks (RPC, registration, stake, models, gateway, Ollama, beacon)
+//	watch       Read-only daemon that posts webhook alerts when the worker stops being able to claim
 package main
 
 import (
@@ -84,6 +85,8 @@ func main() {
 		runStatus()
 	case "preflight":
 		runPreflight()
+	case "watch":
+		runWatch()
 	case "balance":
 		runBalance()
 	case "withdraw":
@@ -122,6 +125,9 @@ Commands:
   balance     Print the worker's accumulated on-chain workerBalance
   withdraw    Drain the worker's workerBalance to the worker address
   release     Reconcile + run one release cycle (settles eligible jobs)
+  watch       Daemon: alert a Discord-compatible webhook when liveness, heartbeat,
+              Ollama, registration, suspension, stake or recent claims go bad,
+              and again on recovery. Never remediates (no tx, no drain).
 
 balance/withdraw/release additionally require JOB_REGISTRY_ADDRESS.
 release additionally reads RELEASE_STATE_PATH (and other RELEASE_* vars).
@@ -165,7 +171,16 @@ preflight flags:
 preflight never writes to disk or chain. Without --worker the gateway
 check performs the normal challenge/response login (a short-lived token
 is minted server-side). OLLAMA_URL and BEACON_API_URL default to the
-sidecar's localhost values.`)
+sidecar's localhost values.
+
+watch flags:
+  --worker <address>    Watch this address (default: the address field of
+                        WORKER_KEYSTORE_PATH, read without the password).
+watch reads the worker's env file plus WATCH_WEBHOOK_URL (required),
+WATCH_INTERVAL (30s), WATCH_COOLDOWN (1h: minimum gap between repeat
+alerts for a check that stays failing) and WATCH_MISSED_CLAIMS (3: sessions
+in a row lost to other workers while eligible; 0 disables; needs
+SESSION_MANAGER_ADDRESS). systemd unit and install steps: deploy/lightchain-worker-watch@.service.`)
 }
 
 func runImportKey() {
