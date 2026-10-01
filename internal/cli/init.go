@@ -238,7 +238,10 @@ func (h *InitHandler) addMissingModels(ctx context.Context) error {
 		return nil
 	}
 	h.say("models", "adding %s", strings.Join(add.ModelNames, ", "))
-	return add.AddModels(ctx)
+	if err := add.AddModels(ctx); err != nil {
+		return fmt.Errorf("add models: %w — re-run `lightchain-worker init` once fixed", err)
+	}
+	return nil
 }
 
 func (h *InitHandler) say(step, format string, args ...any) {

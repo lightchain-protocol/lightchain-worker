@@ -157,10 +157,15 @@ type initChain struct {
 	*fakeChain
 	registerCalls int
 	addCalls      [][32]byte
+	registerErr   error // when set, the registration transaction fails
+	addErr        error // when set, every add-model transaction fails
 }
 
 func (c *initChain) RegisterWorker(_ context.Context, encKey []byte, stake *big.Int) error {
 	c.registerCalls++
+	if c.registerErr != nil {
+		return c.registerErr
+	}
 	c.registered = true
 	c.stake = stake
 	c.encKey = encKey
@@ -170,6 +175,9 @@ func (c *initChain) RegisterWorker(_ context.Context, encKey []byte, stake *big.
 
 func (c *initChain) AddSupportedModel(_ context.Context, id [32]byte) error {
 	c.addCalls = append(c.addCalls, id)
+	if c.addErr != nil {
+		return c.addErr
+	}
 	if !c.whitelisted[id] {
 		return errors.New("execution reverted")
 	}
@@ -393,4 +401,36 @@ func TestInit_NoModelsConfigured(t *testing.T) {
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "SUPPORTED_MODELS")
 	assert.Zero(t, ic.registerCalls)
+}
+
+func TestInit_RegistrationTxFailureIsReported(t *testing.T) {
+	t.Parallel()
+	h, ic, buf := freshWorker(t, "y\n")
+	ic.registerErr = errors.New("insufficient funds for gas * price + value")
+
+	err := h.Run(context.Background())
+
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "registration failed")
+	assert.Contains(t, err.Error(), "insufficient funds")
+	assert.False(t, ic.registered)
+	assert.NotContains(t, buf.String(), "preflight:")
+}
+
+func TestInit_AddModelTxFailureIsReported(t *testing.T) {
+	t.Parallel()
+	h, ic, buf := freshWorker(t, "")
+	ecdhKey, err := h.LoadECDHKey("", "")
+	require.NoError(t, err)
+	ic.registered = true
+	ic.stake = lcaiWei(5000)
+	ic.encKey = ecdhKey.PublicKey().Bytes()
+	ic.addErr = errors.New("execution reverted")
+
+	err = h.Run(context.Background())
+
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "llama3:8b")
+	assert.Contains(t, buf.String(), "Added 0 of 1 models")
+	assert.NotContains(t, buf.String(), "preflight:")
 }
