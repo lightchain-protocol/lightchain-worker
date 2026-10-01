@@ -33,10 +33,14 @@ type fakeWatchChain struct {
 	block      uint64
 	registered bool
 	suspended  bool
+	until      int64 // suspendedUntil, unix seconds
+	hang       bool  // Head blocks until its context ends
 	stake      *big.Int
 	minStake   *big.Int
-	claims     int // SessionClaimed by the worker in any scanned range
-	requests   int // SessionRequested for its models in any scanned range
+	claimLogs  []SessionClaim  // returned by the next SessionClaims scan, then cleared
+	eligible   map[uint64]bool // reqID -> the worker was eligible at the asked block
+	reqCaps    map[uint64]int64
+	asked      []uint64 // blocks EligibleAt was asked about
 	scans      [][2]uint64
 	err        error
 }
@@ -45,7 +49,11 @@ func healthyWatchChain(now *time.Time) *fakeWatchChain {
 	return &fakeWatchChain{now: now, block: 100, registered: true, stake: lcaiWei(5000), minStake: lcaiWei(5000)}
 }
 
-func (f *fakeWatchChain) Head(context.Context) (chain.HeadInfo, error) {
+func (f *fakeWatchChain) Head(ctx context.Context) (chain.HeadInfo, error) {
+	if f.hang {
+		<-ctx.Done()
+		return chain.HeadInfo{}, ctx.Err()
+	}
 	f.block++
 	return chain.HeadInfo{Number: f.block, Timestamp: f.now.Unix()}, f.err
 }
@@ -58,6 +66,10 @@ func (f *fakeWatchChain) IsWorkerSuspended(context.Context, common.Address) (boo
 	return f.suspended, f.err
 }
 
+func (f *fakeWatchChain) GetSuspendedUntil(context.Context, common.Address) (*big.Int, error) {
+	return big.NewInt(f.until), f.err
+}
+
 func (f *fakeWatchChain) GetWorkerStake(context.Context, common.Address) (*big.Int, error) {
 	return f.stake, f.err
 }
@@ -66,13 +78,20 @@ func (f *fakeWatchChain) GetMinWorkerStake(context.Context) (*big.Int, error) {
 	return f.minStake, f.err
 }
 
-func (f *fakeWatchChain) CountSessionClaims(_ context.Context, _ common.Address, from, to uint64) (int, error) {
+func (f *fakeWatchChain) SessionClaims(_ context.Context, from, to uint64) ([]SessionClaim, error) {
 	f.scans = append(f.scans, [2]uint64{from, to})
-	return f.claims, f.err
+	logs := f.claimLogs
+	f.claimLogs = nil
+	return logs, f.err
 }
 
-func (f *fakeWatchChain) CountSessionRequests(context.Context, [][32]byte, uint64, uint64) (int, error) {
-	return f.requests, f.err
+func (f *fakeWatchChain) EligibleAt(_ context.Context, reqID uint64, _ common.Address, block uint64) (bool, error) {
+	f.asked = append(f.asked, block)
+	return f.eligible[reqID], f.err
+}
+
+func (f *fakeWatchChain) RequiredCapabilities(_ context.Context, reqID uint64) (*big.Int, error) {
+	return big.NewInt(f.reqCaps[reqID]), f.err
 }
 
 // discordMessage is the subset of a Discord webhook body the tests check.
@@ -88,7 +107,6 @@ type discordMessage struct {
 
 // webhookSink is an in-process webhook receiver.
 type webhookSink struct {
-	t      *testing.T
 	mu     sync.Mutex
 	got    []discordMessage
 	status int // response status; 0 = 204 like Discord
@@ -97,7 +115,7 @@ type webhookSink struct {
 
 func newWebhookSink(t *testing.T) *webhookSink {
 	t.Helper()
-	s := &webhookSink{t: t}
+	s := &webhookSink{}
 	s.srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		assert.Equal(t, http.MethodPost, r.Method)
 		assert.Equal(t, "application/json", r.Header.Get("Content-Type"))
@@ -173,7 +191,6 @@ func newWatch(t *testing.T, fc *fakeWatchChain, ollamaURL string, sink *webhookS
 		Chain:      fc,
 		WorkerAddr: testAddr,
 		ChainID:    8200,
-		ModelIDs:   [][32]byte{model1},
 		OllamaURL:  ollamaURL,
 		WebhookURL: sink.srv.URL,
 		Interval:   30 * time.Second,
@@ -254,20 +271,15 @@ func TestWatch_CooldownLimitsRepeatsPerCheck(t *testing.T) {
 	assert.Contains(t, got[0].Embeds[0].Title, "still failing")
 	assert.Contains(t, got[0].Embeds[0].Title, "1h0m0s")
 
-	// Flapping: a recovery, then a new failure inside the cooldown of the
-	// last alert, stays quiet until that cooldown ends.
+	// A new failure after a recovery is a new transition: it alerts even
+	// inside the cooldown of the previous alert.
 	ollama.start()
 	h.Tick(ctx)
-	require.Len(t, sink.take(), 1, "recovery")
+	require.Equal(t, []string{"ollama recovered"}, titles(sink.take()))
 	ollama.stop()
 	now = now.Add(time.Minute)
 	h.Tick(ctx)
-	require.Empty(t, sink.take(), "re-failure inside the cooldown is not re-alerted")
-	now = now.Add(h.Cooldown)
-	h.Tick(ctx)
-	got = sink.take()
-	require.Len(t, got, 1)
-	assert.Equal(t, "ollama failing", got[0].Embeds[0].Title)
+	require.Equal(t, []string{"ollama failing"}, titles(sink.take()))
 }
 
 func TestWatch_RejectedWebhookIsRetriedNextTick(t *testing.T) {
@@ -313,16 +325,54 @@ func TestWatch_SuspensionAlerts(t *testing.T) {
 	require.Empty(t, sink.take())
 
 	fc.suspended = true
+	fc.until = now.Add(2 * time.Hour).Unix()
 	now = now.Add(h.Interval)
 	h.Tick(ctx)
 	got := sink.take()
 	require.Equal(t, []string{"suspended failing"}, titles(got))
-	assert.Contains(t, got[0].Embeds[0].Description, "suspended")
+	desc := got[0].Embeds[0].Description
+	assert.Contains(t, desc, time.Unix(fc.until, 0).UTC().Format(time.RFC3339))
+	assert.Contains(t, desc, "reinstate()", "suspension only lifts when the worker reinstates")
 
 	fc.suspended = false
 	now = now.Add(h.Interval)
 	h.Tick(ctx)
 	assert.Equal(t, []string{"suspended recovered"}, titles(sink.take()))
+}
+
+func TestWatch_SuspensionPastCooldownSaysReinstate(t *testing.T) {
+	t.Parallel()
+	now := time.Unix(1_800_000_000, 0)
+	fc := healthyWatchChain(&now)
+	fc.suspended = true
+	fc.until = now.Add(-time.Hour).Unix()
+	sink := newWebhookSink(t)
+	h := newWatch(t, fc, newFakeOllama(t).URL(), sink)
+
+	h.Tick(context.Background())
+
+	got := sink.take()
+	require.Equal(t, []string{"suspended failing"}, titles(got))
+	assert.Contains(t, got[0].Embeds[0].Description, "cooldown ended")
+	assert.Contains(t, got[0].Embeds[0].Description, "reinstate()")
+}
+
+func TestWatch_HungRPCStillAlertsWithinTheInterval(t *testing.T) {
+	t.Parallel()
+	now := time.Unix(1_800_000_000, 0)
+	fc := healthyWatchChain(&now)
+	fc.hang = true
+	sink := newWebhookSink(t)
+	h := newWatch(t, fc, newFakeOllama(t).URL(), sink)
+	h.Interval = 100 * time.Millisecond
+
+	start := time.Now()
+	h.Tick(context.Background())
+
+	assert.Less(t, time.Since(start), time.Second, "a hung RPC must not stall the tick")
+	got := sink.take()
+	require.Equal(t, []string{"rpc failing"}, titles(got), "the alert goes out on the tick's own context")
+	assert.Contains(t, got[0].Embeds[0].Description, "deadline exceeded")
 }
 
 func TestWatch_StakeBelowMinimumAlerts(t *testing.T) {
@@ -459,53 +509,66 @@ func TestWatch_HeartbeatAge(t *testing.T) {
 	assert.Contains(t, got[0].Embeds[0].Description, "no heartbeat")
 }
 
-func TestWatch_UnclaimedDemandAlertsAfterNoClaimAfter(t *testing.T) {
+var otherWorker = common.HexToAddress("0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")
+
+func TestWatch_MissedClaimsAlertAndOwnClaimRecovers(t *testing.T) {
 	t.Parallel()
 	now := time.Unix(1_800_000_000, 0)
 	fc := healthyWatchChain(&now)
+	fc.eligible = map[uint64]bool{1: true, 2: true, 3: true}
 	sink := newWebhookSink(t)
 	h := newWatch(t, fc, newFakeOllama(t).URL(), sink)
-	h.NoClaimAfter = 2 * time.Hour
+	h.MissedClaims = 3
 	ctx := context.Background()
-	step := func(d time.Duration) {
-		now = now.Add(d)
+	tick := func(logs ...SessionClaim) {
+		fc.claimLogs = logs
+		now = now.Add(h.Interval)
 		h.Tick(ctx)
 	}
 
 	h.Tick(ctx) // starts at head: no back-scan
-	fc.requests = 3
-	step(h.Interval)
-	fc.requests = 0
-	step(2*time.Hour - time.Second)
-	require.Empty(t, sink.take(), "unclaimed demand younger than NoClaimAfter is fine")
+	tick(SessionClaim{ReqID: 1, Worker: otherWorker, Block: 120})
+	tick(SessionClaim{ReqID: 2, Worker: otherWorker, Block: 130})
+	require.Empty(t, sink.take(), "two misses are below the threshold")
+	assert.Equal(t, []uint64{120 - claimGraceBlocks, 130 - claimGraceBlocks}, fc.asked,
+		"eligibility is judged claimGraceBlocks before the other worker's claim")
 
-	step(time.Second)
+	tick(SessionClaim{ReqID: 3, Worker: otherWorker, Block: 140})
 	got := sink.take()
 	require.Equal(t, []string{"claims failing"}, titles(got))
-	assert.Contains(t, got[0].Embeds[0].Description, "3 session request(s)")
+	assert.Contains(t, got[0].Embeds[0].Description, "3 session(s) in a row")
 
-	fc.claims = 1
-	step(h.Interval)
+	tick(SessionClaim{ReqID: 4, Worker: testAddr, Block: 150})
 	assert.Equal(t, []string{"claims recovered"}, titles(sink.take()))
 
 	// Scans are contiguous and never re-read a block.
-	require.NotEmpty(t, fc.scans)
 	for i := 1; i < len(fc.scans); i++ {
 		assert.Equal(t, fc.scans[i-1][1]+1, fc.scans[i][0], "scan %d", i)
 	}
 }
 
-func TestWatch_NoDemandNoClaimsIsQuiet(t *testing.T) {
+func TestWatch_LosingSortitionFairlyIsNotAMiss(t *testing.T) {
 	t.Parallel()
 	now := time.Unix(1_800_000_000, 0)
 	fc := healthyWatchChain(&now)
+	// Request 9 went to another worker before this one was eligible; request 7
+	// needed a capability, which watch does not judge.
+	fc.eligible = map[uint64]bool{7: true}
+	fc.reqCaps = map[uint64]int64{7: 1}
 	sink := newWebhookSink(t)
 	h := newWatch(t, fc, newFakeOllama(t).URL(), sink)
-	h.NoClaimAfter = 2 * time.Hour
+	h.MissedClaims = 1
+	ctx := context.Background()
 
-	for range 20 {
-		h.Tick(context.Background())
+	h.Tick(ctx)
+	for i := range 10 {
+		fc.claimLogs = []SessionClaim{
+			{ReqID: 9, Worker: otherWorker, Block: uint64(200 + i)},
+			{ReqID: 7, Worker: otherWorker, Block: uint64(200 + i)},
+			{ReqID: 5, Worker: otherWorker, Block: claimGraceBlocks}, // too early to judge
+		}
 		now = now.Add(time.Hour)
+		h.Tick(ctx)
 	}
 	assert.Empty(t, sink.take())
 }

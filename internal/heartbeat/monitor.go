@@ -174,7 +174,7 @@ func (m *Monitor) emit(ctx context.Context) error {
 		return fmt.Errorf("marshal capabilities: %w", err)
 	}
 
-	ttl := 3 * m.cfg.Interval
+	ttl := KeyTTL(m.cfg.Interval)
 	key := pkgtypes.HeartbeatRedisKey(m.workerAddr)
 
 	pipe := m.redisClient.TxPipeline()
@@ -209,6 +209,12 @@ func (m *Monitor) emit(ctx context.Context) error {
 		m.metrics.HeartbeatLastEmit.SetToCurrentTime()
 	}
 	return nil
+}
+
+// KeyTTL is how long a heartbeat key outlives its last write: a reader that
+// finds no key, or an older timestamp, knows the worker stopped heartbeating.
+func KeyTTL(interval time.Duration) time.Duration {
+	return 3 * interval
 }
 
 // checkOllama performs a GET /api/tags to the Ollama endpoint with a 2s timeout.

@@ -10,11 +10,13 @@
 #   ( umask 077; echo 'WATCH_WEBHOOK_URL=https://discord.com/api/webhooks/<id>/<token>' \
 #       > /etc/lightchain/<name>/watch.env )
 #   # Units that set chain settings with Environment= lines instead of the env
-#   # file: append those settings too, so watch reads what the worker reads,
-#   # plus any further EnvironmentFile= the unit lists (e.g. a Redis password).
+#   # file: append those lines too, so watch reads what the worker reads (re-run
+#   # after changing the worker unit). The env file still wins, as for the worker.
 #   systemctl show -p Environment --value lightchain-<name> | tr ' ' '\n' \
 #     >> /etc/lightchain/<name>/watch.env
+#   # Any further EnvironmentFile= of the worker unit (e.g. a Redis password):
 #   systemctl show -p EnvironmentFiles --value lightchain-<name>
+#   # add each one as EnvironmentFile=<path> in: systemctl edit lightchain-worker-watch@<name>
 #   # Run as the worker's user: `systemctl show -p User --value lightchain-<name>`
 #   # (empty = root). For any other user: systemctl edit lightchain-worker-watch@<name>
 #   # and set User= there; that user must be able to read both env files.
@@ -23,7 +25,8 @@
 #   journalctl -u lightchain-worker-watch@<name> -f     # expect "watch started"
 #
 # Optional in watch.env: WATCH_INTERVAL (30s), WATCH_COOLDOWN (1h, minimum gap
-# between two alerts for the same check), WATCH_NO_CLAIM_AFTER (2h; 0 disables).
+# between repeat alerts for a check that stays failing), WATCH_MISSED_CLAIMS (3:
+# sessions in a row lost to other workers while eligible; 0 disables).
 #
 # Docker workers (external-worker guide): run the same image beside the worker,
 # in its network namespace so 127.0.0.1:9101/healthz is the worker's:
@@ -40,8 +43,9 @@ Wants=network-online.target
 [Service]
 Type=simple
 User=root
-EnvironmentFile=/etc/lightchain/%i/env
+# watch.env first: like Environment= in the worker unit, the env file overrides it.
 EnvironmentFile=/etc/lightchain/%i/watch.env
+EnvironmentFile=/etc/lightchain/%i/env
 ExecStart=/usr/local/bin/lightchain-worker-cli watch
 Restart=always
 RestartSec=10

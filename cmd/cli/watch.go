@@ -16,6 +16,7 @@ import (
 
 	"github.com/lightchain/worker/internal/cli"
 	"github.com/lightchain/worker/internal/config"
+	"github.com/lightchain/worker/internal/heartbeat"
 )
 
 // runWatch is the `watch` daemon. It reads the worker's own env file plus
@@ -64,11 +65,6 @@ func runWatch() {
 		quitProcess(1)
 	}
 
-	var modelIDs [][32]byte
-	if len(cfg.SupportedModels) > 0 {
-		modelIDs, _ = parseModels(cfg, logger)
-	}
-
 	rpc, err := ethclient.Dial(cfg.RPCURL)
 	if err != nil {
 		logger.Error("dial RPC", "error", err)
@@ -85,17 +81,16 @@ func runWatch() {
 		Chain:           chainReader,
 		WorkerAddr:      workerAddr,
 		ChainID:         cfg.ChainID,
-		ModelIDs:        modelIDs,
 		LivenessURL:     "http://" + wcfg.MetricsAddr + "/healthz",
 		OllamaURL:       cfg.OllamaURL,
-		HeartbeatMaxAge: 3 * wcfg.HeartbeatInterval, // the worker's heartbeat key TTL
+		HeartbeatMaxAge: heartbeat.KeyTTL(wcfg.HeartbeatInterval),
 		WebhookURL:      wcfg.WebhookURL,
 		Interval:        wcfg.Interval,
 		Cooldown:        wcfg.Cooldown,
 		Logger:          logger,
 	}
 	if wcfg.SessionManagerAddress != (common.Address{}) {
-		h.NoClaimAfter = wcfg.NoClaimAfter
+		h.MissedClaims = wcfg.MissedClaims
 	}
 	// Gateway profiles heartbeat through the worker-gateway, not Redis.
 	if cfg.WorkerGatewayURL == "" {
@@ -115,6 +110,6 @@ func runWatch() {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 	logger.Info("watch started", "worker", workerAddr.Hex(), "chain", cfg.ChainID,
-		"interval", h.Interval, "cooldown", h.Cooldown, "heartbeat", h.Heartbeat != nil, "claims", h.NoClaimAfter > 0)
+		"interval", h.Interval, "cooldown", h.Cooldown, "heartbeat", h.Heartbeat != nil, "claims", h.MissedClaims > 0)
 	h.Run(ctx)
 }
