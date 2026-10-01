@@ -1404,3 +1404,34 @@ func checksumHexNoPrefix(addr common.Address) string {
 	hex := addr.Hex()
 	return hex[2:]
 }
+
+// Main runs the worker from its environment configuration until it shuts
+// down and returns the process exit code. The sidecar binary and the CLI's
+// `run` command both use it, so a host can serve with the CLI binary alone.
+func Main() int {
+	cfg, err := config.Load()
+	if err != nil {
+		slog.Error("config load failed", "error", err)
+		return 1
+	}
+
+	if errs := cfg.Validate(); len(errs) > 0 {
+		for _, e := range errs {
+			slog.Error("config invalid", "field", e)
+		}
+		slog.Error("config validation failed", "count", len(errs), "fields", strings.Join(errs, "; "))
+		return 1
+	}
+
+	svc, err := New(cfg)
+	if err != nil {
+		slog.Error("service init failed", "error", err)
+		return 1
+	}
+
+	if err := svc.Run(context.Background()); err != nil {
+		slog.Error("service exited with error", "error", err)
+		return 1
+	}
+	return 0
+}
