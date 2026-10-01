@@ -1,0 +1,57 @@
+# lightchain-worker-watch@<name>.service — read-only alerting for the worker
+# whose files live in /etc/lightchain/<name>/ (the worker units' layout). It
+# posts Discord-compatible webhook messages when the worker's liveness
+# endpoint, Redis heartbeat, Ollama, registration, suspension, stake or recent
+# claims go bad, and once more on recovery. It never restarts, drains or
+# sends a transaction.
+#
+# Install, as root, for worker <name>:
+#   install -m 644 lightchain-worker-watch@.service /etc/systemd/system/
+#   ( umask 077; echo 'WATCH_WEBHOOK_URL=https://discord.com/api/webhooks/<id>/<token>' \
+#       > /etc/lightchain/<name>/watch.env )
+#   # Units that set chain settings with Environment= lines instead of the env
+#   # file: append those settings too, so watch reads what the worker reads,
+#   # plus any further EnvironmentFile= the unit lists (e.g. a Redis password).
+#   systemctl show -p Environment --value lightchain-<name> | tr ' ' '\n' \
+#     >> /etc/lightchain/<name>/watch.env
+#   systemctl show -p EnvironmentFiles --value lightchain-<name>
+#   # Run as the worker's user: `systemctl show -p User --value lightchain-<name>`
+#   # (empty = root). For any other user: systemctl edit lightchain-worker-watch@<name>
+#   # and set User= there; that user must be able to read both env files.
+#   systemctl daemon-reload
+#   systemctl enable --now lightchain-worker-watch@<name>
+#   journalctl -u lightchain-worker-watch@<name> -f     # expect "watch started"
+#
+# Optional in watch.env: WATCH_INTERVAL (30s), WATCH_COOLDOWN (1h, minimum gap
+# between two alerts for the same check), WATCH_NO_CLAIM_AFTER (2h; 0 disables).
+#
+# Docker workers (external-worker guide): run the same image beside the worker,
+# in its network namespace so 127.0.0.1:9101/healthz is the worker's:
+#   docker run -d --name lightchain-worker-watch --restart unless-stopped \
+#     --network container:lightchain-worker --env-file ~/lightchain-worker/worker.env \
+#     -e WATCH_WEBHOOK_URL=... -v ~/lightchain-worker/keys:/keys:ro \
+#     --entrypoint /bin/lightchain-worker <worker image> watch
+
+[Unit]
+Description=LightChain worker watch (%i) - webhook alerts, read-only
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+EnvironmentFile=/etc/lightchain/%i/env
+EnvironmentFile=/etc/lightchain/%i/watch.env
+ExecStart=/usr/local/bin/lightchain-worker-cli watch
+Restart=always
+RestartSec=10
+# watch only reads; the sandbox makes the filesystem read-only for it too.
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=read-only
+PrivateTmp=true
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
