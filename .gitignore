@@ -25,3 +25,6 @@ go.work.sum
 *.swp
 *.swo
 .DS_Store
+
+# Release artifacts
+/dist/

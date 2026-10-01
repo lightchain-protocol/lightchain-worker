@@ -1,6 +1,7 @@
 // Binary lightchain-worker is the operator CLI for managing worker on-chain registration.
 // It handles registration, deregistration, model management, and status checks — all
 // operations that control stake and should be separated from the runtime sidecar.
+// The `run` command starts that sidecar from this binary, so a host needs only one file.
 //
 // Usage:
 //
@@ -8,6 +9,8 @@
 //
 // Commands:
 //
+//	init        Guided setup: worker key, register with stake, add models, preflight
+//	run         Run the worker (the sidecar) in the foreground
 //	keygen      Generate/load ECDH encryption key and print public key hex
 //	register    Register worker on-chain (stake + encryption key + models)
 //	add-models  Add models to an already-registered worker
@@ -19,6 +22,7 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"crypto/ecdsa"
 	"flag"
@@ -40,6 +44,7 @@ import (
 	"github.com/lightchain/worker/internal/gateway"
 	"github.com/lightchain/worker/internal/keystore"
 	"github.com/lightchain/worker/internal/release"
+	"github.com/lightchain/worker/internal/service"
 )
 
 const txTimeout = 120 * time.Second
@@ -57,6 +62,10 @@ func main() {
 
 	cmd := os.Args[1]
 	switch cmd {
+	case "init":
+		runInit()
+	case "run":
+		quitProcess(service.Main())
 	case "import-key":
 		runImportKey()
 	case "keygen":
@@ -96,6 +105,10 @@ func printUsage() {
 Usage: lightchain-worker <command>
 
 Commands:
+  init        Guided setup: create or import the worker key, register with
+              stake, add models, then run preflight. Safe to re-run: it
+              skips whatever is already done.
+  run         Run the worker in the foreground (same as the sidecar binary)
   import-key  Import a hex private key into an encrypted keystore file
   keygen      Generate/load ECDH encryption key and print public key hex
   register    Register worker on-chain (stake + encryption key + models)
@@ -129,12 +142,17 @@ drain semantics:
   (which drains and exits). Use drain when you want to monitor in-flight
   job settlement before tearing down.
 
-All configuration is via environment variables. See docs/worker-cli.md for details.
+All configuration is via environment variables. See docs/install.md for a full setup.
 
 import-key flags:
   --private-key <hex>   Hex-encoded private key (without 0x prefix)
   --password <string>   Password to encrypt the keystore
   --output <dir>        Directory to write the keystore file (default: ./eth-keystore)
+
+init flags (each answers a prompt, for unattended runs):
+  --generate                Create a new worker key if none exists
+  --import-key-file <file>  Import the hex private key held in <file>
+  --yes                     Stake and register without asking
 
 release flags:
   --reconcile-only      Run reconciler only; do not execute a release cycle
@@ -363,19 +381,13 @@ func runPreflight() {
 	chainClient := dialChain(cfg, signingKey, logger)
 	defer chainClient.Close()
 
-	h := &cli.PreflightHandler{
-		Chain:       chainClient,
-		ChainID:     cfg.ChainID,
-		WorkerAddr:  workerAddr,
-		ModelIDs:    modelIDs,
-		ModelNames:  modelNames,
-		ECDHKeyPath: cfg.EncryptionKeystorePath,
-		ECDHPass:    cfg.WorkerKeystorePassword,
-		OllamaURL:   cfg.OllamaURL,
-		BeaconURL:   cfg.BeaconAPIURL,
-		Out:         os.Stdout,
-	}
+	h := newPreflightHandler(cfg, chainClient, signingKey, workerAddr, modelIDs, modelNames, logger)
 	if readOnly {
+		// No keystore: skip the ECDH check and only ping the gateway.
+		h.LoadECDHKey = nil
+		if cfg.WorkerGatewayURL != "" {
+			h.Gateway = &cli.GatewayPing{URL: cfg.WorkerGatewayURL}
+		}
 		// Inspecting a remote address: the sidecar-default localhost probes
 		// are meaningless unless the operator asked for them.
 		if os.Getenv("OLLAMA_URL") == "" {
@@ -384,22 +396,95 @@ func runPreflight() {
 		if os.Getenv("BEACON_API_URL") == "" {
 			h.BeaconURL = ""
 		}
-	} else {
-		// Load only: preflight must never create the ECDH key as a side effect.
-		h.LoadECDHKey = keystore.Load
-	}
-	if cfg.WorkerGatewayURL != "" {
-		if readOnly {
-			h.Gateway = &cli.GatewayPing{URL: cfg.WorkerGatewayURL}
-		} else {
-			h.Gateway = gateway.NewClient(cfg.WorkerGatewayURL, signingKey, logger)
-		}
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 
 	if !h.Run(ctx) {
+		quitProcess(1)
+	}
+}
+
+// newPreflightHandler builds the preflight for a worker whose key is loaded.
+func newPreflightHandler(
+	cfg *config.RegistrationConfig,
+	chainClient *chain.ChainClient,
+	signingKey *ecdsa.PrivateKey,
+	workerAddr common.Address,
+	modelIDs [][32]byte,
+	modelNames []string,
+	logger *slog.Logger,
+) *cli.PreflightHandler {
+	h := &cli.PreflightHandler{
+		Chain:       chainClient,
+		ChainID:     cfg.ChainID,
+		WorkerAddr:  workerAddr,
+		ModelIDs:    modelIDs,
+		ModelNames:  modelNames,
+		ECDHKeyPath: cfg.EncryptionKeystorePath,
+		ECDHPass:    cfg.WorkerKeystorePassword,
+		// Load only: preflight must never create the ECDH key as a side effect.
+		LoadECDHKey: keystore.Load,
+		OllamaURL:   cfg.OllamaURL,
+		BeaconURL:   cfg.BeaconAPIURL,
+		Out:         os.Stdout,
+	}
+	if cfg.WorkerGatewayURL != "" {
+		h.Gateway = gateway.NewClient(cfg.WorkerGatewayURL, signingKey, logger)
+	}
+	return h
+}
+
+func runInit() {
+	fs := flag.NewFlagSet("init", flag.ExitOnError)
+	generate := fs.Bool("generate", false, "Create a new worker key if none exists, without asking")
+	importKeyFile := fs.String("import-key-file", "", "Import the hex private key held in this file, without asking")
+	yes := fs.Bool("yes", false, "Stake and register without asking")
+	if err := fs.Parse(os.Args[2:]); err != nil {
+		quitProcess(1)
+	}
+
+	cfg, logger := loadAndValidateCfg()
+	var modelIDs [][32]byte
+	var modelNames []string
+	if len(cfg.SupportedModels) > 0 {
+		modelIDs, modelNames = parseModels(cfg, logger)
+	}
+
+	h := &cli.InitHandler{
+		KeystorePath:  cfg.WorkerKeystorePath,
+		KeystorePass:  cfg.WorkerKeystorePassword,
+		Generate:      *generate,
+		ImportKeyFile: *importKeyFile,
+		ChainID:       cfg.ChainID,
+		ModelIDs:      modelIDs,
+		ModelNames:    modelNames,
+		WorkerStake:   cfg.WorkerStake,
+		ECDHKeyPath:   cfg.EncryptionKeystorePath,
+		ECDHPass:      cfg.WorkerKeystorePassword,
+		LoadECDHKey:   keystore.LoadOrGenerate,
+		Yes:           *yes,
+		In:            bufio.NewReader(os.Stdin),
+		Out:           os.Stdout,
+		Logger:        logger,
+	}
+	signingKey, err := h.EnsureKey()
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "init:", err)
+		quitProcess(1)
+	}
+
+	chainClient := dialChain(cfg, signingKey, logger)
+	defer chainClient.Close()
+	h.Chain = chainClient
+	h.Preflight = newPreflightHandler(cfg, chainClient, signingKey, h.WorkerAddr, modelIDs, modelNames, logger)
+
+	// Covers the stake prompt, the registration and model transactions, and preflight.
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+	defer cancel()
+	if err := h.Run(ctx); err != nil {
+		fmt.Fprintln(os.Stderr, "init:", err)
 		quitProcess(1)
 	}
 }
