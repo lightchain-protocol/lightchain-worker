@@ -12,6 +12,7 @@ import (
 	"github.com/hibiken/asynq"
 	"github.com/redis/go-redis/v9"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 
 	"github.com/lightchain/worker/internal/config"
 )
@@ -47,6 +48,18 @@ func TestAsynqRedisClientOptFromRedisOptions(t *testing.T) {
 		PoolSize:     opts.PoolSize,
 		TLSConfig:    opts.TLSConfig,
 	}, got)
+}
+
+func TestRedisOptions_malformedURLErrorOmitsURL(t *testing.T) {
+	t.Parallel()
+
+	_, err := redisOptions(&config.Config{RedisURL: "redis://:s3cr3t%2Fp4ssw0rd@localhost:63x79"})
+
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "REDIS_URL")
+	for _, secret := range []string{"s3cr3t", "p4ssw0rd", "localhost"} {
+		assert.NotContains(t, err.Error(), secret)
+	}
 }
 
 func TestService_computeDrainTTL_overrideTakesPrecedence(t *testing.T) {
