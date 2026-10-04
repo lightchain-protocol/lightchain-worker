@@ -36,8 +36,7 @@ type RegistrationConfig struct {
 	// takes precedence if set, otherwise RedisURL (direct mode).
 	RedisURL         string
 	WorkerGatewayURL string
-	// RedisPassword authenticates direct mode when RedisURL carries no
-	// password of its own.
+	// RedisPassword, when set, replaces any password embedded in RedisURL.
 	RedisPassword string
 
 	// OllamaURL and BeaconAPIURL are consulted only by the preflight

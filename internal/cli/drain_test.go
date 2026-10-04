@@ -324,7 +324,8 @@ func TestRedisOptions_authenticatesDrainAndUndrain(t *testing.T) {
 		password string // REDIS_PASSWORD
 	}{
 		{name: "REDIS_PASSWORD with a password-less REDIS_URL", password: "s3cret"},
-		{name: "password in REDIS_URL wins over REDIS_PASSWORD", userinfo: ":s3cret@", password: "stale"},
+		{name: "REDIS_PASSWORD wins over a stale password in REDIS_URL", userinfo: ":stale@", password: "s3cret"},
+		{name: "password in REDIS_URL alone", userinfo: ":s3cret@"},
 	}
 
 	for _, tt := range tests {
