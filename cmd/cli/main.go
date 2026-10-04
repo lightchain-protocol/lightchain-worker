@@ -127,7 +127,8 @@ Commands:
   undrain     Reverse drain — restore worker eligibility
   deregister  Deregister worker and withdraw stake
   reinstate   Lift a suspension once its cooldown is over. Sends nothing unless
-              the worker is suspended and its stake meets the on-chain minimum.
+              the worker is suspended and its stake meets the on-chain minimum;
+              before the cooldown ends it prints when that is.
   top-up-stake [--yes] <amount>
               Add <amount> LCAI (e.g. 750 or 60.25) to the worker's stake, as a
               slash can leave it under the on-chain minimum. Asks before

@@ -1196,6 +1196,15 @@ func (c *ChainClient) IsWorkerSuspended(ctx context.Context, worker common.Addre
 	return v, nil
 }
 
+// GetSuspendedUntil returns the unix time at which the worker's suspension cooldown ends.
+func (c *ChainClient) GetSuspendedUntil(ctx context.Context, worker common.Address) (*big.Int, error) {
+	v, err := c.registry.GetSuspendedUntil(&bind.CallOpts{Context: ctx}, worker)
+	if err != nil {
+		return nil, fmt.Errorf("GetSuspendedUntil %s: %w", worker.Hex(), err)
+	}
+	return v, nil
+}
+
 // GetOffenseCount returns the worker's recorded offense count.
 func (c *ChainClient) GetOffenseCount(ctx context.Context, worker common.Address) (*big.Int, error) {
 	v, err := c.registry.GetOffenseCount(&bind.CallOpts{Context: ctx}, worker)
