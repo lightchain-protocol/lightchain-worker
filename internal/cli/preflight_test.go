@@ -231,7 +231,7 @@ func TestPreflight_StakeBelowMinimum(t *testing.T) {
 	require.False(t, ok)
 	assert.Contains(t, buf.String(), "[FAIL] stake")
 	assert.Contains(t, buf.String(), "4000 LCAI")
-	assert.Contains(t, buf.String(), "topUpStake")
+	assert.Contains(t, buf.String(), "`lightchain-worker top-up-stake", "the failing line names its fix")
 }
 
 func TestPreflight_MinimumDiffersFromPublished_Warns(t *testing.T) {

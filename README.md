@@ -18,7 +18,7 @@ lightchain-worker run      # serve; the guide wraps it in a systemd unit
 
 | Path | Binary | Role |
 |---|---|---|
-| `cmd/cli` | `lightchain-worker` | Operator CLI: `init`, `run`, `preflight`, `register`, `add-models`, `status`, `drain`, `balance`, `withdraw`, `reinstate`, `deregister`, ... (`lightchain-worker help`) |
+| `cmd/cli` | `lightchain-worker` | Operator CLI: `init`, `run`, `preflight`, `register`, `add-models`, `status`, `drain`, `balance`, `withdraw`, `top-up-stake`, `reinstate`, `deregister`, ... (`lightchain-worker help`) |
 | `cmd/sidecar` | `worker` | The worker service alone. It is the Docker image's entrypoint and the same code as `lightchain-worker run` |
 
 Both read their configuration from environment variables.

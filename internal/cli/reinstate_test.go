@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"math/big"
 	"strings"
 	"testing"
 	"time"
@@ -12,16 +13,26 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// reinstateChain is the preflight's fakeChain plus the reinstate transaction.
+// reinstateChain is the preflight's fakeChain plus the reinstate and top-up
+// transactions.
 type reinstateChain struct {
 	*fakeChain
 	reinstateCalls int
-	reinstateErr   error // when set, the reinstate transaction fails
+	reinstateErr   error      // when set, the reinstate transaction fails
+	topUps         []*big.Int // the value of each top-up transaction sent
+	topUpErr       error      // when set, the top-up transaction fails
+	sendCtxErr     error      // the context's error when the top-up was sent
 }
 
 func (c *reinstateChain) Reinstate(context.Context) error {
 	c.reinstateCalls++
 	return c.reinstateErr
+}
+
+func (c *reinstateChain) TopUpStake(ctx context.Context, amount *big.Int) error {
+	c.topUps = append(c.topUps, amount)
+	c.sendCtxErr = ctx.Err()
+	return c.topUpErr
 }
 
 // suspendedWorker is a registered, suspended worker whose stake is at the
@@ -66,7 +77,7 @@ func TestReinstate_RefusesWithoutSending(t *testing.T) {
 		{
 			name:  "stake below the minimum",
 			setup: func(c *reinstateChain) { c.stake = lcaiWei(4250) },
-			want:  []string{"4250 LCAI", "minimum 5000 LCAI", "750 LCAI"},
+			want:  []string{"4250 LCAI", "minimum 5000 LCAI", "750 LCAI", "`lightchain-worker top-up-stake"},
 		},
 		{
 			name:  "minimum stake unreadable",
