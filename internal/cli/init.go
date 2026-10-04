@@ -45,6 +45,8 @@ type InitHandler struct {
 	LoadECDHKey ECDHKeyLoader // creates the ECDH key when registering
 	Preflight   *PreflightHandler
 	Yes         bool // stake without asking
+	// ReconcileSeed is handed to the registration; see Handler.ReconcileSeed.
+	ReconcileSeed *ReconcileSeed
 
 	In     *bufio.Reader // shared by every prompt so none reads ahead of another
 	Out    io.Writer
@@ -215,6 +217,7 @@ func (h *InitHandler) register(ctx context.Context) error {
 		Out:         h.Out,
 		Logger:      h.Logger,
 	}
+	reg.ReconcileSeed = h.ReconcileSeed
 	if err := reg.Register(ctx); err != nil {
 		return fmt.Errorf("registration failed: %w — re-run `lightchain-worker init` once fixed; it reads the chain before acting", err)
 	}
