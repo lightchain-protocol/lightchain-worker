@@ -49,6 +49,18 @@ type Handler struct {
 	// ReleaseConfig configures the on-demand release cycle and reconciler
 	// run invoked by `worker-cli release`.
 	ReleaseConfig release.Config
+	// Reinstatement is required only by the `reinstate` subcommand.
+	Reinstatement ReinstateChain
+}
+
+// ReinstateChain is what `reinstate` drives: the reads that tell whether the
+// chain would accept it, then the transaction that lifts the suspension.
+type ReinstateChain interface {
+	IsWorkerRegistered(ctx context.Context, worker common.Address) (bool, error)
+	IsWorkerSuspended(ctx context.Context, worker common.Address) (bool, error)
+	GetWorkerStake(ctx context.Context, worker common.Address) (*big.Int, error)
+	GetMinWorkerStake(ctx context.Context) (*big.Int, error)
+	Reinstate(ctx context.Context) error
 }
 
 // Keygen loads or generates the ECDH encryption key and prints the public key hex.
@@ -134,6 +146,46 @@ func (h *Handler) Deregister(ctx context.Context) error {
 	}
 
 	fmt.Fprintf(h.Out, "Worker %s deregistered, stake withdrawn\n", h.WorkerAddr.Hex())
+	return nil
+}
+
+// Reinstate lifts the worker's suspension. It reads the chain first and sends
+// nothing unless the worker is registered, suspended and staked to the
+// on-chain minimum. The cooldown is not read: while it runs the chain rejects
+// the transaction, and the error says so.
+func (h *Handler) Reinstate(ctx context.Context) error {
+	registered, err := h.Reinstatement.IsWorkerRegistered(ctx, h.WorkerAddr)
+	if err != nil {
+		return fmt.Errorf("read registration: %w", err)
+	}
+	if !registered {
+		return fmt.Errorf("worker %s is not registered — there is nothing to reinstate", h.WorkerAddr.Hex())
+	}
+	suspended, err := h.Reinstatement.IsWorkerSuspended(ctx, h.WorkerAddr)
+	if err != nil {
+		return fmt.Errorf("read suspension: %w", err)
+	}
+	if !suspended {
+		return fmt.Errorf("worker %s is not suspended — there is nothing to reinstate", h.WorkerAddr.Hex())
+	}
+	stake, err := h.Reinstatement.GetWorkerStake(ctx, h.WorkerAddr)
+	if err != nil {
+		return fmt.Errorf("read stake: %w", err)
+	}
+	minStake, err := h.Reinstatement.GetMinWorkerStake(ctx)
+	if err != nil {
+		return fmt.Errorf("read the minimum stake: %w", err)
+	}
+	if stake.Cmp(minStake) < 0 {
+		return fmt.Errorf("stake %s is below the on-chain minimum %s — top it up by at least %s (topUpStake) first; nothing was sent",
+			lcai(stake), lcai(minStake), lcai(new(big.Int).Sub(minStake, stake)))
+	}
+
+	if err := h.Reinstatement.Reinstate(ctx); err != nil {
+		return fmt.Errorf("reinstate transaction: %w — the chain rejects it while the suspension cooldown is still running; "+
+			"if that is the cause, run `lightchain-worker reinstate` again once the cooldown is over", err)
+	}
+	fmt.Fprintf(h.Out, "Worker %s reinstated, suspension lifted\n", h.WorkerAddr.Hex())
 	return nil
 }
 

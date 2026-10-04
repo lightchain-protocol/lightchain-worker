@@ -159,6 +159,7 @@ On its first start the worker reads the chain's session history to set its curso
 | Registration and key status | `lcw status` |
 | Add a model | `ollama pull NAME`, append it to `SUPPORTED_MODELS`, `lcw init`, `sudo systemctl restart lightchain-worker` |
 | Earnings | `lcw balance`; `lcw withdraw` moves them to the worker address |
+| Back from a suspension | `lcw reinstate`, once the cooldown is over and the stake is back at the minimum |
 | Upgrade | re-run the installer, then `sudo systemctl restart lightchain-worker` |
 | Stop | `sudo systemctl stop lightchain-worker` drains first: no new sessions, and in-flight jobs get up to `SHUTDOWN_TIMEOUT` to finish |
 | Leave | stop the service, then `lcw deregister` returns the stake once no jobs are active |

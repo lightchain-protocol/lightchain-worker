@@ -214,7 +214,7 @@ func (h *PreflightHandler) checkSuspension(ctx context.Context, r *report) {
 		offenses = n.String()
 	}
 	if suspended {
-		r.failf("suspended", "yes — %s offense(s); wait out the cooldown (getSuspendedUntil) before serving", offenses)
+		r.failf("suspended", "yes — %s offense(s); wait out the cooldown (getSuspendedUntil), then run `lightchain-worker reinstate`", offenses)
 	} else {
 		r.pass("suspended", "no (%s offense(s) on record)", offenses)
 	}
