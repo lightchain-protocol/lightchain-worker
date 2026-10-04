@@ -57,15 +57,14 @@ type DrainHandler struct {
 	Logger *slog.Logger
 }
 
-// RedisOptions parses REDIS_URL for the direct-mode Redis client. A password
-// embedded in the URL wins; REDIS_PASSWORD is used only when the URL carries
-// none.
+// RedisOptions parses REDIS_URL for the direct-mode Redis client.
+// REDIS_PASSWORD, when set, replaces any password embedded in the URL.
 func RedisOptions(redisURL, password string) (*redis.Options, error) {
 	opts, err := redis.ParseURL(redisURL)
 	if err != nil {
 		return nil, err
 	}
-	if opts.Password == "" {
+	if password != "" {
 		opts.Password = password
 	}
 	return opts, nil
