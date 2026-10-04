@@ -64,8 +64,10 @@ type Handler struct {
 // tell whether the chain would accept them, then the transaction that lifts
 // the suspension or adds the stake.
 type ReinstateChain interface {
+	Head(ctx context.Context) (chain.HeadInfo, error)
 	IsWorkerRegistered(ctx context.Context, worker common.Address) (bool, error)
 	IsWorkerSuspended(ctx context.Context, worker common.Address) (bool, error)
+	GetSuspendedUntil(ctx context.Context, worker common.Address) (*big.Int, error)
 	Balance(ctx context.Context, addr common.Address) (*big.Int, error)
 	GetWorkerStake(ctx context.Context, worker common.Address) (*big.Int, error)
 	GetMinWorkerStake(ctx context.Context) (*big.Int, error)
@@ -160,8 +162,8 @@ func (h *Handler) Deregister(ctx context.Context) error {
 }
 
 // Reinstate lifts the worker's suspension. It reads the chain first and sends
-// nothing unless the worker is registered, suspended and staked to the
-// on-chain minimum.
+// nothing unless the worker is registered, suspended, staked to the on-chain
+// minimum and past its cooldown.
 func (h *Handler) Reinstate(ctx context.Context) error {
 	registered, err := h.Reinstatement.IsWorkerRegistered(ctx, h.WorkerAddr)
 	if err != nil {
@@ -189,11 +191,22 @@ func (h *Handler) Reinstate(ctx context.Context) error {
 		return fmt.Errorf("stake %s is below the on-chain minimum %s — top it up by at least %s (`lightchain-worker top-up-stake <amount>`) first; nothing was sent",
 			lcai(stake), lcai(minStake), lcai(new(big.Int).Sub(minStake, stake)))
 	}
+	until, err := h.Reinstatement.GetSuspendedUntil(ctx, h.WorkerAddr)
+	if err != nil {
+		return fmt.Errorf("read the cooldown end: %w", err)
+	}
+	head, err := h.Reinstatement.Head(ctx)
+	if err != nil {
+		return fmt.Errorf("read the latest block: %w", err)
+	}
+	if end, left := cooldown(until, head); left > 0 {
+		return fmt.Errorf("the suspension cooldown runs until %s (%s left) — run `lightchain-worker reinstate` again after that; nothing was sent", end, left)
+	}
 
 	if err := h.Reinstatement.Reinstate(ctx); err != nil {
-		// ponytail: the cooldown is not read before sending (this chain client
-		// has no reader for its end), so a revert is explained instead. Read
-		// getSuspendedUntil and refuse with the end time if this gets run early.
+		// The cooldown was over as of the latest block, so a revert here is a
+		// race: the node estimated gas against an older block, or the worker
+		// was suspended again in between. The hint covers that.
 		if strings.Contains(err.Error(), "reverted") {
 			return fmt.Errorf("%w — the chain rejects reinstate while the suspension cooldown is still running; "+
 				"if that is the cause, run `lightchain-worker reinstate` again once it is over", err)
