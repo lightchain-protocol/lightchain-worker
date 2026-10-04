@@ -813,8 +813,8 @@ func hexNibble(c byte) (byte, bool) {
 // RedisOptions parses REDIS_URL into client options. REDIS_PASSWORD, when set,
 // replaces any password embedded in the URL.
 //
-// The error is built from fixed text only. ParseURL's own error quotes the
-// URL, or the part it choked on, and an unescaped '/', '?' or '#' in a
+// The error is built from fixed text only. Nearly every ParseURL error quotes
+// the URL, or the part it choked on, and an unescaped '/', '?' or '#' in a
 // password moves the password into that part, so none of it is passed on.
 func RedisOptions(redisURL, password string) (*redis.Options, error) {
 	opts, err := redis.ParseURL(redisURL)
@@ -827,10 +827,10 @@ func RedisOptions(redisURL, password string) (*redis.Options, error) {
 	return opts, nil
 }
 
-// redisURLFaults maps the leading text of each error redis.ParseURL returns
-// (net/url's, found inside its *url.Error, then go-redis's own) to what is
-// wrong in general terms. The catch-all for query options comes last.
-var redisURLFaults = []struct{ prefix, fault string }{
+// redisURLFaultByPrefix maps the leading text of each error redis.ParseURL
+// returns (net/url's, found inside its *url.Error, then go-redis's own) to
+// what is wrong in general terms. The catch-all for query options comes last.
+var redisURLFaultByPrefix = []struct{ prefix, fault string }{
 	{"net/url: invalid control character", "control character"},
 	{"missing protocol scheme", "missing scheme"},
 	{"first path segment in URL cannot contain colon", "missing scheme"},
@@ -857,7 +857,7 @@ func redisURLFault(err error) string {
 	if errors.As(err, &urlErr) {
 		msg = urlErr.Err.Error()
 	}
-	for _, f := range redisURLFaults {
+	for _, f := range redisURLFaultByPrefix {
 		if strings.HasPrefix(msg, f.prefix) {
 			return f.fault
 		}
