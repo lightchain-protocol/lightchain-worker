@@ -315,9 +315,6 @@ func TestUndrain_gatewayMode_callsSendUndrain(t *testing.T) {
 	assert.Equal(t, 1, gw.undrainCalls)
 }
 
-// A Redis that requires auth rejects every command from a client that holds
-// no password, so drain and undrain only pass here when the password reaches
-// the client.
 func TestRedisOptions_authenticatesDrainAndUndrain(t *testing.T) {
 	t.Parallel()
 
