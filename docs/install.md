@@ -149,7 +149,7 @@ gateway stream connected
 worker sidecar running (sortition mode) — waiting for shutdown signal
 ```
 
-On its first start the worker looks for session requests in the most recent blocks only (the last 2000 by default), so it can claim without first reading the chain's session history. It still reads the chain's job history once to set its job cursor, and serves its first jobs once that has caught up. A claim logs `claimed session request`. From then on the worker serves its jobs on Ollama, streams tokens through the gateway, and submits the result as an on-chain blob.
+On its first start the worker does not read the chain's history: it starts its session and job cursors 2000 blocks behind the chain head (`SORTITION_SESSION_LOOKBACK_BLOCKS`), so it can claim as soon as it is eligible. A claim logs `claimed session request`. From then on the worker serves its jobs on Ollama, streams tokens through the gateway, and submits the result as an on-chain blob.
 
 ## Day to day
 
@@ -176,7 +176,7 @@ Run `lcw preflight` first; each `[FAIL]` line names its fix.
 | `init: cannot reach the chain RPC` | Check `RPC_URL` and the host's outbound access |
 | `[FAIL] ollama … not pulled` | `ollama pull` the name, or `ollama cp` a pulled model to it |
 | `[FAIL] gateway … 403 worker not registered` | Registration missing, or the env file points at another keystore |
-| Registered but never claims | A model was not added for this worker, the worker is suspended, or the service is still catching up on its first start |
+| Registered but never claims | A model was not added for this worker, or the worker is suspended |
 
 ## Docker Compose recipe
 

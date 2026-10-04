@@ -28,6 +28,7 @@ type mockServeClient struct {
 	sessionInfos  map[uint64]chain.SessionInfo
 	headErr       error
 	filterErr     error
+	filterRanges  [][2]uint64 // every [from, to] FilterJobSubmitted was asked for
 	// encWorkerKeyErrOverride, keyed by sessionID, forces GetSessionEncWorkerKey
 	// to always return the given error (takes priority over encWorkerKeys).
 	// Used to model a session that never becomes Active again.
@@ -43,8 +44,18 @@ func (m *mockServeClient) Head(_ context.Context) (chain.HeadInfo, error) {
 	return m.head, m.headErr
 }
 
-func (m *mockServeClient) FilterJobSubmitted(_ context.Context, _, _ uint64) ([]chain.JobSubmittedEvent, error) {
-	return m.jobSubmitted, m.filterErr
+func (m *mockServeClient) FilterJobSubmitted(_ context.Context, from, to uint64) ([]chain.JobSubmittedEvent, error) {
+	m.filterRanges = append(m.filterRanges, [2]uint64{from, to})
+	if m.filterErr != nil {
+		return nil, m.filterErr
+	}
+	var result []chain.JobSubmittedEvent
+	for _, ev := range m.jobSubmitted {
+		if ev.BlockNumber >= from && ev.BlockNumber <= to {
+			result = append(result, ev)
+		}
+	}
+	return result, nil
 }
 
 func (m *mockServeClient) GetJobBlobInfo(_ context.Context, jobID uint64) (common.Hash, common.Hash, uint64, uint64, error) {
@@ -111,11 +122,14 @@ var (
 
 // newJW builds a JobWatcher backed by a fresh CursorStore with syncServe=true
 // for deterministic tests (HandleJobPayload is called synchronously, not in a
-// goroutine). Returns the watcher and its CursorStore for cursor assertions.
+// goroutine). The cursor is stored at 0: an absent one would start the watcher
+// at the safe head instead. Returns the watcher and its CursorStore for cursor
+// assertions.
 func newJW(t *testing.T, mc *mockServeClient, kc *mockKeyChecker, sink *mockJobSink, counter *atomic.Int32) (*JobWatcher, *CursorStore) {
 	t.Helper()
 	cs, err := NewCursorStore(t.TempDir())
 	require.NoError(t, err)
+	require.NoError(t, cs.Set(cursorJobSubmitted, 0))
 	return NewJobWatcher(JobWatcherOpts{
 		Client:        mc,
 		KeyChecker:    kc,
@@ -352,6 +366,7 @@ func TestJobWatcher_SessionNotActive_BoundedRetryThenSkip(t *testing.T) {
 	sink := &mockJobSink{}
 	cs, err := NewCursorStore(t.TempDir())
 	require.NoError(t, err)
+	require.NoError(t, cs.Set(cursorJobSubmitted, 0))
 	jw := NewJobWatcher(JobWatcherOpts{
 		Client:            mc,
 		KeyChecker:        &mockKeyChecker{canDecrypt: true},
@@ -411,6 +426,7 @@ func TestJobWatcher_PlainRPCError_NeverGivesUp(t *testing.T) {
 	sink := &mockJobSink{}
 	cs, err := NewCursorStore(t.TempDir())
 	require.NoError(t, err)
+	require.NoError(t, cs.Set(cursorJobSubmitted, 0))
 	jw := NewJobWatcher(JobWatcherOpts{
 		Client:            mc,
 		KeyChecker:        &mockKeyChecker{canDecrypt: true},
@@ -433,4 +449,83 @@ func TestJobWatcher_PlainRPCError_NeverGivesUp(t *testing.T) {
 		require.NoError(t, gErr)
 		require.Equal(t, uint64(19), got, "pass %d: cursor must stay parked (no skip) past retryLimit", i)
 	}
+}
+
+// ── first pass of a fresh worker (no cursor on disk) ─────────────────────────
+
+// freshJobChain is a long chain with one job of ours months back and one in
+// the last few blocks, both servable.
+func freshJobChain(head uint64) *mockServeClient {
+	return &mockServeClient{
+		head: chain.HeadInfo{Number: head},
+		jobSubmitted: []chain.JobSubmittedEvent{
+			{JobID: 1, SessionID: 10, Worker: testMyWorker, BlockNumber: 50},
+			{JobID: 2, SessionID: 10, Worker: testMyWorker, BlockNumber: 9_990},
+		},
+		encWorkerKeys: map[uint64][]byte{10: []byte("encKey")},
+		blobInfos:     map[uint64]mockBlobInfo{1: {submitBlock: 50}, 2: {submitBlock: 9_990}},
+		sessionInfos:  map[uint64]chain.SessionInfo{10: {Worker: testMyWorker, Status: 1}},
+	}
+}
+
+// A worker with no job cursor must not scan the chain from the first block: it
+// starts LookbackBlocks behind the safe head.
+func TestJobWatcher_NoCursorStartsWithinLookbackOfSafeHead(t *testing.T) {
+	var counter atomic.Int32
+	mc := freshJobChain(10_005) // safe head 10_000 at 5 confirmations
+	sink := &mockJobSink{}
+	cs, err := NewCursorStore(t.TempDir())
+	require.NoError(t, err)
+	jw := NewJobWatcher(JobWatcherOpts{
+		Client:         mc,
+		KeyChecker:     &mockKeyChecker{canDecrypt: true},
+		Sink:           sink,
+		Cursor:         cs,
+		Worker:         testMyWorker,
+		JobCounter:     &counter,
+		MaxConcurrent:  4,
+		ChunkSize:      5000,
+		Confirmations:  5,
+		LookbackBlocks: 60,
+		Logger:         testLogger(t),
+		syncServe:      true,
+	})
+
+	require.NoError(t, jw.RunOnce(context.Background()))
+	require.Equal(t, [][2]uint64{{9_941, 10_000}}, mc.filterRanges,
+		"only the look-back window behind the safe head is scanned")
+	payloads := sink.received()
+	require.Len(t, payloads, 1)
+	require.Equal(t, uint64(2), payloads[0].JobID)
+	got, err := cs.Get(cursorJobSubmitted)
+	require.NoError(t, err)
+	require.Equal(t, uint64(10_000), got)
+}
+
+// A stored cursor stays authoritative however far behind the head it is, even a
+// stored 0: the scan resumes right after it.
+func TestJobWatcher_StoredCursorIsAuthoritative(t *testing.T) {
+	var counter atomic.Int32
+	mc := freshJobChain(10_000)
+	sink := &mockJobSink{}
+	cs, err := NewCursorStore(t.TempDir())
+	require.NoError(t, err)
+	require.NoError(t, cs.Set(cursorJobSubmitted, 0))
+	jw := NewJobWatcher(JobWatcherOpts{
+		Client:         mc,
+		KeyChecker:     &mockKeyChecker{canDecrypt: true},
+		Sink:           sink,
+		Cursor:         cs,
+		Worker:         testMyWorker,
+		JobCounter:     &counter,
+		MaxConcurrent:  4,
+		ChunkSize:      5000,
+		LookbackBlocks: 60,
+		Logger:         testLogger(t),
+		syncServe:      true,
+	})
+
+	require.NoError(t, jw.RunOnce(context.Background()))
+	require.Equal(t, [][2]uint64{{1, 5000}, {5001, 10_000}}, mc.filterRanges)
+	require.Len(t, sink.received(), 2)
 }
