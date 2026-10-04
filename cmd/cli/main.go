@@ -387,8 +387,7 @@ func runTopUpStake() {
 		Out:           os.Stdout,
 	}
 
-	// Covers the question as well as the transaction.
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+	ctx, cancel := context.WithTimeout(context.Background(), txTimeout)
 	defer cancel()
 
 	if err := h.TopUpStake(ctx, amount); err != nil {

@@ -21,6 +21,7 @@ type reinstateChain struct {
 	reinstateErr   error      // when set, the reinstate transaction fails
 	topUps         []*big.Int // the value of each top-up transaction sent
 	topUpErr       error      // when set, the top-up transaction fails
+	sendCtxErr     error      // the context's error when the top-up was sent
 }
 
 func (c *reinstateChain) Reinstate(context.Context) error {
@@ -28,8 +29,9 @@ func (c *reinstateChain) Reinstate(context.Context) error {
 	return c.reinstateErr
 }
 
-func (c *reinstateChain) TopUpStake(_ context.Context, amount *big.Int) error {
+func (c *reinstateChain) TopUpStake(ctx context.Context, amount *big.Int) error {
 	c.topUps = append(c.topUps, amount)
+	c.sendCtxErr = ctx.Err()
 	return c.topUpErr
 }
 
