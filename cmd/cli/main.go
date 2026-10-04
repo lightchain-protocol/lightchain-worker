@@ -573,7 +573,7 @@ func newDrainHandler(
 		return nil
 	}
 
-	opts, err := cli.RedisOptions(cfg.RedisURL, cfg.RedisPassword)
+	opts, err := config.RedisOptions(cfg.RedisURL, cfg.RedisPassword)
 	if err != nil {
 		logger.Error("parse REDIS_URL failed", "error", err)
 		quitProcess(1)

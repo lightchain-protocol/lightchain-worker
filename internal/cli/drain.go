@@ -57,19 +57,6 @@ type DrainHandler struct {
 	Logger *slog.Logger
 }
 
-// RedisOptions parses REDIS_URL for the direct-mode Redis client.
-// REDIS_PASSWORD, when set, replaces any password embedded in the URL.
-func RedisOptions(redisURL, password string) (*redis.Options, error) {
-	opts, err := redis.ParseURL(redisURL)
-	if err != nil {
-		return nil, err
-	}
-	if password != "" {
-		opts.Password = password
-	}
-	return opts, nil
-}
-
 // DrainTTLFallback is the TTL applied when the dispute window cannot be
 // read from chain at drain time. 24h matches the live testnet dispute
 // window.
