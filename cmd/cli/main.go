@@ -131,7 +131,7 @@ Commands:
 
 balance/withdraw/release additionally require JOB_REGISTRY_ADDRESS.
 release additionally reads RELEASE_STATE_PATH (and other RELEASE_* vars).
-drain/undrain require REDIS_URL (direct mode) or WORKER_GATEWAY_URL
+drain/undrain require REDIS_URL (direct mode, with REDIS_PASSWORD if set) or WORKER_GATEWAY_URL
 (gateway mode). In direct mode, LIGHTCHAIN_DRAIN_TTL optionally
 overrides the chain-derived default TTL (disputeWindow + slack).
 LIGHTCHAIN_DRAIN_SLACK overrides the slack added to the dispute
