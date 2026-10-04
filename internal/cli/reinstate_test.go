@@ -28,14 +28,9 @@ func (c *reinstateChain) Reinstate(context.Context) error {
 	return c.reinstateErr
 }
 
-// TopUpStake adds the value to the stake, as the contract does.
 func (c *reinstateChain) TopUpStake(_ context.Context, amount *big.Int) error {
 	c.topUps = append(c.topUps, amount)
-	if c.topUpErr != nil {
-		return c.topUpErr
-	}
-	c.stake = new(big.Int).Add(c.stake, amount)
-	return nil
+	return c.topUpErr
 }
 
 // suspendedWorker is a registered, suspended worker whose stake is at the

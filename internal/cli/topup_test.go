@@ -24,6 +24,8 @@ func TestParseLCAI(t *testing.T) {
 		"60.25":                wei("60250000000000000000"),
 		"0.000000000000000001": wei("1"),
 		"010":                  wei("10000000000000000000"),
+		".5":                   wei("500000000000000000"),
+		"5.":                   wei("5000000000000000000"),
 	}
 	for in, want := range valid {
 		got, err := ParseLCAI(in)
@@ -62,6 +64,20 @@ func TestTopUpStake_SendsTheAmountAndPrintsTheNewStake(t *testing.T) {
 	assert.Contains(t, out, "now 5000 LCAI")
 	assert.Contains(t, out, "minimum 5000 LCAI")
 	assert.NotContains(t, out, "reinstate", "a worker that is not suspended has nothing to reinstate")
+	assert.NotContains(t, out, "gas", "250 LCAI is left, well over the gas buffer")
+}
+
+func TestTopUpStake_NotesABalanceLeftUnderTheGasBuffer(t *testing.T) {
+	t.Parallel()
+	h, rc, buf := slashedWorker()
+	rc.balance = lcaiWei(760)
+
+	err := h.TopUpStake(context.Background(), lcaiWei(750))
+
+	require.NoError(t, err)
+	assert.Len(t, rc.topUps, 1)
+	assert.Contains(t, buf.String(), "topped up by 750 LCAI")
+	assert.Contains(t, buf.String(), "leaves under 50 LCAI for gas")
 }
 
 func TestTopUpStake_RefusesWithoutSending(t *testing.T) {

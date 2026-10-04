@@ -212,10 +212,10 @@ func (h *Handler) TopUpStake(ctx context.Context, amount *big.Int) error {
 	if err != nil {
 		return fmt.Errorf("read balance: %w", err)
 	}
+	need := new(big.Int).Add(amount, lcaiToWei(gasBufferLCAI))
 	if bal.Cmp(amount) <= 0 {
-		need := new(big.Int).Add(amount, lcaiToWei(gasBufferLCAI))
 		return fmt.Errorf("worker %s holds %s; topping up %s needs gas on top — send at least %s to it first; nothing was sent",
-			h.WorkerAddr.Hex(), lcai(bal), lcai(amount), lcai(need.Sub(need, bal)))
+			h.WorkerAddr.Hex(), lcai(bal), lcai(amount), lcai(new(big.Int).Sub(need, bal)))
 	}
 	stake, err := h.Reinstatement.GetWorkerStake(ctx, h.WorkerAddr)
 	if err != nil {
@@ -244,6 +244,9 @@ func (h *Handler) TopUpStake(ctx context.Context, amount *big.Int) error {
 	if suspended {
 		fmt.Fprintln(h.Out, "The worker is still suspended: a top-up does not lift a suspension — "+
 			"run `lightchain-worker reinstate` once the stake meets the minimum and the cooldown is over")
+	}
+	if bal.Cmp(need) < 0 {
+		fmt.Fprintf(h.Out, "Note: that leaves under %d LCAI for gas — send the worker more before it runs out\n", gasBufferLCAI)
 	}
 	return nil
 }
