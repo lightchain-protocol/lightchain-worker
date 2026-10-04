@@ -219,12 +219,13 @@ func (h *PreflightHandler) checkSuspension(ctx context.Context, r *report) {
 		return
 	}
 	until, err := h.Chain.GetSuspendedUntil(ctx, h.WorkerAddr)
-	var head chain.HeadInfo
-	if err == nil {
-		head, err = h.Chain.Head(ctx)
-	}
 	if err != nil {
-		r.failf("suspended", "yes — %s offense(s); the cooldown end could not be read (%v); once it is over run `lightchain-worker reinstate`", offenses, err)
+		r.failf("suspended", "yes — %s offense(s); the cooldown end could not be read: %v", offenses, err)
+		return
+	}
+	head, err := h.Chain.Head(ctx)
+	if err != nil {
+		r.failf("suspended", "yes — %s offense(s); the latest block could not be read: %v", offenses, err)
 		return
 	}
 	if end, left := cooldown(until, head); left > 0 {
