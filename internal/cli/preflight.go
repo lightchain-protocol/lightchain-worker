@@ -25,6 +25,7 @@ type PreflightChain interface {
 	Balance(ctx context.Context, addr common.Address) (*big.Int, error)
 	IsWorkerRegistered(ctx context.Context, worker common.Address) (bool, error)
 	IsWorkerSuspended(ctx context.Context, worker common.Address) (bool, error)
+	GetSuspendedUntil(ctx context.Context, worker common.Address) (*big.Int, error)
 	GetOffenseCount(ctx context.Context, worker common.Address) (*big.Int, error)
 	GetWorkerStake(ctx context.Context, worker common.Address) (*big.Int, error)
 	GetMinWorkerStake(ctx context.Context) (*big.Int, error)
@@ -213,10 +214,24 @@ func (h *PreflightHandler) checkSuspension(ctx context.Context, r *report) {
 	if n, err := h.Chain.GetOffenseCount(ctx, h.WorkerAddr); err == nil {
 		offenses = n.String()
 	}
-	if suspended {
-		r.failf("suspended", "yes — %s offense(s); wait out the cooldown (getSuspendedUntil), then run `lightchain-worker reinstate`", offenses)
-	} else {
+	if !suspended {
 		r.pass("suspended", "no (%s offense(s) on record)", offenses)
+		return
+	}
+	until, err := h.Chain.GetSuspendedUntil(ctx, h.WorkerAddr)
+	if err != nil {
+		r.failf("suspended", "yes — %s offense(s); the cooldown end could not be read: %v", offenses, err)
+		return
+	}
+	head, err := h.Chain.Head(ctx)
+	if err != nil {
+		r.failf("suspended", "yes — %s offense(s); the latest block could not be read: %v", offenses, err)
+		return
+	}
+	if end, left := cooldown(until, head); left > 0 {
+		r.failf("suspended", "yes — %s offense(s); the cooldown ends %s (%s left), then run `lightchain-worker reinstate`", offenses, end, left)
+	} else {
+		r.failf("suspended", "yes — %s offense(s); the cooldown ended %s — run `lightchain-worker reinstate`", offenses, end)
 	}
 }
 
@@ -448,6 +463,14 @@ func networkName(chainID int64) string {
 		return n
 	}
 	return "unknown network"
+}
+
+// cooldown renders when a suspension cooldown ends and how much of it is left
+// as of the head block, whose timestamp is what the contract compares. The
+// chain accepts reinstate once left is no longer positive.
+func cooldown(until *big.Int, head chain.HeadInfo) (end string, left time.Duration) {
+	end = time.Unix(until.Int64(), 0).UTC().Format(time.RFC3339)
+	return end, time.Duration(until.Int64()-head.Timestamp) * time.Second
 }
 
 func lcaiToWei(n int64) *big.Int {

@@ -28,6 +28,7 @@ type fakeChain struct {
 	balance     *big.Int
 	registered  bool
 	suspended   bool
+	until       int64 // suspendedUntil, unix seconds
 	offenses    int64
 	stake       *big.Int
 	minStake    *big.Int
@@ -37,6 +38,7 @@ type fakeChain struct {
 	supported   map[[32]byte]bool
 	err         error // when set, every call fails with it
 	minStakeErr error // when set, only GetMinWorkerStake fails
+	untilErr    error // when set, only GetSuspendedUntil fails
 }
 
 func lcaiWei(n int64) *big.Int {
@@ -72,6 +74,13 @@ func (f *fakeChain) IsWorkerRegistered(context.Context, common.Address) (bool, e
 
 func (f *fakeChain) IsWorkerSuspended(context.Context, common.Address) (bool, error) {
 	return f.suspended, f.err
+}
+
+func (f *fakeChain) GetSuspendedUntil(context.Context, common.Address) (*big.Int, error) {
+	if f.untilErr != nil {
+		return nil, f.untilErr
+	}
+	return big.NewInt(f.until), f.err
 }
 
 func (f *fakeChain) GetOffenseCount(context.Context, common.Address) (*big.Int, error) {
@@ -249,9 +258,10 @@ func TestPreflight_MinimumDiffersFromPublished_Warns(t *testing.T) {
 
 func TestPreflight_Suspended(t *testing.T) {
 	t.Parallel()
-	fc := greenChain(time.Now(), nil)
+	fc := greenChain(time.Unix(1_800_000_002, 0), nil) // head at 2027-01-15T08:00:00Z
 	fc.suspended = true
 	fc.offenses = 3
+	fc.until = 1_800_009_000
 	h, buf := newPreflight(t, fc, nil, nil)
 
 	ok := h.Run(context.Background())
@@ -259,7 +269,38 @@ func TestPreflight_Suspended(t *testing.T) {
 	require.False(t, ok)
 	assert.Contains(t, buf.String(), "[FAIL] suspended")
 	assert.Contains(t, buf.String(), "3 offense")
+	assert.Contains(t, buf.String(), "cooldown ends 2027-01-15T10:30:00Z (2h30m0s left)")
 	assert.Contains(t, buf.String(), "`lightchain-worker reinstate`", "the failing line names its fix")
+}
+
+func TestPreflight_SuspendedPastTheCooldown(t *testing.T) {
+	t.Parallel()
+	fc := greenChain(time.Unix(1_800_000_002, 0), nil) // head at 2027-01-15T08:00:00Z
+	fc.suspended = true
+	fc.until = 1_799_996_400
+	h, buf := newPreflight(t, fc, nil, nil)
+
+	ok := h.Run(context.Background())
+
+	require.False(t, ok)
+	assert.Contains(t, buf.String(), "[FAIL] suspended")
+	assert.Contains(t, buf.String(), "cooldown ended 2027-01-15T07:00:00Z")
+	assert.NotContains(t, buf.String(), "left")
+	assert.Contains(t, buf.String(), "`lightchain-worker reinstate`", "the failing line names its fix")
+}
+
+func TestPreflight_SuspendedCooldownEndUnreadable(t *testing.T) {
+	t.Parallel()
+	fc := greenChain(time.Now(), nil)
+	fc.suspended = true
+	fc.offenses = 3
+	fc.untilErr = errors.New("GetSuspendedUntil: timeout")
+	h, buf := newPreflight(t, fc, nil, nil)
+
+	ok := h.Run(context.Background())
+
+	require.False(t, ok)
+	assert.Contains(t, buf.String(), "[FAIL] suspended  yes — 3 offense(s); the cooldown end could not be read: GetSuspendedUntil: timeout\n")
 }
 
 func TestPreflight_ModelNotWhitelisted(t *testing.T) {

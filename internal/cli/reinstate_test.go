@@ -36,10 +36,12 @@ func (c *reinstateChain) TopUpStake(ctx context.Context, amount *big.Int) error 
 }
 
 // suspendedWorker is a registered, suspended worker whose stake is at the
-// minimum: nothing stands between it and reinstating.
+// minimum and whose cooldown ended with the latest block: nothing stands
+// between it and reinstating.
 func suspendedWorker() (*Handler, *reinstateChain, *bytes.Buffer) {
 	fc := greenChain(time.Now(), nil)
 	fc.suspended = true
+	fc.until = fc.head.Timestamp
 	rc := &reinstateChain{fakeChain: fc}
 	var buf bytes.Buffer
 	return &Handler{Reinstatement: rc, WorkerAddr: testAddr, Out: &buf}, rc, &buf
@@ -83,6 +85,19 @@ func TestReinstate_RefusesWithoutSending(t *testing.T) {
 			name:  "minimum stake unreadable",
 			setup: func(c *reinstateChain) { c.minStakeErr = errors.New("GetMinWorkerStake: timeout") },
 			want:  []string{"minimum stake", "timeout"},
+		},
+		{
+			name:  "cooldown end unreadable",
+			setup: func(c *reinstateChain) { c.untilErr = errors.New("GetSuspendedUntil: timeout") },
+			want:  []string{"cooldown end", "timeout"},
+		},
+		{
+			name: "cooldown still running",
+			setup: func(c *reinstateChain) {
+				c.head.Timestamp = 1_800_000_000 // 2027-01-15T08:00:00Z
+				c.until = 1_800_009_000
+			},
+			want: []string{"cooldown", "until 2027-01-15T10:30:00Z", "2h30m0s left", "nothing was sent"},
 		},
 		{
 			name:  "rpc unreachable",
