@@ -30,7 +30,10 @@
 #
 # Optional in watch.env: WATCH_INTERVAL (30s), WATCH_COOLDOWN (1h, minimum gap
 # between repeat alerts for a check that stays failing), WATCH_MISSED_CLAIMS (3:
-# sessions in a row lost to other workers while eligible; 0 disables).
+# sessions in a row lost to other workers while eligible; 0 disables),
+# WATCH_WORKER_ADDRESS (the worker's address, for a keystore without an address
+# field: watch then exits with "keystore … has no address field". Default: that
+# field of the keystore at WORKER_KEYSTORE_PATH, read without the password).
 #
 # Docker workers (external-worker guide): run the same image beside the worker,
 # in its network namespace so 127.0.0.1:9101/healthz is the worker's:
