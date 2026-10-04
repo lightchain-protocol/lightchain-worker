@@ -2,8 +2,12 @@ package cli
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"math/big"
+	"os"
+	"path/filepath"
+	"syscall"
 
 	"github.com/ethereum/go-ethereum/common"
 
@@ -144,9 +148,9 @@ func (h *Handler) Release(ctx context.Context, reconcileOnly bool) error {
 	return nil
 }
 
-// ReconcileSeed is what Register needs to start a new worker's release
-// reconciler at the safe head it registered at instead of at the chain's
-// first block.
+// ReconcileSeed is what Register needs to have a fresh worker's release
+// reconciler resume after the safe head read at its registration instead of
+// scanning the chain from its first block.
 type ReconcileSeed struct {
 	Chain ReconcileSeedChain
 	// ChainID and JobRegistry, with the worker address, are the identity of
@@ -165,14 +169,14 @@ type ReconcileSeedChain interface {
 	NonceAt(ctx context.Context, addr common.Address, block uint64) (uint64, error)
 }
 
-// newWorkerSafeHead returns the reconciler's safe head when the worker is new
-// to the chain: not registered, and its key had sent no transaction by that
-// block. Otherwise it returns 0. It is read before the registration is sent.
-// Such a worker has no completed job at or before that block: registerWorker
-// and completeJob both act for their sender only, so every JobCompleted event
-// of a worker follows a transaction from its key. A key that was used before
-// gets 0, and its reconciler scans from the start.
-func (h *Handler) newWorkerSafeHead(ctx context.Context) (uint64, error) {
+// freshWorkerSafeHead returns the reconciler's safe head when the worker is
+// new to the chain: not registered, and its key had sent no transaction by
+// that block. Otherwise it returns 0. It is read before the registration is
+// sent. Such a worker has no completed job at or before that block:
+// registerWorker and completeJob both act for their sender only, so every
+// JobCompleted event of a worker follows a transaction from its key. A key
+// that was used before gets 0, and its reconciler scans from the start.
+func (h *Handler) freshWorkerSafeHead(ctx context.Context) (uint64, error) {
 	s := h.ReconcileSeed
 	if s == nil {
 		return 0, nil
@@ -193,22 +197,37 @@ func (h *Handler) newWorkerSafeHead(ctx context.Context) (uint64, error) {
 	return safeHead, nil
 }
 
-// seedReconcileBlock stores block (from newWorkerSafeHead, 0 for none) as the
-// release reconcile cursor once the registration has gone through. It never
-// fails the registration: when the state cannot be written the worker is left
-// as it was, scanning from the start.
+// seedReconcileBlock stores block (from freshWorkerSafeHead, 0 for none) as
+// the release reconcile cursor once the registration has gone through. It
+// never fails the registration: when the state cannot be written the worker
+// is left as it was, scanning from the start.
 func (h *Handler) seedReconcileBlock(ctx context.Context, block uint64, err error) {
 	if err == nil && block != 0 {
 		err = h.storeReconcileBlock(ctx, block)
 	}
 	if err != nil {
 		fmt.Fprintf(h.Out, "note: the release state was not prepared (%v) — registration is not affected; "+
-			"the worker's first start looks for its completed jobs from the chain's first block, as before\n", err)
+			"the worker's first start scans the chain for its completed jobs from RELEASE_RECONCILE_START_BLOCK, "+
+			"or from the first block, as before\n", err)
 	}
 }
 
 func (h *Handler) storeReconcileBlock(ctx context.Context, block uint64) error {
 	s := h.ReconcileSeed
+	if s.JobRegistry == (common.Address{}) {
+		return errors.New("JOB_REGISTRY_ADDRESS is not set")
+	}
+	// Whatever this creates, the sidecar must be able to open: write only
+	// into a directory that is already there and belongs to the user running
+	// the command.
+	dir := filepath.Dir(s.StatePath)
+	info, err := os.Stat(dir)
+	if err != nil {
+		return err
+	}
+	if st, ok := info.Sys().(*syscall.Stat_t); !ok || int(st.Uid) != os.Geteuid() {
+		return fmt.Errorf("%s belongs to another user", dir)
+	}
 	store, err := release.NewFileStore(s.StatePath, release.StoreIdentity{
 		ChainID:       s.ChainID,
 		JobRegistry:   s.JobRegistry,
@@ -218,13 +237,9 @@ func (h *Handler) storeReconcileBlock(ctx context.Context, block uint64) error {
 		return err
 	}
 	defer func() { _ = store.Close() }()
-	// A stored cursor is the reconciler's own progress and is never replaced.
-	if stored, err := store.GetReconcileBlock(ctx); err != nil || stored != 0 {
-		return err
+	seeded, err := store.SeedReconcileBlock(ctx, block)
+	if seeded {
+		h.Logger.Info("release reconciler starts after this block: the worker key had sent no transaction by it", "block", block)
 	}
-	if err := store.SetReconcileBlock(ctx, block); err != nil {
-		return err
-	}
-	h.Logger.Info("release reconciler starts after this block: the worker key had sent no transaction by it", "block", block)
-	return nil
+	return err
 }

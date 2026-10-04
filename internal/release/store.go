@@ -548,6 +548,27 @@ func (s *FileStore) SetReconcileBlock(_ context.Context, block uint64) error {
 	})
 }
 
+// SeedReconcileBlock stores block as the cursor only when none is stored (a
+// cursor of 0), under one lock, and reports whether it did. `init` and
+// `register` use it for a worker with no completed job behind it; a stored
+// cursor is the reconciler's own progress and is never replaced.
+func (s *FileStore) SeedReconcileBlock(_ context.Context, block uint64) (bool, error) {
+	seeded := false
+	err := s.withExclusiveLock(func() error {
+		snap, err := s.loadVerifiedLocked()
+		if err != nil || snap.LastReconciledBlock != 0 {
+			return err
+		}
+		snap.LastReconciledBlock = block
+		if err := s.writeSnapshotLocked(snap); err != nil {
+			return err
+		}
+		seeded = true
+		return nil
+	})
+	return seeded, err
+}
+
 // GetLastReleaseTs returns the cycle-attempt timestamp. Missing/empty
 // state propagates as an error rather than returning 0, which would
 // otherwise cause the time-trigger to fire immediately.
