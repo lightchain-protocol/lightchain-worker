@@ -1180,6 +1180,15 @@ func (c *ChainClient) Balance(ctx context.Context, addr common.Address) (*big.In
 	return bal, nil
 }
 
+// NonceAt returns how many transactions addr had sent as of the given block.
+func (c *ChainClient) NonceAt(ctx context.Context, addr common.Address, block uint64) (uint64, error) {
+	nonce, err := c.ethClient.NonceAt(ctx, addr, new(big.Int).SetUint64(block))
+	if err != nil {
+		return 0, fmt.Errorf("NonceAt %s at block %d: %w", addr.Hex(), block, err)
+	}
+	return nonce, nil
+}
+
 // IsWorkerSuspended reports whether the worker is currently serving a suspension cooldown.
 func (c *ChainClient) IsWorkerSuspended(ctx context.Context, worker common.Address) (bool, error) {
 	v, err := c.registry.IsWorkerSuspended(&bind.CallOpts{Context: ctx}, worker)
