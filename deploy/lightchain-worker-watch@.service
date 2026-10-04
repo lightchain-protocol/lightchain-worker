@@ -5,7 +5,11 @@
 # claims go bad, and once more on recovery. It never restarts, drains or
 # sends a transaction.
 #
-# Install, as root, for worker <name>:
+# It runs `/usr/local/bin/lightchain-worker watch`: the one worker binary, put
+# there by the installer (docs/install.md, step 1), from a release that has the
+# `watch` command (`lightchain-worker help` lists it).
+#
+# Install, as root, for worker <name> (`worker` on a host set up by docs/install.md):
 #   install -m 644 lightchain-worker-watch@.service /etc/systemd/system/
 #   ( umask 077; echo 'WATCH_WEBHOOK_URL=https://discord.com/api/webhooks/<id>/<token>' \
 #       > /etc/lightchain/<name>/watch.env )
@@ -46,7 +50,7 @@ User=root
 # watch.env first: like Environment= in the worker unit, the env file overrides it.
 EnvironmentFile=/etc/lightchain/%i/watch.env
 EnvironmentFile=/etc/lightchain/%i/env
-ExecStart=/usr/local/bin/lightchain-worker-cli watch
+ExecStart=/usr/local/bin/lightchain-worker watch
 Restart=always
 RestartSec=10
 # watch only reads; the sandbox makes the filesystem read-only for it too.
