@@ -5,7 +5,15 @@
 # claims go bad, and once more on recovery. It never restarts, drains or
 # sends a transaction.
 #
-# Install, as root, for worker <name>:
+# It runs `/usr/local/bin/lightchain-worker watch`: the one worker binary, put
+# there by the installer (docs/install.md, step 1), from a release that has the
+# `watch` command. A worker-only binary (cmd/sidecar: /bin/worker in the Docker
+# image) ignores its arguments, so at that path it would run as a second
+# worker; ExecCondition below refuses to start the unit on such a binary. On a
+# host whose binary lives elsewhere, override ExecCondition and ExecStart
+# together in a drop-in.
+#
+# Install, as root, for worker <name> (`worker` on a host set up by docs/install.md):
 #   install -m 644 lightchain-worker-watch@.service /etc/systemd/system/
 #   ( umask 077; echo 'WATCH_WEBHOOK_URL=https://discord.com/api/webhooks/<id>/<token>' \
 #       > /etc/lightchain/<name>/watch.env )
@@ -26,7 +34,10 @@
 #
 # Optional in watch.env: WATCH_INTERVAL (30s), WATCH_COOLDOWN (1h, minimum gap
 # between repeat alerts for a check that stays failing), WATCH_MISSED_CLAIMS (3:
-# sessions in a row lost to other workers while eligible; 0 disables).
+# sessions in a row lost to other workers while eligible; 0 disables),
+# WATCH_WORKER_ADDRESS (the worker's address. Default: the address field of the
+# keystore at WORKER_KEYSTORE_PATH, read without the password; set the variable
+# when watch exits with "keystore … has no address field").
 #
 # Docker workers (external-worker guide): run the same image beside the worker,
 # in its network namespace so 127.0.0.1:9101/healthz is the worker's:
@@ -46,7 +57,11 @@ User=root
 # watch.env first: like Environment= in the worker unit, the env file overrides it.
 EnvironmentFile=/etc/lightchain/%i/watch.env
 EnvironmentFile=/etc/lightchain/%i/env
-ExecStart=/usr/local/bin/lightchain-worker-cli watch
+# Start only if the binary lists the `watch` command. env -i: with an empty
+# environment a worker-only binary exits on its missing config, so the check
+# itself can never start a worker.
+ExecCondition=/bin/sh -c 'env -i /usr/local/bin/lightchain-worker help 2>&1 | grep -q "^  watch "'
+ExecStart=/usr/local/bin/lightchain-worker watch
 Restart=always
 RestartSec=10
 # watch only reads; the sandbox makes the filesystem read-only for it too.

@@ -14,6 +14,7 @@ func clearWatchEnv(t *testing.T) {
 	for _, k := range []string{
 		"WATCH_WEBHOOK_URL", "WATCH_INTERVAL", "WATCH_COOLDOWN", "WATCH_MISSED_CLAIMS",
 		"WORKER_METRICS_ADDR", "HEARTBEAT_INTERVAL", "REDIS_URL", "REDIS_PASSWORD", "SESSION_MANAGER_ADDRESS",
+		"WATCH_WORKER_ADDRESS",
 	} {
 		t.Setenv(k, "")
 	}
@@ -35,6 +36,18 @@ func TestLoadWatch_DefaultsMatchTheSidecar(t *testing.T) {
 	assert.Equal(t, 10*time.Second, cfg.HeartbeatInterval)
 	assert.Equal(t, "redis://localhost:6379", cfg.RedisURL)
 	assert.Equal(t, common.HexToAddress("0xcccccccccccccccccccccccccccccccccccccccc"), cfg.SessionManagerAddress)
+	assert.Zero(t, cfg.WorkerAddress, "unset: the address comes from the flag or the keystore")
+}
+
+func TestLoadWatch_WorkerAddress(t *testing.T) {
+	clearWatchEnv(t)
+	t.Setenv("WATCH_WEBHOOK_URL", "https://hooks.example/x")
+	t.Setenv("WATCH_WORKER_ADDRESS", "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")
+
+	cfg, err := LoadWatch()
+
+	require.NoError(t, err)
+	assert.Equal(t, common.HexToAddress("0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"), cfg.WorkerAddress)
 }
 
 func TestLoadWatch_Errors(t *testing.T) {
@@ -49,6 +62,8 @@ func TestLoadWatch_Errors(t *testing.T) {
 		"bad session mgr":    {map[string]string{"SESSION_MANAGER_ADDRESS": "0x12"}, "SESSION_MANAGER_ADDRESS"},
 		"missed negative":    {map[string]string{"WATCH_MISSED_CLAIMS": "-1"}, "WATCH_MISSED_CLAIMS: must be >= 0"},
 		"heartbeat negative": {map[string]string{"HEARTBEAT_INTERVAL": "-1s"}, "HEARTBEAT_INTERVAL: must be positive"},
+		"worker not hex":     {map[string]string{"WATCH_WORKER_ADDRESS": "notanaddress"}, `WATCH_WORKER_ADDRESS: must be a non-zero hex address, got "notanaddress"`},
+		"worker zero":        {map[string]string{"WATCH_WORKER_ADDRESS": "0x0000000000000000000000000000000000000000"}, "WATCH_WORKER_ADDRESS: must be a non-zero hex address"},
 	}
 	for name, tc := range cases {
 		t.Run(name, func(t *testing.T) {

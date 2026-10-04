@@ -192,8 +192,9 @@ is minted server-side). OLLAMA_URL and BEACON_API_URL default to the
 sidecar's localhost values.
 
 watch flags:
-  --worker <address>    Watch this address (default: the address field of
-                        WORKER_KEYSTORE_PATH, read without the password).
+  --worker <address>    Watch this address (default: WATCH_WORKER_ADDRESS, then
+                        the address field of WORKER_KEYSTORE_PATH, read
+                        without the password).
 watch reads the worker's env file plus WATCH_WEBHOOK_URL (required),
 WATCH_INTERVAL (30s), WATCH_COOLDOWN (1h: minimum gap between repeat
 alerts for a check that stays failing) and WATCH_MISSED_CLAIMS (3: sessions

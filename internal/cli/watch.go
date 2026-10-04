@@ -413,6 +413,23 @@ func (h *WatchHandler) now() time.Time {
 	return time.Now()
 }
 
+// WatchWorkerAddress picks the worker `watch` reports on: the --worker flag,
+// then WATCH_WORKER_ADDRESS (zero = unset), then the keystore's address field.
+func WatchWorkerAddress(flag string, envAddr common.Address, keystorePath string) (common.Address, error) {
+	switch {
+	case flag != "":
+		if !common.IsHexAddress(flag) {
+			return common.Address{}, fmt.Errorf("--worker must be a hex address, got %q", flag)
+		}
+		return common.HexToAddress(flag), nil
+	case envAddr != (common.Address{}):
+		return envAddr, nil
+	case keystorePath != "":
+		return KeystoreAddress(keystorePath)
+	}
+	return common.Address{}, errors.New("watch needs --worker, WATCH_WORKER_ADDRESS or WORKER_KEYSTORE_PATH")
+}
+
 // KeystoreAddress reads the address field of a v3 keystore file without
 // decrypting it, so `watch` never needs the keystore password.
 func KeystoreAddress(path string) (common.Address, error) {
@@ -427,7 +444,7 @@ func KeystoreAddress(path string) (common.Address, error) {
 		return common.Address{}, fmt.Errorf("parse keystore %s: %w", path, err)
 	}
 	if !common.IsHexAddress(ks.Address) {
-		return common.Address{}, fmt.Errorf("keystore %s has no address field — pass --worker", path)
+		return common.Address{}, fmt.Errorf("keystore %s has no address field — set WATCH_WORKER_ADDRESS or pass --worker", path)
 	}
 	return common.HexToAddress(ks.Address), nil
 }
