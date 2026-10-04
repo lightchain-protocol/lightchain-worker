@@ -32,20 +32,27 @@ func (c *CursorStore) path(name string) string {
 
 // Get returns the last processed block for `name`, or 0 if unset.
 func (c *CursorStore) Get(name string) (uint64, error) {
+	v, _, err := c.Lookup(name)
+	return v, err
+}
+
+// Lookup is Get that also reports whether a cursor is stored for `name` at all,
+// which tells a fresh worker (nothing stored) apart from a stored cursor of 0.
+func (c *CursorStore) Lookup(name string) (block uint64, stored bool, err error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	b, err := os.ReadFile(c.path(name))
 	if os.IsNotExist(err) {
-		return 0, nil
+		return 0, false, nil
 	}
 	if err != nil {
-		return 0, fmt.Errorf("read cursor %s: %w", name, err)
+		return 0, false, fmt.Errorf("read cursor %s: %w", name, err)
 	}
 	v, err := strconv.ParseUint(strings.TrimSpace(string(b)), 10, 64)
 	if err != nil {
-		return 0, fmt.Errorf("parse cursor %s: %w", name, err)
+		return 0, false, fmt.Errorf("parse cursor %s: %w", name, err)
 	}
-	return v, nil
+	return v, true, nil
 }
 
 // Set atomically writes the last processed block for `name`.

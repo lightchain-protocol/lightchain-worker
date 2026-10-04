@@ -52,7 +52,8 @@ type SessionWatcherOpts struct {
 	// cursor — including ones still waiting out the sortition threshold. Size it
 	// to how long requests stay Open: the consumer-api's default expiry is 1 h,
 	// but callers may request longer, so raise it where they do. Zero disables
-	// the look-back.
+	// the look-back. A worker with no cursor yet starts at the safe head, so
+	// this is also how far back a fresh worker looks.
 	LookbackBlocks uint64
 }
 
@@ -132,7 +133,9 @@ func (w *SessionWatcher) Start(ctx context.Context) {
 	}
 }
 
-// RunOnce performs one poll pass in three phases.
+// RunOnce performs one poll pass in three phases. A worker with no persisted
+// cursor first takes the safe head as its cursor, so it never scans the chain
+// from block 0; phase 0 then covers the requests still Open behind the head.
 //
 // Phase 0 — Reseed (first pass only): re-scan LookbackBlocks behind the
 // persisted cursor and add whatever SessionRequested events are there to the
@@ -169,9 +172,19 @@ func (w *SessionWatcher) RunOnce(ctx context.Context) error {
 		safeHead = head.Number - w.confs
 	}
 
-	cursor, err := w.cursor.Get(cursorSessionRequested)
+	cursor, stored, err := w.cursor.Lookup(cursorSessionRequested)
 	if err != nil {
 		return err
+	}
+	// A fresh worker has no cursor. Start it at the safe head rather than block
+	// 0, so it does not scan the whole chain before its first claim; the
+	// look-back below then picks up the requests still Open behind the head.
+	if !stored {
+		cursor = safeHead
+		if err := w.cursor.Set(cursorSessionRequested, cursor); err != nil {
+			return err
+		}
+		w.log.Info("no session cursor stored; starting at the safe head", "block", cursor)
 	}
 
 	// Phase 0: Reseed — once per process, look behind the cursor. A failure

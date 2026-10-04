@@ -149,7 +149,7 @@ gateway stream connected
 worker sidecar running (sortition mode) — waiting for shutdown signal
 ```
 
-On its first start the worker reads the chain's session history to set its cursors, so claims begin once it has caught up. A claim logs `claimed session request`. From then on the worker serves its jobs on Ollama, streams tokens through the gateway, and submits the result as an on-chain blob.
+On its first start the worker looks for session requests in the most recent blocks only (the last 2000 by default), so it can claim without first reading the chain's session history. It still reads the chain's job history once to set its job cursor, and serves its first jobs once that has caught up. A claim logs `claimed session request`. From then on the worker serves its jobs on Ollama, streams tokens through the gateway, and submits the result as an on-chain blob.
 
 ## Day to day
 

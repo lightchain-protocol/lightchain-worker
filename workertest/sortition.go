@@ -202,6 +202,10 @@ func NewSortitionHarness(t testing.TB, opts SortitionOptions) *SortitionHarness 
 			PollInterval:    time.Second,
 			Logger:          opts.Logger,
 			OwnCapabilities: ownCaps,
+			// The harness starts with no cursor, so the watcher starts at the
+			// safe head; look back over the whole test chain so requests opened
+			// before the first ClaimOnce are still discovered.
+			LookbackBlocks: ^uint64(0),
 		}),
 		jobWatcher: sortition.NewJobWatcher(sortition.JobWatcherOpts{
 			Client:            chainClient,
