@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
@@ -11,8 +12,7 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// reinstateChain is the preflight's fakeChain plus the reinstate
-// transaction, which lifts the suspension the reads then report.
+// reinstateChain is the preflight's fakeChain plus the reinstate transaction.
 type reinstateChain struct {
 	*fakeChain
 	reinstateCalls int
@@ -21,11 +21,7 @@ type reinstateChain struct {
 
 func (c *reinstateChain) Reinstate(context.Context) error {
 	c.reinstateCalls++
-	if c.reinstateErr != nil {
-		return c.reinstateErr
-	}
-	c.suspended = false
-	return nil
+	return c.reinstateErr
 }
 
 // suspendedWorker is a registered, suspended worker whose stake is at the
@@ -46,7 +42,6 @@ func TestReinstate_SuspendedWorkerIsReinstated(t *testing.T) {
 
 	require.NoError(t, err)
 	assert.Equal(t, 1, rc.reinstateCalls)
-	assert.False(t, rc.suspended)
 	assert.Contains(t, buf.String(), testAddr.Hex())
 	assert.Contains(t, buf.String(), "reinstated")
 }
@@ -74,6 +69,11 @@ func TestReinstate_RefusesWithoutSending(t *testing.T) {
 			want:  []string{"4250 LCAI", "minimum 5000 LCAI", "750 LCAI"},
 		},
 		{
+			name:  "minimum stake unreadable",
+			setup: func(c *reinstateChain) { c.minStakeErr = errors.New("GetMinWorkerStake: timeout") },
+			want:  []string{"minimum stake", "timeout"},
+		},
+		{
 			name:  "rpc unreachable",
 			setup: func(c *reinstateChain) { c.err = errors.New("dial tcp: connection refused") },
 			want:  []string{"connection refused"},
@@ -99,15 +99,33 @@ func TestReinstate_RefusesWithoutSending(t *testing.T) {
 
 func TestReinstate_TxFailureIsReported(t *testing.T) {
 	t.Parallel()
-	h, rc, buf := suspendedWorker()
-	// What the RPC returns while the suspension cooldown is still running.
-	rc.reinstateErr = errors.New("execution reverted")
+	cases := []struct {
+		name         string
+		txErr        string // as the chain client words it
+		wantCooldown bool   // the error names the cooldown as the likely cause
+	}{
+		{
+			name:         "reverted, as it is while the cooldown runs",
+			txErr:        "Reinstate transaction: execution reverted",
+			wantCooldown: true,
+		},
+		{
+			name:  "not a revert",
+			txErr: "send Reinstate tx: insufficient funds for gas * price + value",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			h, rc, buf := suspendedWorker()
+			rc.reinstateErr = errors.New(tc.txErr)
 
-	err := h.Reinstate(context.Background())
+			err := h.Reinstate(context.Background())
 
-	require.Error(t, err)
-	assert.Contains(t, err.Error(), "execution reverted")
-	assert.Contains(t, err.Error(), "cooldown", "the usual cause must be named")
-	assert.True(t, rc.suspended)
-	assert.NotContains(t, buf.String(), "reinstated")
+			require.Error(t, err)
+			assert.True(t, strings.HasPrefix(err.Error(), tc.txErr), "the chain's error leads, said once: %s", err)
+			assert.Equal(t, tc.wantCooldown, strings.Contains(err.Error(), "cooldown"), err.Error())
+			assert.NotContains(t, buf.String(), "reinstated")
+		})
+	}
 }
