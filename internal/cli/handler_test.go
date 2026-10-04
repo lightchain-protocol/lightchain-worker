@@ -8,6 +8,7 @@ import (
 	"io"
 	"log/slog"
 	"math/big"
+	"path/filepath"
 	"testing"
 
 	"github.com/ethereum/go-ethereum/common"
@@ -15,6 +16,8 @@ import (
 	"github.com/stretchr/testify/require"
 
 	pkgcrypto "github.com/lightchain/pkg/crypto"
+
+	"github.com/lightchain/worker/internal/chain"
 )
 
 // mockRegClient is a hand-rolled mock for chain.RegistrationClient.
@@ -152,6 +155,87 @@ func TestRegister_Success(t *testing.T) {
 	require.NoError(t, err)
 	assert.Contains(t, buf.String(), testAddr.Hex())
 	assert.Contains(t, buf.String(), "min (auto-queried)")
+}
+
+func TestRegister_UnusedKey_SeedsReconcileBlock(t *testing.T) {
+	t.Parallel()
+
+	key := mustGenerateECDHKey(t)
+	var buf bytes.Buffer
+	seedChain := &initChain{fakeChain: &fakeChain{head: chain.HeadInfo{Number: 100}}}
+	mock := &mockRegClient{
+		isWorkerRegisteredFn: func(_ context.Context, _ common.Address) (bool, error) {
+			return false, nil
+		},
+		registerWorkerFn: func(_ context.Context, _ []byte, _ *big.Int) error {
+			seedChain.mine()
+			return nil
+		},
+		addSupportedModelFn: func(_ context.Context, _ [32]byte) error {
+			seedChain.mine()
+			return nil
+		},
+		getMinWorkerStakeFn: func(_ context.Context) (*big.Int, error) {
+			return big.NewInt(1e18), nil
+		},
+	}
+
+	h := &Handler{
+		Client:      mock,
+		WorkerAddr:  testAddr,
+		ModelIDs:    [][32]byte{model1},
+		ModelNames:  []string{"llama3-8b"},
+		LoadECDHKey: func(_, _ string) (*ecdh.PrivateKey, error) { return key, nil },
+		Out:         &buf,
+		Logger:      testLogger(),
+		ReconcileSeed: &ReconcileSeed{
+			Chain:       seedChain,
+			ChainID:     8200,
+			JobRegistry: common.HexToAddress("0xaaaa000000000000000000000000000000000001"),
+			StatePath:   filepath.Join(t.TempDir(), "release_state.json"),
+		},
+	}
+
+	require.NoError(t, h.Register(context.Background()))
+	require.Equal(t, uint64(101), seedChain.txBlocks[0], "the registration is mined in block 101")
+	assert.Equal(t, uint64(100), reconcileBlock(t, h.ReconcileSeed), "the reconciler resumes at the registration block")
+	assert.NotContains(t, buf.String(), "note:")
+}
+
+func TestRegister_AlreadyRegistered_ReconcileBlockNotSeeded(t *testing.T) {
+	t.Parallel()
+
+	key := mustGenerateECDHKey(t)
+	var buf bytes.Buffer
+	mock := &mockRegClient{
+		isWorkerRegisteredFn: func(_ context.Context, _ common.Address) (bool, error) {
+			return true, nil
+		},
+		getWorkerEncryptionKeyFn: func(_ context.Context, _ common.Address) ([]byte, error) {
+			return key.PublicKey().Bytes(), nil
+		},
+	}
+
+	h := &Handler{
+		Client:      mock,
+		WorkerAddr:  testAddr,
+		ModelIDs:    [][32]byte{model1},
+		ModelNames:  []string{"llama3-8b"},
+		LoadECDHKey: func(_, _ string) (*ecdh.PrivateKey, error) { return key, nil },
+		Out:         &buf,
+		Logger:      testLogger(),
+		ReconcileSeed: &ReconcileSeed{
+			// Registered two blocks ago: the key shows no transaction at the safe head.
+			Chain:         &initChain{fakeChain: &fakeChain{head: chain.HeadInfo{Number: 100}}, txBlocks: []uint64{98}},
+			ChainID:       8200,
+			JobRegistry:   common.HexToAddress("0xaaaa000000000000000000000000000000000001"),
+			StatePath:     filepath.Join(t.TempDir(), "release_state.json"),
+			Confirmations: 5,
+		},
+	}
+
+	require.NoError(t, h.Register(context.Background()))
+	assert.NoFileExists(t, h.ReconcileSeed.StatePath, "only the command that registers the worker seeds")
 }
 
 func TestRegister_ExplicitStake(t *testing.T) {

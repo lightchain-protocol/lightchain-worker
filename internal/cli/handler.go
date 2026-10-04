@@ -58,6 +58,10 @@ type Handler struct {
 	// the answer from In before sending, unless Yes is set.
 	Yes bool
 	In  *bufio.Reader
+	// ReconcileSeed is set by `init` and `register` so that a worker
+	// registering with a never-used key has its release reconciler resume
+	// after the safe head read at its registration. Nil skips that.
+	ReconcileSeed *ReconcileSeed
 }
 
 // ReinstateChain is what `reinstate` and `top-up-stake` drive: the reads that
@@ -101,10 +105,12 @@ func (h *Handler) Register(ctx context.Context) error {
 
 	mgr := registration.NewManager(h.Client, h.WorkerAddr, h.ModelIDs, h.Logger)
 
+	seedBlock, seedErr := h.freshWorkerSafeHead(ctx)
 	ecdhPubKeyBytes := ecdhKey.PublicKey().Bytes()
 	if err := mgr.EnsureRegistered(ctx, ecdhPubKeyBytes, h.WorkerStake); err != nil {
 		return fmt.Errorf("registration: %w", err)
 	}
+	h.seedReconcileBlock(ctx, seedBlock, seedErr)
 
 	stakeStr := "min (auto-queried)"
 	if h.WorkerStake != nil {

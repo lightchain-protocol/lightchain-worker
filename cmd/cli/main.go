@@ -146,6 +146,9 @@ Commands:
 
 balance/withdraw/release additionally require JOB_REGISTRY_ADDRESS.
 release additionally reads RELEASE_STATE_PATH (and other RELEASE_* vars).
+init/register write RELEASE_STATE_PATH too when they register a never-used key
+(needs JOB_REGISTRY_ADDRESS): the worker then looks for its completed jobs from
+its registration on instead of scanning the whole chain on its first start.
 drain/undrain require REDIS_URL (direct mode, with REDIS_PASSWORD if set) or WORKER_GATEWAY_URL
 (gateway mode). In direct mode, LIGHTCHAIN_DRAIN_TTL optionally
 overrides the chain-derived default TTL (disputeWindow + slack).
@@ -275,6 +278,7 @@ func runRegister() {
 		Out:         os.Stdout,
 		Logger:      logger,
 	}
+	h.ReconcileSeed = newReconcileSeed(cfg, chainClient, logger)
 
 	ctx, cancel := context.WithTimeout(context.Background(), txTimeout)
 	defer cancel()
@@ -572,6 +576,7 @@ func runInit() {
 	defer chainClient.Close()
 	h.Chain = chainClient
 	h.Preflight = newPreflightHandler(cfg, chainClient, signingKey, h.WorkerAddr, modelIDs, modelNames, logger)
+	h.ReconcileSeed = newReconcileSeed(cfg, chainClient, logger)
 
 	// Covers the stake prompt, the registration and model transactions, and preflight.
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
@@ -579,6 +584,26 @@ func runInit() {
 	if err := h.Run(ctx); err != nil {
 		fmt.Fprintln(os.Stderr, "init:", err)
 		quitProcess(1)
+	}
+}
+
+// newReconcileSeed wires what `init` and `register` need to have a fresh
+// worker's release reconciler resume after the safe head read at its
+// registration. It reads the same RELEASE_* variables as `release` and the
+// sidecar, so all three use one state file. Nil (they cannot be read) only
+// skips the seed: registration never depends on it.
+func newReconcileSeed(cfg *config.RegistrationConfig, chainClient *chain.ChainClient, logger *slog.Logger) *cli.ReconcileSeed {
+	releaseCfg, err := release.ConfigFromEnv()
+	if err != nil {
+		logger.Warn("release config invalid; the release state will not be prepared", "error", err)
+		return nil
+	}
+	return &cli.ReconcileSeed{
+		Chain:         chainClient,
+		ChainID:       uint64(cfg.ChainID),
+		JobRegistry:   cfg.JobRegistryAddress,
+		StatePath:     releaseCfg.StatePath,
+		Confirmations: releaseCfg.Confirmations,
 	}
 }
 
