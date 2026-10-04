@@ -151,8 +151,7 @@ func (h *Handler) Deregister(ctx context.Context) error {
 
 // Reinstate lifts the worker's suspension. It reads the chain first and sends
 // nothing unless the worker is registered, suspended and staked to the
-// on-chain minimum. The cooldown is not read: while it runs the chain rejects
-// the transaction, and the error says so.
+// on-chain minimum.
 func (h *Handler) Reinstate(ctx context.Context) error {
 	registered, err := h.Reinstatement.IsWorkerRegistered(ctx, h.WorkerAddr)
 	if err != nil {
@@ -182,8 +181,14 @@ func (h *Handler) Reinstate(ctx context.Context) error {
 	}
 
 	if err := h.Reinstatement.Reinstate(ctx); err != nil {
-		return fmt.Errorf("reinstate transaction: %w — the chain rejects it while the suspension cooldown is still running; "+
-			"if that is the cause, run `lightchain-worker reinstate` again once the cooldown is over", err)
+		// ponytail: the cooldown is not read before sending (this chain client
+		// has no reader for its end), so a revert is explained instead. Read
+		// getSuspendedUntil and refuse with the end time if this gets run early.
+		if strings.Contains(err.Error(), "reverted") {
+			return fmt.Errorf("%w — the chain rejects reinstate while the suspension cooldown is still running; "+
+				"if that is the cause, run `lightchain-worker reinstate` again once it is over", err)
+		}
+		return err
 	}
 	fmt.Fprintf(h.Out, "Worker %s reinstated, suspension lifted\n", h.WorkerAddr.Hex())
 	return nil
