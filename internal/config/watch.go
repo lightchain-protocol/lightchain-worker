@@ -19,6 +19,8 @@ type WatchConfig struct {
 	Interval     time.Duration
 	Cooldown     time.Duration
 	MissedClaims int // missed claims in a row before alerting; 0 disables
+	// WorkerAddress is WATCH_WORKER_ADDRESS; zero = read the keystore's address field.
+	WorkerAddress common.Address
 
 	MetricsAddr       string
 	HeartbeatInterval time.Duration
@@ -66,6 +68,14 @@ func LoadWatch() (*WatchConfig, error) {
 			errs = append(errs, fmt.Sprintf("SESSION_MANAGER_ADDRESS: invalid hex address %q", sm))
 		} else {
 			cfg.SessionManagerAddress = common.HexToAddress(sm)
+		}
+	}
+	if w := os.Getenv("WATCH_WORKER_ADDRESS"); w != "" {
+		// The zero address would read as unset and fall back to the keystore.
+		if !common.IsHexAddress(w) || common.HexToAddress(w) == (common.Address{}) {
+			errs = append(errs, fmt.Sprintf("WATCH_WORKER_ADDRESS: must be a non-zero hex address, got %q", w))
+		} else {
+			cfg.WorkerAddress = common.HexToAddress(w)
 		}
 	}
 
