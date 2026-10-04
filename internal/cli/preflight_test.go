@@ -259,6 +259,7 @@ func TestPreflight_Suspended(t *testing.T) {
 	require.False(t, ok)
 	assert.Contains(t, buf.String(), "[FAIL] suspended")
 	assert.Contains(t, buf.String(), "3 offense")
+	assert.Contains(t, buf.String(), "`lightchain-worker reinstate`", "the failing line names its fix")
 }
 
 func TestPreflight_ModelNotWhitelisted(t *testing.T) {

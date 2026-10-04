@@ -239,6 +239,13 @@ func (c *ChainClient) DeregisterWorker(ctx context.Context) error {
 	})
 }
 
+// Reinstate submits a reinstate transaction, lifting this worker's suspension once its cooldown is over.
+func (c *ChainClient) Reinstate(ctx context.Context) error {
+	return c.submitPreparedTx(ctx, "Reinstate", nil, func(opts *bind.TransactOpts) (*types.Transaction, error) {
+		return c.registry.Reinstate(opts)
+	})
+}
+
 // GetMinWorkerStake reads the minimum stake required to register from the AIConfig contract.
 func (c *ChainClient) GetMinWorkerStake(ctx context.Context) (*big.Int, error) {
 	stake, err := c.aiConfig.GetMinWorkerStake(&bind.CallOpts{Context: ctx})

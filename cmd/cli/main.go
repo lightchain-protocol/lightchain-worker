@@ -17,6 +17,7 @@
 //	drain       Mark worker ineligible for new sessions (selection-only)
 //	undrain     Reverse drain — restore worker eligibility
 //	deregister  Deregister worker and withdraw stake
+//	reinstate   Lift a suspension once its cooldown is over
 //	status      Check on-chain registration status
 //	preflight   Read-only go-live checks (RPC, registration, stake, models, gateway, Ollama, beacon)
 //	watch       Read-only daemon that posts webhook alerts when the worker stops being able to claim
@@ -75,6 +76,8 @@ func main() {
 		runRegister()
 	case "add-models":
 		runAddModels()
+	case "reinstate":
+		runReinstate()
 	case "deregister":
 		runDeregister()
 	case "drain":
@@ -119,6 +122,8 @@ Commands:
   drain       Mark worker ineligible for new sessions (selection-only)
   undrain     Reverse drain — restore worker eligibility
   deregister  Deregister worker and withdraw stake
+  reinstate   Lift a suspension once its cooldown is over. Sends nothing unless
+              the worker is suspended and its stake meets the on-chain minimum.
   status      Check on-chain registration status
   preflight   Read-only go-live checks: RPC, registration, stake vs on-chain
               minimum, models, gateway, Ollama, beacon. Exit 1 on any failure.
@@ -316,6 +321,28 @@ func runDeregister() {
 	if err := h.Deregister(ctx); err != nil {
 		logger.Error("deregistration failed", "error", err)
 		os.Exit(1)
+	}
+}
+
+func runReinstate() {
+	cfg, logger := loadAndValidateCfg()
+	signingKey, workerAddr := loadSigningKey(cfg, logger)
+
+	chainClient := dialChain(cfg, signingKey, logger)
+	defer chainClient.Close()
+
+	h := &cli.Handler{
+		Reinstatement: chainClient,
+		WorkerAddr:    workerAddr,
+		Out:           os.Stdout,
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), txTimeout)
+	defer cancel()
+
+	if err := h.Reinstate(ctx); err != nil {
+		fmt.Fprintln(os.Stderr, "reinstate:", err)
+		quitProcess(1)
 	}
 }
 
