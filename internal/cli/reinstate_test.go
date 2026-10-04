@@ -87,6 +87,11 @@ func TestReinstate_RefusesWithoutSending(t *testing.T) {
 			want:  []string{"minimum stake", "timeout"},
 		},
 		{
+			name:  "cooldown end unreadable",
+			setup: func(c *reinstateChain) { c.untilErr = errors.New("GetSuspendedUntil: timeout") },
+			want:  []string{"cooldown end", "timeout"},
+		},
+		{
 			name: "cooldown still running",
 			setup: func(c *reinstateChain) {
 				c.head.Timestamp = 1_800_000_000 // 2027-01-15T08:00:00Z

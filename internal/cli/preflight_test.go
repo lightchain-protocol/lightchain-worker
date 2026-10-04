@@ -38,6 +38,7 @@ type fakeChain struct {
 	supported   map[[32]byte]bool
 	err         error // when set, every call fails with it
 	minStakeErr error // when set, only GetMinWorkerStake fails
+	untilErr    error // when set, only GetSuspendedUntil fails
 }
 
 func lcaiWei(n int64) *big.Int {
@@ -76,6 +77,9 @@ func (f *fakeChain) IsWorkerSuspended(context.Context, common.Address) (bool, er
 }
 
 func (f *fakeChain) GetSuspendedUntil(context.Context, common.Address) (*big.Int, error) {
+	if f.untilErr != nil {
+		return nil, f.untilErr
+	}
 	return big.NewInt(f.until), f.err
 }
 
@@ -283,6 +287,20 @@ func TestPreflight_SuspendedPastTheCooldown(t *testing.T) {
 	assert.Contains(t, buf.String(), "cooldown ended 2027-01-15T07:00:00Z")
 	assert.NotContains(t, buf.String(), "left")
 	assert.Contains(t, buf.String(), "`lightchain-worker reinstate`", "the failing line names its fix")
+}
+
+func TestPreflight_SuspendedCooldownEndUnreadable(t *testing.T) {
+	t.Parallel()
+	fc := greenChain(time.Now(), nil)
+	fc.suspended = true
+	fc.offenses = 3
+	fc.untilErr = errors.New("GetSuspendedUntil: timeout")
+	h, buf := newPreflight(t, fc, nil, nil)
+
+	ok := h.Run(context.Background())
+
+	require.False(t, ok)
+	assert.Contains(t, buf.String(), "[FAIL] suspended  yes — 3 offense(s); the cooldown end could not be read: GetSuspendedUntil: timeout\n")
 }
 
 func TestPreflight_ModelNotWhitelisted(t *testing.T) {

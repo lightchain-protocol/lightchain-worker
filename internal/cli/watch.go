@@ -186,8 +186,7 @@ func (h *WatchHandler) chainFindings(ctx context.Context) ([]finding, error) {
 		if err != nil {
 			return nil, err
 		}
-		end := time.Unix(until.Int64(), 0).UTC().Format(time.RFC3339)
-		if until.Int64() > head.Timestamp {
+		if end, left := cooldown(until, head); left > 0 {
 			f.problem = fmt.Sprintf("worker is suspended by WorkerRegistry until %s; after that run `lightchain-worker reinstate` to claim again", end)
 		} else {
 			f.problem = fmt.Sprintf("suspension cooldown ended %s but the worker is still suspended — run `lightchain-worker reinstate` to claim again", end)
