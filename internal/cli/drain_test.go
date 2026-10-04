@@ -17,6 +17,8 @@ import (
 	"github.com/stretchr/testify/require"
 
 	pkgtypes "github.com/lightchain/pkg/types"
+
+	"github.com/lightchain/worker/internal/config"
 )
 
 var testDrainWorker = common.HexToAddress("0xAb5801a7D398351b8bE11C439e05C5B3259aeC9B")
@@ -334,7 +336,7 @@ func TestRedisOptions_authenticatesDrainAndUndrain(t *testing.T) {
 			mr := miniredis.RunT(t)
 			mr.RequireAuth("s3cret")
 
-			opts, err := RedisOptions("redis://"+tt.userinfo+mr.Addr(), tt.password)
+			opts, err := config.RedisOptions("redis://"+tt.userinfo+mr.Addr(), tt.password)
 			require.NoError(t, err)
 			rdb := redis.NewClient(opts)
 			t.Cleanup(func() { _ = rdb.Close() })

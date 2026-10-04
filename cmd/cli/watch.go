@@ -94,13 +94,10 @@ func runWatch() {
 	}
 	// Gateway profiles heartbeat through the worker-gateway, not Redis.
 	if cfg.WorkerGatewayURL == "" {
-		opts, err := redis.ParseURL(wcfg.RedisURL)
+		opts, err := config.RedisOptions(wcfg.RedisURL, wcfg.RedisPassword)
 		if err != nil {
 			logger.Error("parse REDIS_URL", "error", err)
 			quitProcess(1)
-		}
-		if wcfg.RedisPassword != "" {
-			opts.Password = wcfg.RedisPassword
 		}
 		rdb := redis.NewClient(opts)
 		defer func() { _ = rdb.Close() }()
