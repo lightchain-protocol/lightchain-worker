@@ -388,6 +388,7 @@ func TestWatch_StakeBelowMinimumAlerts(t *testing.T) {
 	got := sink.take()
 	require.Equal(t, []string{"stake failing"}, titles(got))
 	assert.Contains(t, got[0].Embeds[0].Description, "4925 LCAI below the on-chain minimum 5000 LCAI")
+	assert.Contains(t, got[0].Embeds[0].Description, "`lightchain-worker top-up-stake", "the alert names its fix")
 }
 
 func TestWatch_NotRegisteredAlertsOnceNotPerDerivedCheck(t *testing.T) {

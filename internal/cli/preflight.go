@@ -228,7 +228,7 @@ func (h *PreflightHandler) checkStake(ctx context.Context, r *report, minStake *
 	}
 	if stake.Cmp(minStake) < 0 {
 		short := new(big.Int).Sub(minStake, stake)
-		r.failf("stake", "%s below minimum %s — topUpStake with at least %s", lcai(stake), lcai(minStake), lcai(short))
+		r.failf("stake", "%s below minimum %s — run `lightchain-worker top-up-stake <amount>` with at least %s", lcai(stake), lcai(minStake), lcai(short))
 		return
 	}
 	r.pass("stake", "%s (minimum %s)", lcai(stake), lcai(minStake))
@@ -460,4 +460,19 @@ func lcai(wei *big.Int) string {
 	f.Quo(f, weiPerEther)
 	s := strings.TrimRight(strings.TrimRight(f.Text('f', 4), "0"), ".")
 	return s + " LCAI"
+}
+
+// ParseLCAI reads a positive LCAI amount in plain decimals ("750", "60.25")
+// as wei.
+func ParseLCAI(s string) (*big.Int, error) {
+	whole, frac, _ := strings.Cut(s, ".")
+	digits := whole + frac
+	if digits == "" || len(frac) > 18 || strings.Trim(digits, "0123456789") != "" {
+		return nil, fmt.Errorf("%q is not an LCAI amount — use plain decimals such as 750 or 60.25", s)
+	}
+	wei, _ := new(big.Int).SetString(digits+strings.Repeat("0", 18-len(frac)), 10)
+	if wei.Sign() == 0 {
+		return nil, errors.New("the amount must be more than 0 LCAI")
+	}
+	return wei, nil
 }

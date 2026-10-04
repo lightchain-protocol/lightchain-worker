@@ -18,6 +18,8 @@
 //	undrain     Reverse drain — restore worker eligibility
 //	deregister  Deregister worker and withdraw stake
 //	reinstate   Lift a suspension once its cooldown is over
+//	top-up-stake [--yes] <amount>
+//	            Add LCAI to the worker's stake, e.g. after a slash
 //	status      Check on-chain registration status
 //	preflight   Read-only go-live checks (RPC, registration, stake, models, gateway, Ollama, beacon)
 //	watch       Read-only daemon that posts webhook alerts when the worker stops being able to claim
@@ -78,6 +80,8 @@ func main() {
 		runAddModels()
 	case "reinstate":
 		runReinstate()
+	case "top-up-stake":
+		runTopUpStake()
 	case "deregister":
 		runDeregister()
 	case "drain":
@@ -124,6 +128,11 @@ Commands:
   deregister  Deregister worker and withdraw stake
   reinstate   Lift a suspension once its cooldown is over. Sends nothing unless
               the worker is suspended and its stake meets the on-chain minimum.
+  top-up-stake [--yes] <amount>
+              Add <amount> LCAI (e.g. 750 or 60.25) to the worker's stake, as a
+              slash can leave it under the on-chain minimum. Asks before
+              sending; --yes, ahead of the amount, skips the question. A
+              suspended worker still needs reinstate afterwards.
   status      Check on-chain registration status
   preflight   Read-only go-live checks: RPC, registration, stake vs on-chain
               minimum, models, gateway, Ollama, beacon. Exit 1 on any failure.
@@ -342,6 +351,47 @@ func runReinstate() {
 
 	if err := h.Reinstate(ctx); err != nil {
 		fmt.Fprintln(os.Stderr, "reinstate:", err)
+		quitProcess(1)
+	}
+}
+
+func runTopUpStake() {
+	fs := flag.NewFlagSet("top-up-stake", flag.ExitOnError)
+	yes := fs.Bool("yes", false, "Send without asking")
+	if err := fs.Parse(os.Args[2:]); err != nil {
+		quitProcess(1)
+	}
+	if fs.NArg() != 1 {
+		fmt.Fprintln(os.Stderr, "usage: lightchain-worker top-up-stake [--yes] <amount in LCAI>")
+		quitProcess(1)
+		return
+	}
+	amount, err := cli.ParseLCAI(fs.Arg(0))
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "top-up-stake:", err)
+		quitProcess(1)
+		return
+	}
+
+	cfg, logger := loadAndValidateCfg()
+	signingKey, workerAddr := loadSigningKey(cfg, logger)
+
+	chainClient := dialChain(cfg, signingKey, logger)
+	defer chainClient.Close()
+
+	h := &cli.Handler{
+		Reinstatement: chainClient,
+		WorkerAddr:    workerAddr,
+		Yes:           *yes,
+		In:            bufio.NewReader(os.Stdin),
+		Out:           os.Stdout,
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), txTimeout)
+	defer cancel()
+
+	if err := h.TopUpStake(ctx, amount); err != nil {
+		fmt.Fprintln(os.Stderr, "top-up-stake:", err)
 		quitProcess(1)
 	}
 }
