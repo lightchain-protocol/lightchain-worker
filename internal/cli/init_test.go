@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -495,37 +496,54 @@ func reconcileBlock(t *testing.T, s *ReconcileSeed) uint64 {
 	return block
 }
 
-func TestInit_UnusedKey_FirstReconcileStartsAtRegistrationBlock(t *testing.T) {
+// The first reconcile of a worker registered with a never-used key starts
+// right after the safe head read at its registration: at the registration
+// block itself with no confirmations, that many blocks earlier otherwise.
+func TestInit_UnusedKey_FirstReconcileStartsAtRegistration(t *testing.T) {
 	t.Parallel()
-	h, ic, buf := freshWorker(t, "y\n")
-	withReconcileSeed(t, h, ic)
-
-	require.NoError(t, h.Run(context.Background()), buf.String())
-	require.Equal(t, uint64(101), ic.txBlocks[0], "the registration is mined in block 101")
-
-	// The worker's first reconcile, as `release` and the sidecar's start run it.
-	var scanned [][2]uint64
-	cfg := release.DefaultConfig()
-	cfg.Confirmations = 0
-	first := &Handler{
-		Settlement: &mockSettlement{
-			headFn: func(context.Context) (chain.HeadInfo, error) {
-				return chain.HeadInfo{Number: 150}, nil
-			},
-			filterFn: func(_ context.Context, _ common.Address, lo, hi uint64) ([]chain.JobCompletedEvent, error) {
-				scanned = append(scanned, [2]uint64{lo, hi})
-				return nil, nil
-			},
-		},
-		WorkerAddr:    testAddr,
-		ReleaseStore:  openReleaseStore(t, h.ReconcileSeed),
-		ReleaseConfig: cfg,
-		Out:           &bytes.Buffer{},
-		Logger:        testLogger(),
+	cases := []struct {
+		name          string
+		confirmations uint64
+		wantScan      [2]uint64
+	}{
+		{name: "no confirmations: at the registration block", confirmations: 0, wantScan: [2]uint64{101, 150}},
+		{name: "five confirmations: five blocks before it", confirmations: 5, wantScan: [2]uint64{96, 145}},
 	}
-	require.NoError(t, first.Release(context.Background(), true))
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			h, ic, buf := freshWorker(t, "y\n")
+			withReconcileSeed(t, h, ic)
+			h.ReconcileSeed.Confirmations = tc.confirmations
 
-	assert.Equal(t, [][2]uint64{{101, 150}}, scanned, "the scan starts at the registration block, not at block 1")
+			require.NoError(t, h.Run(context.Background()), buf.String())
+			require.Equal(t, uint64(101), ic.txBlocks[0], "the registration is mined in block 101")
+
+			// The worker's first reconcile, as `release` and the sidecar's start run it.
+			var scanned [][2]uint64
+			cfg := release.DefaultConfig()
+			cfg.Confirmations = tc.confirmations
+			first := &Handler{
+				Settlement: &mockSettlement{
+					headFn: func(context.Context) (chain.HeadInfo, error) {
+						return chain.HeadInfo{Number: 150}, nil
+					},
+					filterFn: func(_ context.Context, _ common.Address, lo, hi uint64) ([]chain.JobCompletedEvent, error) {
+						scanned = append(scanned, [2]uint64{lo, hi})
+						return nil, nil
+					},
+				},
+				WorkerAddr:    testAddr,
+				ReleaseStore:  openReleaseStore(t, h.ReconcileSeed),
+				ReleaseConfig: cfg,
+				Out:           &bytes.Buffer{},
+				Logger:        testLogger(),
+			}
+			require.NoError(t, first.Release(context.Background(), true))
+
+			assert.Equal(t, [][2]uint64{tc.wantScan}, scanned, "one query from the registration on, not a scan from block 1")
+		})
+	}
 }
 
 func TestInit_KeyWithEarlierTransactions_ReconcileBlockNotSeeded(t *testing.T) {
@@ -538,6 +556,33 @@ func TestInit_KeyWithEarlierTransactions_ReconcileBlockNotSeeded(t *testing.T) {
 
 	assert.Equal(t, 1, ic.registerCalls)
 	assert.Zero(t, reconcileBlock(t, h.ReconcileSeed), "jobs completed before block 100 must still be found")
+}
+
+// The key's nonce is read at the safe head itself: a transaction in that
+// block rules the seed out, one in the next block does not.
+func TestInit_ReconcileBlock_NonceReadAtTheSafeHead(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name    string
+		txBlock uint64
+		want    uint64
+	}{
+		{name: "transaction in the safe head block", txBlock: 95, want: 0},
+		{name: "transaction in the block after it", txBlock: 96, want: 95},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			h, ic, buf := freshWorker(t, "y\n")
+			withReconcileSeed(t, h, ic) // head 100
+			h.ReconcileSeed.Confirmations = 5
+			ic.txBlocks = []uint64{tc.txBlock}
+
+			require.NoError(t, h.Run(context.Background()), buf.String())
+
+			assert.Equal(t, tc.want, reconcileBlock(t, h.ReconcileSeed))
+		})
+	}
 }
 
 func TestInit_StoredReconcileBlock_LeftAlone(t *testing.T) {
@@ -589,50 +634,75 @@ func TestInit_ReleaseStateNotWritable_RegistrationStillSucceeds(t *testing.T) {
 	assert.Contains(t, out, "init       done")
 }
 
-func TestInit_UnusedKey_ReconcileBlockStaysBehindConfirmations(t *testing.T) {
+// The command prepares the state only in a directory that is already there
+// and its own, so it never leaves files the sidecar's user cannot open.
+func TestInit_ReleaseStateDirectoryMissing_NotCreated(t *testing.T) {
 	t.Parallel()
-	cases := []struct {
-		name string
-		head uint64
-		want uint64
-	}{
-		{name: "seeded at the safe head", head: 100, want: 95},
-		{name: "chain shorter than the confirmations", head: 3, want: 0},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			t.Parallel()
-			h, ic, buf := freshWorker(t, "y\n")
-			withReconcileSeed(t, h, ic)
-			ic.head.Number = tc.head
-			h.ReconcileSeed.Confirmations = 5
+	h, ic, buf := freshWorker(t, "y\n")
+	withReconcileSeed(t, h, ic)
+	dir := filepath.Join(t.TempDir(), "not-created-yet")
+	h.ReconcileSeed.StatePath = filepath.Join(dir, "release_state.json")
 
-			require.NoError(t, h.Run(context.Background()), buf.String())
+	require.NoError(t, h.Run(context.Background()), buf.String())
 
-			assert.Equal(t, tc.want, reconcileBlock(t, h.ReconcileSeed))
-			assert.NotContains(t, buf.String(), "note:")
-		})
+	assert.True(t, ic.registered)
+	assert.NoDirExists(t, dir)
+	assert.Contains(t, buf.String(), "note: the release state was not prepared")
+	assert.Contains(t, buf.String(), "no such file or directory")
+}
+
+func TestInit_ReleaseStateDirectoryOfAnotherUser_NothingWritten(t *testing.T) {
+	t.Parallel()
+	const dir = "/tmp" // root's on Linux and macOS, and writable by everyone
+	info, err := os.Stat(dir)
+	if err != nil {
+		t.Skip("needs a directory owned by another user")
 	}
+	if st, ok := info.Sys().(*syscall.Stat_t); !ok || int(st.Uid) == os.Geteuid() {
+		t.Skip("needs a directory owned by another user")
+	}
+	h, ic, buf := freshWorker(t, "y\n")
+	withReconcileSeed(t, h, ic)
+	h.ReconcileSeed.StatePath = filepath.Join(dir, "lightchain-init-test-"+filepath.Base(t.TempDir())+".json")
+	t.Cleanup(func() {
+		_ = os.Remove(h.ReconcileSeed.StatePath)
+		_ = os.Remove(h.ReconcileSeed.StatePath + ".lock")
+	})
+
+	require.NoError(t, h.Run(context.Background()), buf.String())
+
+	assert.True(t, ic.registered)
+	assert.NoFileExists(t, h.ReconcileSeed.StatePath)
+	assert.NoFileExists(t, h.ReconcileSeed.StatePath+".lock")
+	assert.Contains(t, buf.String(), "note: the release state was not prepared (/tmp belongs to another user)")
 }
 
 func TestInit_ReconcileBlockNotSeeded_RegistrationUnaffected(t *testing.T) {
 	t.Parallel()
 	cases := []struct {
 		name       string
-		setup      func(*initChain)
+		setup      func(*initChain, *ReconcileSeed)
 		registered bool
 		wantNote   string
 	}{
 		{
-			name:     "registration fails",
-			setup:    func(c *initChain) { c.registerErr = errors.New("insufficient funds for gas * price + value") },
+			name: "registration fails",
+			setup: func(c *initChain, _ *ReconcileSeed) {
+				c.registerErr = errors.New("insufficient funds for gas * price + value")
+			},
 			wantNote: "",
 		},
 		{
 			name:       "the key's nonce cannot be read",
-			setup:      func(c *initChain) { c.nonceErr = errors.New("missing trie node") },
+			setup:      func(c *initChain, _ *ReconcileSeed) { c.nonceErr = errors.New("missing trie node") },
 			registered: true,
 			wantNote:   "note: the release state was not prepared (missing trie node)",
+		},
+		{
+			name:       "JOB_REGISTRY_ADDRESS is not set",
+			setup:      func(_ *initChain, s *ReconcileSeed) { s.JobRegistry = common.Address{} },
+			registered: true,
+			wantNote:   "note: the release state was not prepared (JOB_REGISTRY_ADDRESS is not set)",
 		},
 	}
 	for _, tc := range cases {
@@ -640,7 +710,7 @@ func TestInit_ReconcileBlockNotSeeded_RegistrationUnaffected(t *testing.T) {
 			t.Parallel()
 			h, ic, buf := freshWorker(t, "y\n")
 			withReconcileSeed(t, h, ic)
-			tc.setup(ic)
+			tc.setup(ic, h.ReconcileSeed)
 
 			err := h.Run(context.Background())
 

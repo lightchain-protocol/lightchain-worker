@@ -52,8 +52,8 @@ type Handler struct {
 	// Reinstatement is required only by the `reinstate` subcommand.
 	Reinstatement ReinstateChain
 	// ReconcileSeed is set by `init` and `register` so that a worker
-	// registering with a never-used key starts its release reconciler at the
-	// safe head it registered at, not at the chain's first block. Nil skips that.
+	// registering with a never-used key has its release reconciler resume
+	// after the safe head read at its registration. Nil skips that.
 	ReconcileSeed *ReconcileSeed
 }
 
@@ -93,7 +93,7 @@ func (h *Handler) Register(ctx context.Context) error {
 
 	mgr := registration.NewManager(h.Client, h.WorkerAddr, h.ModelIDs, h.Logger)
 
-	seedBlock, seedErr := h.newWorkerSafeHead(ctx)
+	seedBlock, seedErr := h.freshWorkerSafeHead(ctx)
 	ecdhPubKeyBytes := ecdhKey.PublicKey().Bytes()
 	if err := mgr.EnsureRegistered(ctx, ecdhPubKeyBytes, h.WorkerStake); err != nil {
 		return fmt.Errorf("registration: %w", err)

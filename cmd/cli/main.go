@@ -136,6 +136,9 @@ Commands:
 
 balance/withdraw/release additionally require JOB_REGISTRY_ADDRESS.
 release additionally reads RELEASE_STATE_PATH (and other RELEASE_* vars).
+init/register write RELEASE_STATE_PATH too when they register a never-used key
+(needs JOB_REGISTRY_ADDRESS): the worker then looks for its completed jobs from
+its registration on instead of scanning the whole chain on its first start.
 drain/undrain require REDIS_URL (direct mode, with REDIS_PASSWORD if set) or WORKER_GATEWAY_URL
 (gateway mode). In direct mode, LIGHTCHAIN_DRAIN_TTL optionally
 overrides the chain-derived default TTL (disputeWindow + slack).
@@ -533,11 +536,11 @@ func runInit() {
 	}
 }
 
-// newReconcileSeed wires what `init` and `register` need to start a new
-// worker's release reconciler at the safe head it registered at. It reads the
-// same RELEASE_* variables as `release` and the sidecar, so all three use one
-// state file. Nil (they cannot be read) only skips the seed: registration
-// never depends on it.
+// newReconcileSeed wires what `init` and `register` need to have a fresh
+// worker's release reconciler resume after the safe head read at its
+// registration. It reads the same RELEASE_* variables as `release` and the
+// sidecar, so all three use one state file. Nil (they cannot be read) only
+// skips the seed: registration never depends on it.
 func newReconcileSeed(cfg *config.RegistrationConfig, chainClient *chain.ChainClient, logger *slog.Logger) *cli.ReconcileSeed {
 	releaseCfg, err := release.ConfigFromEnv()
 	if err != nil {
