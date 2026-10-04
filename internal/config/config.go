@@ -2,6 +2,7 @@
 package config
 
 import (
+	"errors"
 	"fmt"
 	"math/big"
 	"net/url"
@@ -811,15 +812,57 @@ func hexNibble(c byte) (byte, bool) {
 
 // RedisOptions parses REDIS_URL into client options. REDIS_PASSWORD, when set,
 // replaces any password embedded in the URL.
+//
+// The error is built from fixed text only. Nearly every ParseURL error quotes
+// the URL, or the part it choked on, and an unescaped '/', '?' or '#' in a
+// password moves the password into that part, so none of it is passed on.
 func RedisOptions(redisURL, password string) (*redis.Options, error) {
 	opts, err := redis.ParseURL(redisURL)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("invalid REDIS_URL: %s (URL not shown, it may hold a password; a password's special characters must be percent-encoded)", redisURLFault(err))
 	}
 	if password != "" {
 		opts.Password = password
 	}
 	return opts, nil
+}
+
+// redisURLFaultByPrefix maps the leading text of each error redis.ParseURL
+// returns (net/url's, found inside its *url.Error, then go-redis's own) to
+// what is wrong in general terms. The catch-all for query options comes last.
+var redisURLFaultByPrefix = []struct{ prefix, fault string }{
+	{"net/url: invalid control character", "control character"},
+	{"missing protocol scheme", "missing scheme"},
+	{"first path segment in URL cannot contain colon", "missing scheme"},
+	{"net/url: invalid userinfo", "bad character in user or password"},
+	{"invalid port", "bad port"},
+	{"invalid URL escape", "bad percent-escape"},
+	{"invalid character", "bad host"},
+	{"invalid IP-literal", "bad host"},
+	{"missing ']' in host", "bad host"},
+	{"invalid host", "bad host"},
+	{"redis: invalid URL scheme", "bad scheme, want redis, rediss or unix"},
+	{"redis: invalid database number", "bad database number"},
+	{"redis: invalid URL path", "bad path, want /<database number>"},
+	{"redis: empty unix socket path", "empty unix socket path"},
+	{"redis: unexpected option", "unknown query option"},
+	{"redis: invalid ", "bad query option value"},
+}
+
+// redisURLFault picks the fixed description of a redis.ParseURL error. A
+// message it does not recognise gets no detail rather than being echoed.
+func redisURLFault(err error) string {
+	msg := err.Error()
+	var urlErr *url.Error
+	if errors.As(err, &urlErr) {
+		msg = urlErr.Err.Error()
+	}
+	for _, f := range redisURLFaultByPrefix {
+		if strings.HasPrefix(msg, f.prefix) {
+			return f.fault
+		}
+	}
+	return "malformed URL"
 }
 
 func envOrDefault(key, defaultVal string) string {
