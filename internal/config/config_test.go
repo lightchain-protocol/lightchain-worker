@@ -1082,3 +1082,79 @@ func TestLoad_ModelOptions_ProductionWorkerSets(t *testing.T) {
 		})
 	}
 }
+
+func TestRedisOptions_MalformedURLErrorOmitsPassword(t *testing.T) {
+	t.Parallel()
+
+	// Every URL carries the password s3cr3t<x>p4ssw0rd somewhere; %zq is the
+	// three bytes a bad percent-escape error quotes.
+	secrets := []string{"s3cr3t", "p4ssw0rd", "%zq"}
+
+	tests := []struct {
+		name  string
+		url   string
+		fault string
+	}{
+		// net/url failures: a *url.Error that quotes the whole URL.
+		{"control characters", "redis://:s3cr3t-p4ssw0rd@localhost:6379\r\n", "control character"},
+		{"leading colon", "://:s3cr3t-p4ssw0rd@localhost:6379", "missing scheme"},
+		{"no scheme", "s3cr3t-p4ssw0rd@localhost:6379", "missing scheme"},
+		{"space in password", "redis://user:s3cr3t p4ssw0rd@localhost:6379", "bad character in user or password"},
+		{"bad port", "redis://:s3cr3t-p4ssw0rd@localhost:63x79", "bad port"},
+		{"escaped password, bad port", "redis://:s3cr3t%2Fp4ssw0rd@localhost:63x79", "bad port"},
+		{"unescaped / in password", "redis://user:s3cr3t/p4ssw0rd@localhost:6379", "bad port"},
+		{"unescaped ? in password", "redis://user:s3cr3t?p4ssw0rd@localhost:6379", "bad port"},
+		{"unescaped # in password", "redis://user:s3cr3t#p4ssw0rd@localhost:6379", "bad port"},
+		{"bad percent-escape in password", "redis://:s3cr3t%zqp4ssw0rd@localhost:6379", "bad percent-escape"},
+		{"bad percent-escape in path", "redis://:s3cr3t-p4ssw0rd@localhost:6379/%zq", "bad percent-escape"},
+		{"bad percent-escape in fragment", "redis://:s3cr3t-p4ssw0rd@localhost:6379/0#%zq", "bad percent-escape"},
+		{"space in host", "redis://:s3cr3t-p4ssw0rd@local host:6379", "bad host"},
+		{"unclosed IPv6 bracket", "redis://:s3cr3t-p4ssw0rd@[::1:6379", "bad host"},
+		{"bracketed name", "redis://:s3cr3t-p4ssw0rd@[nothex]:6379", "bad host"},
+		{"bracket inside host", "redis://:s3cr3t-p4ssw0rd@host[1]:6379", "bad host"},
+
+		// go-redis's own messages, each quoting a part of the URL.
+		{"wrong scheme", "http://:s3cr3t-p4ssw0rd@localhost:6379", "bad scheme"},
+		{"password where the scheme goes", "s3cr3t-p4ssw0rd:@localhost:6379", "bad scheme"},
+		{"database not a number", "redis://:s3cr3t-p4ssw0rd@localhost:6379/notanumber", "bad database number"},
+		{"password starting with /", "redis://:/s3cr3t-p4ssw0rd@localhost:6379", "bad database number"},
+		{"extra path segment", "redis://:s3cr3t-p4ssw0rd@localhost:6379/0/1", "bad path"},
+		{"password with two /", "redis://:12/s3cr3t/p4ssw0rd@localhost:6379", "bad path"},
+		{"unix without a socket path", "unix://:s3cr3t-p4ssw0rd@", "empty unix socket path"},
+		{"db option not a number", "redis://localhost:6379?db=s3cr3t-p4ssw0rd", "bad database number"},
+		{"number option", "redis://localhost:6379?max_retries=s3cr3t-p4ssw0rd", "bad query option value"},
+		{"duration option", "redis://localhost:6379?dial_timeout=s3cr3t-p4ssw0rd", "bad query option value"},
+		{"boolean option", "redis://localhost:6379?pool_fifo=s3cr3t-p4ssw0rd", "bad query option value"},
+		{"unknown option", "redis://localhost:6379?password=s3cr3t-p4ssw0rd", "unknown query option"},
+		{"password starting with ?", "redis://:?s3cr3t-p4ssw0rd@localhost:6379", "unknown query option"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			_, err := RedisOptions(tt.url, "")
+
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), "invalid REDIS_URL: "+tt.fault)
+			for _, secret := range secrets {
+				assert.NotContains(t, err.Error(), secret)
+			}
+		})
+	}
+}
+
+func TestRedisOptions_WellFormedURL(t *testing.T) {
+	t.Parallel()
+
+	opts, err := RedisOptions("redis://worker:s3cr3t%2Fp4ssw0rd@redis.internal:6380/2", "")
+	require.NoError(t, err)
+	assert.Equal(t, "redis.internal:6380", opts.Addr)
+	assert.Equal(t, "worker", opts.Username)
+	assert.Equal(t, "s3cr3t/p4ssw0rd", opts.Password, "a percent-encoded password is decoded")
+	assert.Equal(t, 2, opts.DB)
+
+	opts, err = RedisOptions("redis://worker:stale@redis.internal:6380/2", "s3cr3t/p4ssw0rd")
+	require.NoError(t, err)
+	assert.Equal(t, "s3cr3t/p4ssw0rd", opts.Password, "REDIS_PASSWORD replaces the URL password, unencoded")
+}

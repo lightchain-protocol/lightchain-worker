@@ -315,10 +315,10 @@ func New(cfg *config.Config) (*Service, error) {
 	switch blobMode {
 	case "redis":
 		// Redis blob mode requires a Redis connection for blob I/O.
-		redisOpts, err = config.RedisOptions(cfg.RedisURL, cfg.RedisPassword)
+		redisOpts, err = redisOptions(cfg)
 		if err != nil {
 			chainClient.Close()
-			return nil, fmt.Errorf("parse Redis URL %q: %w", cfg.RedisURL, err)
+			return nil, err
 		}
 		redisClient = redis.NewClient(redisOpts)
 		blobFetcher = blob.NewRedisBlobFetcher(redisClient)
@@ -357,10 +357,10 @@ func New(cfg *config.Config) (*Service, error) {
 	// External profile (sortition + gateway URL) does all three via the
 	// gateway, so Redis is skipped unless BLOB_MODE=redis already dialed one.
 	if cfg.WorkerGatewayURL == "" && redisClient == nil {
-		redisOpts, err = config.RedisOptions(cfg.RedisURL, cfg.RedisPassword)
+		redisOpts, err = redisOptions(cfg)
 		if err != nil {
 			chainClient.Close()
-			return nil, fmt.Errorf("parse Redis URL %q: %w", cfg.RedisURL, err)
+			return nil, err
 		}
 		redisClient = redis.NewClient(redisOpts)
 	}
@@ -1350,6 +1350,16 @@ func (s *Service) shutdown(ctx context.Context) error {
 	default:
 		return shutdownErr
 	}
+}
+
+// redisOptions parses the configured Redis URL. The URL stays out of the
+// error, which ends up in the log: it can hold the Redis password.
+func redisOptions(cfg *config.Config) (*redis.Options, error) {
+	opts, err := config.RedisOptions(cfg.RedisURL, cfg.RedisPassword)
+	if err != nil {
+		return nil, fmt.Errorf("parse Redis URL: %w", err)
+	}
+	return opts, nil
 }
 
 func asynqRedisClientOptFromRedisOptions(opts *redis.Options) asynq.RedisClientOpt {
