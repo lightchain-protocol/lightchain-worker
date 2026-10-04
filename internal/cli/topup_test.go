@@ -1,10 +1,12 @@
 package cli
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"errors"
 	"math/big"
+	"strings"
 	"testing"
 	"time"
 
@@ -39,14 +41,14 @@ func TestParseLCAI(t *testing.T) {
 }
 
 // slashedWorker is a registered worker whose stake a slash left 750 LCAI under
-// the minimum, holding enough to top it up.
+// the minimum, holding enough to top it up. Its handler runs unattended (--yes).
 func slashedWorker() (*Handler, *reinstateChain, *bytes.Buffer) {
 	fc := greenChain(time.Now(), nil)
 	fc.stake = lcaiWei(4250)
 	fc.balance = lcaiWei(1000)
 	rc := &reinstateChain{fakeChain: fc}
 	var buf bytes.Buffer
-	return &Handler{Reinstatement: rc, WorkerAddr: testAddr, Out: &buf}, rc, &buf
+	return &Handler{Reinstatement: rc, WorkerAddr: testAddr, Yes: true, Out: &buf}, rc, &buf
 }
 
 func TestTopUpStake_SendsTheAmountAndPrintsTheNewStake(t *testing.T) {
@@ -165,4 +167,66 @@ func TestTopUpStake_TxFailureIsReported(t *testing.T) {
 
 	require.ErrorIs(t, err, rc.topUpErr)
 	assert.NotContains(t, buf.String(), "topped up")
+}
+
+func TestTopUpStake_DeclinedSendsNothing(t *testing.T) {
+	t.Parallel()
+	cases := map[string]*bufio.Reader{
+		"no":              bufio.NewReader(strings.NewReader("n\n")),
+		"empty line":      bufio.NewReader(strings.NewReader("\n")),
+		"not a yes":       bufio.NewReader(strings.NewReader("yes please\n")),
+		"end of input":    bufio.NewReader(strings.NewReader("")),
+		"no input at all": nil,
+	}
+	for name, in := range cases {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			h, rc, buf := slashedWorker()
+			h.Yes, h.In = false, in
+
+			err := h.TopUpStake(context.Background(), lcaiWei(500))
+
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), "nothing was sent")
+			assert.Empty(t, rc.topUps, "no transaction may be sent")
+			out := buf.String()
+			assert.Contains(t, out, "Add 500 LCAI")
+			assert.Contains(t, out, "will be 4750 LCAI, still 250 LCAI below the minimum 5000 LCAI")
+			assert.Contains(t, out, "[y/N]")
+			assert.NotContains(t, out, "topped up")
+		})
+	}
+}
+
+func TestTopUpStake_AcceptedSends(t *testing.T) {
+	t.Parallel()
+	for _, answer := range []string{"y\n", "YES\n"} {
+		h, rc, buf := slashedWorker()
+		h.Yes, h.In = false, bufio.NewReader(strings.NewReader(answer))
+
+		err := h.TopUpStake(context.Background(), lcaiWei(750))
+
+		require.NoError(t, err)
+		require.Len(t, rc.topUps, 1)
+		assert.Zero(t, lcaiWei(750).Cmp(rc.topUps[0]), "sent %s wei", rc.topUps[0])
+		out := buf.String()
+		assert.Contains(t, out, "will be 5000 LCAI (minimum 5000 LCAI)")
+		assert.Contains(t, out, "[y/N]")
+		assert.Contains(t, out, "topped up by 750 LCAI")
+	}
+}
+
+func TestTopUpStake_YesSendsWithoutReadingInput(t *testing.T) {
+	t.Parallel()
+	h, rc, buf := slashedWorker()
+	in := strings.NewReader("n\n")
+	h.Yes, h.In = true, bufio.NewReader(in)
+
+	err := h.TopUpStake(context.Background(), lcaiWei(750))
+
+	require.NoError(t, err)
+	assert.Len(t, rc.topUps, 1)
+	assert.Equal(t, 2, in.Len(), "the input must not be read")
+	assert.NotContains(t, buf.String(), "[y/N]")
+	assert.Contains(t, buf.String(), "topped up by 750 LCAI")
 }
