@@ -79,7 +79,10 @@ func (r *Reconciler) Run(ctx context.Context) error {
 	// Resume from cursor + 1. Use cfg.StartBlock when there is no cursor
 	// AND a non-zero StartBlock is configured (operator-specified
 	// deployment block). Otherwise start from block 1 (block 0 is genesis
-	// and never has events).
+	// and never has events). A worker registered with a never-used key
+	// may already have a cursor: `init` and `register` store the safe head
+	// read at its registration when they can (FileStore.SeedReconcileBlock),
+	// so it does not scan the chain from before it existed.
 	start := startCursor + 1
 	if startCursor == 0 && r.cfg.StartBlock > 0 {
 		start = r.cfg.StartBlock
