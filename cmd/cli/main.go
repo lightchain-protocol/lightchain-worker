@@ -18,6 +18,8 @@
 //	undrain     Reverse drain — restore worker eligibility
 //	deregister  Deregister worker and withdraw stake
 //	reinstate   Lift a suspension once its cooldown is over
+//	top-up-stake <amount>
+//	            Add LCAI to the worker's stake, e.g. after a slash
 //	status      Check on-chain registration status
 //	preflight   Read-only go-live checks (RPC, registration, stake, models, gateway, Ollama, beacon)
 //	watch       Read-only daemon that posts webhook alerts when the worker stops being able to claim
@@ -78,6 +80,8 @@ func main() {
 		runAddModels()
 	case "reinstate":
 		runReinstate()
+	case "top-up-stake":
+		runTopUpStake()
 	case "deregister":
 		runDeregister()
 	case "drain":
@@ -124,6 +128,10 @@ Commands:
   deregister  Deregister worker and withdraw stake
   reinstate   Lift a suspension once its cooldown is over. Sends nothing unless
               the worker is suspended and its stake meets the on-chain minimum.
+  top-up-stake <amount>
+              Add <amount> LCAI (e.g. 750 or 60.25) to the worker's stake, as a
+              slash can leave it under the on-chain minimum. A suspended
+              worker still needs reinstate afterwards.
   status      Check on-chain registration status
   preflight   Read-only go-live checks: RPC, registration, stake vs on-chain
               minimum, models, gateway, Ollama, beacon. Exit 1 on any failure.
@@ -342,6 +350,40 @@ func runReinstate() {
 
 	if err := h.Reinstate(ctx); err != nil {
 		fmt.Fprintln(os.Stderr, "reinstate:", err)
+		quitProcess(1)
+	}
+}
+
+func runTopUpStake() {
+	if len(os.Args) != 3 {
+		fmt.Fprintln(os.Stderr, "usage: lightchain-worker top-up-stake <amount in LCAI>")
+		quitProcess(1)
+		return
+	}
+	amount, err := cli.ParseLCAI(os.Args[2])
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "top-up-stake:", err)
+		quitProcess(1)
+		return
+	}
+
+	cfg, logger := loadAndValidateCfg()
+	signingKey, workerAddr := loadSigningKey(cfg, logger)
+
+	chainClient := dialChain(cfg, signingKey, logger)
+	defer chainClient.Close()
+
+	h := &cli.Handler{
+		Reinstatement: chainClient,
+		WorkerAddr:    workerAddr,
+		Out:           os.Stdout,
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), txTimeout)
+	defer cancel()
+
+	if err := h.TopUpStake(ctx, amount); err != nil {
+		fmt.Fprintln(os.Stderr, "top-up-stake:", err)
 		quitProcess(1)
 	}
 }

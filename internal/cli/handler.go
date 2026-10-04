@@ -49,18 +49,22 @@ type Handler struct {
 	// ReleaseConfig configures the on-demand release cycle and reconciler
 	// run invoked by `worker-cli release`.
 	ReleaseConfig release.Config
-	// Reinstatement is required only by the `reinstate` subcommand.
+	// Reinstatement is required only by the `reinstate` and `top-up-stake`
+	// subcommands.
 	Reinstatement ReinstateChain
 }
 
-// ReinstateChain is what `reinstate` drives: the reads that tell whether the
-// chain would accept it, then the transaction that lifts the suspension.
+// ReinstateChain is what `reinstate` and `top-up-stake` drive: the reads that
+// tell whether the chain would accept them, then the transaction that lifts
+// the suspension or adds the stake.
 type ReinstateChain interface {
 	IsWorkerRegistered(ctx context.Context, worker common.Address) (bool, error)
 	IsWorkerSuspended(ctx context.Context, worker common.Address) (bool, error)
+	Balance(ctx context.Context, addr common.Address) (*big.Int, error)
 	GetWorkerStake(ctx context.Context, worker common.Address) (*big.Int, error)
 	GetMinWorkerStake(ctx context.Context) (*big.Int, error)
 	Reinstate(ctx context.Context) error
+	TopUpStake(ctx context.Context, amount *big.Int) error
 }
 
 // Keygen loads or generates the ECDH encryption key and prints the public key hex.
@@ -176,7 +180,7 @@ func (h *Handler) Reinstate(ctx context.Context) error {
 		return fmt.Errorf("read the minimum stake: %w", err)
 	}
 	if stake.Cmp(minStake) < 0 {
-		return fmt.Errorf("stake %s is below the on-chain minimum %s — top it up by at least %s (topUpStake) first; nothing was sent",
+		return fmt.Errorf("stake %s is below the on-chain minimum %s — top it up by at least %s (`lightchain-worker top-up-stake <amount>`) first; nothing was sent",
 			lcai(stake), lcai(minStake), lcai(new(big.Int).Sub(minStake, stake)))
 	}
 
@@ -191,6 +195,56 @@ func (h *Handler) Reinstate(ctx context.Context) error {
 		return err
 	}
 	fmt.Fprintf(h.Out, "Worker %s reinstated, suspension lifted\n", h.WorkerAddr.Hex())
+	return nil
+}
+
+// TopUpStake adds amount (wei) to the worker's stake and prints the new stake
+// against the on-chain minimum.
+func (h *Handler) TopUpStake(ctx context.Context, amount *big.Int) error {
+	registered, err := h.Reinstatement.IsWorkerRegistered(ctx, h.WorkerAddr)
+	if err != nil {
+		return fmt.Errorf("read registration: %w", err)
+	}
+	if !registered {
+		return fmt.Errorf("worker %s is not registered — there is no stake to top up; `lightchain-worker register` stakes it", h.WorkerAddr.Hex())
+	}
+	bal, err := h.Reinstatement.Balance(ctx, h.WorkerAddr)
+	if err != nil {
+		return fmt.Errorf("read balance: %w", err)
+	}
+	if bal.Cmp(amount) <= 0 {
+		need := new(big.Int).Add(amount, lcaiToWei(gasBufferLCAI))
+		return fmt.Errorf("worker %s holds %s; topping up %s needs gas on top — send at least %s to it first; nothing was sent",
+			h.WorkerAddr.Hex(), lcai(bal), lcai(amount), lcai(need.Sub(need, bal)))
+	}
+	stake, err := h.Reinstatement.GetWorkerStake(ctx, h.WorkerAddr)
+	if err != nil {
+		return fmt.Errorf("read stake: %w", err)
+	}
+	minStake, err := h.Reinstatement.GetMinWorkerStake(ctx)
+	if err != nil {
+		return fmt.Errorf("read the minimum stake: %w", err)
+	}
+	suspended, err := h.Reinstatement.IsWorkerSuspended(ctx, h.WorkerAddr)
+	if err != nil {
+		return fmt.Errorf("read suspension: %w", err)
+	}
+
+	if err := h.Reinstatement.TopUpStake(ctx, amount); err != nil {
+		return err
+	}
+	// ponytail: the new stake is the stake read before sending plus the
+	// amount, so every read that can fail does so before anything is sent.
+	stake = new(big.Int).Add(stake, amount)
+	against := fmt.Sprintf(" (minimum %s)", lcai(minStake))
+	if stake.Cmp(minStake) < 0 {
+		against = fmt.Sprintf(", still %s below the minimum %s", lcai(new(big.Int).Sub(minStake, stake)), lcai(minStake))
+	}
+	fmt.Fprintf(h.Out, "Worker %s stake topped up by %s: now %s%s\n", h.WorkerAddr.Hex(), lcai(amount), lcai(stake), against)
+	if suspended {
+		fmt.Fprintln(h.Out, "The worker is still suspended: a top-up does not lift a suspension — "+
+			"run `lightchain-worker reinstate` once the stake meets the minimum and the cooldown is over")
+	}
 	return nil
 }
 

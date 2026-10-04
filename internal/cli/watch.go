@@ -205,7 +205,7 @@ func (h *WatchHandler) chainFindings(ctx context.Context) ([]finding, error) {
 	}
 	f = finding{check: "stake"}
 	if stake.Cmp(minStake) < 0 {
-		f.problem = fmt.Sprintf("%s below the on-chain minimum %s — top up the stake", lcai(stake), lcai(minStake))
+		f.problem = fmt.Sprintf("%s below the on-chain minimum %s — top it up with `lightchain-worker top-up-stake <amount>`", lcai(stake), lcai(minStake))
 	}
 	out = append(out, f)
 
