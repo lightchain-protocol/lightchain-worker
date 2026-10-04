@@ -159,7 +159,7 @@ On its first start the worker does not read the chain's history: it starts its s
 | Registration and key status | `lcw status` |
 | Add a model | `ollama pull NAME`, append it to `SUPPORTED_MODELS`, `lcw init`, `sudo systemctl restart lightchain-worker` |
 | Earnings | `lcw balance`; `lcw withdraw` moves them to the worker address |
-| Stake under the minimum after a slash | `lcw top-up-stake AMOUNT` adds AMOUNT LCAI to the stake; `lcw preflight` shows how much is missing |
+| Stake under the minimum after a slash | `lcw top-up-stake AMOUNT` adds AMOUNT LCAI to the stake after asking (`lcw top-up-stake --yes AMOUNT` does not ask); `lcw preflight` shows how much is missing |
 | Back from a suspension | `lcw reinstate`, once the cooldown is over and the stake is back at the minimum |
 | Upgrade | re-run the installer, then `sudo systemctl restart lightchain-worker` |
 | Stop | `sudo systemctl stop lightchain-worker` drains first: no new sessions, and in-flight jobs get up to `SHUTDOWN_TIMEOUT` to finish |

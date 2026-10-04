@@ -251,11 +251,16 @@ func (h *InitHandler) say(step, format string, args ...any) {
 // ask prints a question and returns the trimmed answer; an error means no
 // answer is coming (no terminal, or end of input).
 func (h *InitHandler) ask(question string) (string, error) {
-	_, _ = fmt.Fprint(h.Out, question)
-	if h.In == nil {
+	return ask(h.Out, h.In, question)
+}
+
+// ask is the prompt init and top-up-stake share.
+func ask(out io.Writer, in *bufio.Reader, question string) (string, error) {
+	_, _ = fmt.Fprint(out, question)
+	if in == nil {
 		return "", io.EOF
 	}
-	line, err := h.In.ReadString('\n')
+	line, err := in.ReadString('\n')
 	if err != nil && line == "" {
 		return "", err
 	}

@@ -4,6 +4,7 @@
 package cli
 
 import (
+	"bufio"
 	"context"
 	"crypto/ecdh"
 	"encoding/hex"
@@ -52,6 +53,10 @@ type Handler struct {
 	// Reinstatement is required only by the `reinstate` and `top-up-stake`
 	// subcommands.
 	Reinstatement ReinstateChain
+	// Yes and In are used only by `top-up-stake`: it asks on Out and reads
+	// the answer from In before sending, unless Yes is set.
+	Yes bool
+	In  *bufio.Reader
 }
 
 // ReinstateChain is what `reinstate` and `top-up-stake` drive: the reads that
@@ -199,7 +204,8 @@ func (h *Handler) Reinstate(ctx context.Context) error {
 }
 
 // TopUpStake adds amount (wei) to the worker's stake and prints the new stake
-// against the on-chain minimum.
+// against the on-chain minimum. Once every check has passed it asks before
+// sending, unless Yes is set.
 func (h *Handler) TopUpStake(ctx context.Context, amount *big.Int) error {
 	registered, err := h.Reinstatement.IsWorkerRegistered(ctx, h.WorkerAddr)
 	if err != nil {
@@ -229,10 +235,6 @@ func (h *Handler) TopUpStake(ctx context.Context, amount *big.Int) error {
 	if err != nil {
 		return fmt.Errorf("read suspension: %w", err)
 	}
-
-	if err := h.Reinstatement.TopUpStake(ctx, amount); err != nil {
-		return err
-	}
 	// ponytail: the new stake is the stake read before sending plus the
 	// amount, so every read that can fail does so before anything is sent.
 	stake = new(big.Int).Add(stake, amount)
@@ -240,13 +242,24 @@ func (h *Handler) TopUpStake(ctx context.Context, amount *big.Int) error {
 	if stake.Cmp(minStake) < 0 {
 		against = fmt.Sprintf(", still %s below the minimum %s", lcai(new(big.Int).Sub(minStake, stake)), lcai(minStake))
 	}
+	if bal.Cmp(need) < 0 {
+		fmt.Fprintf(h.Out, "Note: that leaves under %d LCAI for gas — send the worker more before it runs out\n", gasBufferLCAI)
+	}
+	if !h.Yes {
+		answer, _ := ask(h.Out, h.In, fmt.Sprintf("Add %s to the stake of worker %s? It will be %s%s. [y/N] ",
+			lcai(amount), h.WorkerAddr.Hex(), lcai(stake), against))
+		if a := strings.ToLower(answer); a != "y" && a != "yes" {
+			return fmt.Errorf("top-up not confirmed, nothing was sent — run it again when ready (or pass --yes)")
+		}
+	}
+
+	if err := h.Reinstatement.TopUpStake(ctx, amount); err != nil {
+		return err
+	}
 	fmt.Fprintf(h.Out, "Worker %s stake topped up by %s: now %s%s\n", h.WorkerAddr.Hex(), lcai(amount), lcai(stake), against)
 	if suspended {
 		fmt.Fprintln(h.Out, "The worker is still suspended: a top-up does not lift a suspension — "+
 			"run `lightchain-worker reinstate` once the stake meets the minimum and the cooldown is over")
-	}
-	if bal.Cmp(need) < 0 {
-		fmt.Fprintf(h.Out, "Note: that leaves under %d LCAI for gas — send the worker more before it runs out\n", gasBufferLCAI)
 	}
 	return nil
 }
