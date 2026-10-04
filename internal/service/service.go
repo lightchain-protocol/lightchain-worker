@@ -463,7 +463,8 @@ func New(cfg *config.Config) (*Service, error) {
 	var voiceEngine pipeline.VoiceEngine
 	if cfg.STTEnabled || cfg.TTSEnabled {
 		voiceEngine = voice.New(cfg.STTSidecarURL, cfg.TTSSidecarURL, cfg.STTTimeout, cfg.TTSTimeout)
-		logger.Info("voice sidecars configured",
+		logger.Info(
+			"voice sidecars configured",
 			"sttEnabled", cfg.STTEnabled,
 			"sttURL", cfg.STTSidecarURL,
 			"ttsEnabled", cfg.TTSEnabled,
@@ -539,8 +540,8 @@ func New(cfg *config.Config) (*Service, error) {
 			SpeechModelName:      cfg.SpeechModelName,
 			TTSMaxChars:          cfg.TTSMaxChars,
 			TTSTimeout:           cfg.TTSTimeout,
-			SearchMaxResults:    cfg.SearchMaxResults,
-			SearchTimeout:       cfg.SearchTimeout,
+			SearchMaxResults:     cfg.SearchMaxResults,
+			SearchTimeout:        cfg.SearchTimeout,
 		},
 		publisher, // nil for internal profiles — fallback wires RedisResponsePublisher
 		checkpoints,
@@ -617,12 +618,12 @@ func New(cfg *config.Config) (*Service, error) {
 				// inert here because gatewayResponsePublisher reports
 				// SupportsChunks()==false, so there is no streamer to
 				// carry the audio frame - the pipeline logs and skips.
-				STTEnabled:  cfg.STTEnabled,
-				TTSEnabled:  cfg.TTSEnabled,
-				TTSVoice:    cfg.TTSVoice,
-				SpeechModelName: cfg.SpeechModelName,
-				TTSMaxChars: cfg.TTSMaxChars,
-				TTSTimeout:  cfg.TTSTimeout,
+				STTEnabled:       cfg.STTEnabled,
+				TTSEnabled:       cfg.TTSEnabled,
+				TTSVoice:         cfg.TTSVoice,
+				SpeechModelName:  cfg.SpeechModelName,
+				TTSMaxChars:      cfg.TTSMaxChars,
+				TTSTimeout:       cfg.TTSTimeout,
 				SearchMaxResults: cfg.SearchMaxResults,
 				SearchTimeout:    cfg.SearchTimeout,
 			},
@@ -824,6 +825,7 @@ func New(cfg *config.Config) (*Service, error) {
 			ChunkSize:         cfg.SortitionChunkSize,
 			Confirmations:     cfg.SortitionConfirmations,
 			SessionRetryLimit: cfg.SortitionSessionRetryLimit,
+			LookbackBlocks:    cfg.SortitionSessionLookbackBlocks,
 			PollInterval:      cfg.SortitionPollInterval,
 			Logger:            logger,
 		})
@@ -956,7 +958,8 @@ func (p *gatewayResponsePublisher) PublishChunk(
 	kind pkgtypes.FrameKind,
 	_ []byte,
 ) {
-	p.logger.Warn("gateway publisher cannot emit chunk frames; dropping delta",
+	p.logger.Warn(
+		"gateway publisher cannot emit chunk frames; dropping delta",
 		"jobID", jobID,
 		"sequence", sequence,
 		"kind", kind.Normalize(),
