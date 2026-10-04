@@ -125,6 +125,15 @@ func TestLoadRegistration_JobRegistryAddress_Provided(t *testing.T) {
 	)
 }
 
+func TestLoadRegistration_RedisPassword(t *testing.T) {
+	validRegEnv(t)
+	t.Setenv("REDIS_PASSWORD", "s3cret")
+
+	cfg, err := LoadRegistration()
+	require.NoError(t, err)
+	assert.Equal(t, "s3cret", cfg.RedisPassword)
+}
+
 func TestLoadRegistration_JobRegistryAddress_InvalidHex(t *testing.T) {
 	validRegEnv(t)
 	t.Setenv("JOB_REGISTRY_ADDRESS", "not-an-address")
