@@ -13,6 +13,7 @@ import (
 	"log/slog"
 	"math/big"
 	"strings"
+	"time"
 
 	"github.com/ethereum/go-ethereum/common"
 
@@ -243,13 +244,21 @@ func (h *Handler) TopUpStake(ctx context.Context, amount *big.Int) error {
 		against = fmt.Sprintf(", still %s below the minimum %s", lcai(new(big.Int).Sub(minStake, stake)), lcai(minStake))
 	}
 	if bal.Cmp(need) < 0 {
-		fmt.Fprintf(h.Out, "Note: that leaves under %d LCAI for gas — send the worker more before it runs out\n", gasBufferLCAI)
+		fmt.Fprintf(h.Out, "Note: this top-up leaves under %d LCAI for gas — send the worker more before it runs out\n", gasBufferLCAI)
 	}
 	if !h.Yes {
-		answer, _ := ask(h.Out, h.In, fmt.Sprintf("Add %s to the stake of worker %s? It will be %s%s. [y/N] ",
-			lcai(amount), h.WorkerAddr.Hex(), lcai(stake), against))
-		if a := strings.ToLower(answer); a != "y" && a != "yes" {
+		asked := time.Now()
+		if !confirm(h.Out, h.In, fmt.Sprintf("Add %s to the stake of worker %s? It will be %s%s. [y/N] ",
+			lcai(amount), h.WorkerAddr.Hex(), lcai(stake), against)) {
 			return fmt.Errorf("top-up not confirmed, nothing was sent — run it again when ready (or pass --yes)")
+		}
+		// The wait for the answer is not on the caller's clock: after a slow
+		// yes the transaction would go out with no time left to see it mined,
+		// and a failure reported for a top-up that landed invites a second one.
+		if deadline, ok := ctx.Deadline(); ok {
+			var cancel context.CancelFunc
+			ctx, cancel = context.WithDeadline(context.WithoutCancel(ctx), deadline.Add(time.Since(asked)))
+			defer cancel()
 		}
 	}
 

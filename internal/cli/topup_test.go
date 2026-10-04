@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"io"
 	"math/big"
 	"strings"
 	"testing"
@@ -73,13 +74,15 @@ func TestTopUpStake_NotesABalanceLeftUnderTheGasBuffer(t *testing.T) {
 	t.Parallel()
 	h, rc, buf := slashedWorker()
 	rc.balance = lcaiWei(760)
+	h.Yes, h.In = false, bufio.NewReader(strings.NewReader("y\n"))
 
 	err := h.TopUpStake(context.Background(), lcaiWei(750))
 
 	require.NoError(t, err)
 	assert.Len(t, rc.topUps, 1)
-	assert.Contains(t, buf.String(), "topped up by 750 LCAI")
-	assert.Contains(t, buf.String(), "leaves under 50 LCAI for gas")
+	note, question, _ := strings.Cut(buf.String(), "[y/N]")
+	assert.Contains(t, note, "this top-up leaves under 50 LCAI for gas", "the operator reads it before answering")
+	assert.Contains(t, question, "topped up by 750 LCAI")
 }
 
 func TestTopUpStake_RefusesWithoutSending(t *testing.T) {
@@ -119,6 +122,7 @@ func TestTopUpStake_RefusesWithoutSending(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 			h, rc, buf := slashedWorker()
+			h.Yes, h.In = false, bufio.NewReader(strings.NewReader("y\n"))
 			tc.setup(rc)
 
 			err := h.TopUpStake(context.Background(), lcaiWei(750))
@@ -128,6 +132,7 @@ func TestTopUpStake_RefusesWithoutSending(t *testing.T) {
 				assert.Contains(t, err.Error(), w)
 			}
 			assert.Empty(t, rc.topUps, "no transaction may be sent")
+			assert.NotContains(t, buf.String(), "[y/N]", "the question comes only after every check")
 			assert.NotContains(t, buf.String(), "topped up")
 		})
 	}
@@ -229,4 +234,29 @@ func TestTopUpStake_YesSendsWithoutReadingInput(t *testing.T) {
 	assert.Equal(t, 2, in.Len(), "the input must not be read")
 	assert.NotContains(t, buf.String(), "[y/N]")
 	assert.Contains(t, buf.String(), "topped up by 750 LCAI")
+}
+
+// slowAnswer delays the operator's answer.
+type slowAnswer struct {
+	delay time.Duration
+	io.Reader
+}
+
+func (s slowAnswer) Read(p []byte) (int, error) {
+	time.Sleep(s.delay)
+	return s.Reader.Read(p)
+}
+
+func TestTopUpStake_WaitingForTheAnswerDoesNotUseUpTheSendBudget(t *testing.T) {
+	t.Parallel()
+	h, rc, _ := slashedWorker()
+	h.Yes, h.In = false, bufio.NewReader(slowAnswer{300 * time.Millisecond, strings.NewReader("y\n")})
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+
+	err := h.TopUpStake(ctx, lcaiWei(750))
+
+	require.NoError(t, err)
+	require.Len(t, rc.topUps, 1)
+	assert.NoError(t, rc.sendCtxErr, "the transaction must not be sent on an expired context")
 }
