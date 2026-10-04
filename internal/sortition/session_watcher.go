@@ -52,7 +52,8 @@ type SessionWatcherOpts struct {
 	// cursor — including ones still waiting out the sortition threshold. Size it
 	// to how long requests stay Open: the consumer-api's default expiry is 1 h,
 	// but callers may request longer, so raise it where they do. Zero disables
-	// the look-back.
+	// the look-back. It is also how far behind the safe head a worker with no
+	// stored cursor starts discovery (see CursorStore.GetOrSeed).
 	LookbackBlocks uint64
 }
 
@@ -75,8 +76,9 @@ type SessionWatcher struct {
 	log      *slog.Logger
 	ownCaps  *big.Int
 	lookback uint64
-	// seeded is set once the look-back behind the persisted cursor has run, or
-	// has been given up after reseedMaxAttempts failures (see RunOnce, phase 0).
+	// seeded is set once the look-back behind the persisted cursor has run, has
+	// been given up after reseedMaxAttempts failures, or is moot because there
+	// was no cursor to look behind (see RunOnce, phase 0).
 	seeded      bool
 	reseedTries int
 	// pending maps reqID → its required-capability mask, fetched lazily on first
@@ -132,7 +134,9 @@ func (w *SessionWatcher) Start(ctx context.Context) {
 	}
 }
 
-// RunOnce performs one poll pass in three phases.
+// RunOnce performs one poll pass in three phases. A worker with no stored
+// cursor starts discovery LookbackBlocks behind the safe head, so it never
+// scans further back than that, and has nothing behind its cursor for phase 0.
 //
 // Phase 0 — Reseed (first pass only): re-scan LookbackBlocks behind the
 // persisted cursor and add whatever SessionRequested events are there to the
@@ -169,9 +173,15 @@ func (w *SessionWatcher) RunOnce(ctx context.Context) error {
 		safeHead = head.Number - w.confs
 	}
 
-	cursor, err := w.cursor.Get(cursorSessionRequested)
+	cursor, fresh, err := w.cursor.GetOrSeed(cursorSessionRequested, safeHead, w.lookback)
 	if err != nil {
 		return err
+	}
+	if fresh {
+		// Discovery below scans the look-back window itself.
+		w.seeded = true
+		w.log.Info("no session cursor stored; starting behind the safe head",
+			"cursor", cursor, "safeHead", safeHead)
 	}
 
 	// Phase 0: Reseed — once per process, look behind the cursor. A failure

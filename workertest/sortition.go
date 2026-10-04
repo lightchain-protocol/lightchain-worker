@@ -202,6 +202,10 @@ func NewSortitionHarness(t testing.TB, opts SortitionOptions) *SortitionHarness 
 			PollInterval:    time.Second,
 			Logger:          opts.Logger,
 			OwnCapabilities: ownCaps,
+			// The harness has no stored cursors. A look-back longer than any
+			// test chain keeps both watchers scanning from the first block, so
+			// requests and jobs sent before the first pass are still seen.
+			LookbackBlocks: ^uint64(0),
 		}),
 		jobWatcher: sortition.NewJobWatcher(sortition.JobWatcherOpts{
 			Client:            chainClient,
@@ -214,6 +218,7 @@ func NewSortitionHarness(t testing.TB, opts SortitionOptions) *SortitionHarness 
 			ChunkSize:         2048,
 			Confirmations:     0,
 			SessionRetryLimit: 3,
+			LookbackBlocks:    ^uint64(0), // as for the session watcher above
 			PollInterval:      time.Second,
 			Logger:            opts.Logger,
 		}),
