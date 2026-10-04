@@ -315,13 +315,10 @@ func New(cfg *config.Config) (*Service, error) {
 	switch blobMode {
 	case "redis":
 		// Redis blob mode requires a Redis connection for blob I/O.
-		redisOpts, err = redis.ParseURL(cfg.RedisURL)
+		redisOpts, err = config.RedisOptions(cfg.RedisURL, cfg.RedisPassword)
 		if err != nil {
 			chainClient.Close()
 			return nil, fmt.Errorf("parse Redis URL %q: %w", cfg.RedisURL, err)
-		}
-		if cfg.RedisPassword != "" {
-			redisOpts.Password = cfg.RedisPassword
 		}
 		redisClient = redis.NewClient(redisOpts)
 		blobFetcher = blob.NewRedisBlobFetcher(redisClient)
@@ -360,13 +357,10 @@ func New(cfg *config.Config) (*Service, error) {
 	// External profile (sortition + gateway URL) does all three via the
 	// gateway, so Redis is skipped unless BLOB_MODE=redis already dialed one.
 	if cfg.WorkerGatewayURL == "" && redisClient == nil {
-		redisOpts, err = redis.ParseURL(cfg.RedisURL)
+		redisOpts, err = config.RedisOptions(cfg.RedisURL, cfg.RedisPassword)
 		if err != nil {
 			chainClient.Close()
 			return nil, fmt.Errorf("parse Redis URL %q: %w", cfg.RedisURL, err)
-		}
-		if cfg.RedisPassword != "" {
-			redisOpts.Password = cfg.RedisPassword
 		}
 		redisClient = redis.NewClient(redisOpts)
 	}

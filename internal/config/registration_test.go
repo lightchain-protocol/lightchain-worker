@@ -104,6 +104,15 @@ func TestLoadRegistration_NegativeStake(t *testing.T) {
 	assert.Contains(t, err.Error(), "WORKER_STAKE: must be non-negative")
 }
 
+func TestLoadRegistration_RedisPassword(t *testing.T) {
+	validRegEnv(t)
+	t.Setenv("REDIS_PASSWORD", "s3cret")
+
+	cfg, err := LoadRegistration()
+	require.NoError(t, err)
+	assert.Equal(t, "s3cret", cfg.RedisPassword)
+}
+
 func TestLoadRegistration_JobRegistryAddress_OptionalAtLoad(t *testing.T) {
 	validRegEnv(t)
 	// JOB_REGISTRY_ADDRESS not set — load should succeed; field stays zero.

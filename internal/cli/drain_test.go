@@ -17,6 +17,8 @@ import (
 	"github.com/stretchr/testify/require"
 
 	pkgtypes "github.com/lightchain/pkg/types"
+
+	"github.com/lightchain/worker/internal/config"
 )
 
 var testDrainWorker = common.HexToAddress("0xAb5801a7D398351b8bE11C439e05C5B3259aeC9B")
@@ -313,4 +315,45 @@ func TestUndrain_gatewayMode_callsSendUndrain(t *testing.T) {
 	}
 	require.NoError(t, h.Undrain(context.Background()))
 	assert.Equal(t, 1, gw.undrainCalls)
+}
+
+func TestRedisOptions_authenticatesDrainAndUndrain(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name     string
+		userinfo string // REDIS_URL userinfo, in front of the server address
+		password string // REDIS_PASSWORD
+	}{
+		{name: "REDIS_PASSWORD with a password-less REDIS_URL", password: "s3cret"},
+		{name: "REDIS_PASSWORD wins over a stale password in REDIS_URL", userinfo: ":stale@", password: "s3cret"},
+		{name: "password in REDIS_URL alone", userinfo: ":s3cret@"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			mr := miniredis.RunT(t)
+			mr.RequireAuth("s3cret")
+
+			opts, err := config.RedisOptions("redis://"+tt.userinfo+mr.Addr(), tt.password)
+			require.NoError(t, err)
+			rdb := redis.NewClient(opts)
+			t.Cleanup(func() { _ = rdb.Close() })
+
+			h := &DrainHandler{
+				RedisClient: rdb,
+				WorkerAddr:  testDrainWorker,
+				SkipConfirm: true,
+				Logger:      discardLogger(),
+			}
+			key := pkgtypes.DrainRedisKey(testDrainWorker.Hex())
+
+			require.NoError(t, h.Drain(context.Background()))
+			assert.True(t, mr.Exists(key))
+
+			require.NoError(t, h.Undrain(context.Background()))
+			assert.False(t, mr.Exists(key))
+		})
+	}
 }

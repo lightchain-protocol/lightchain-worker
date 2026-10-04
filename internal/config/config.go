@@ -12,6 +12,7 @@ import (
 
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/crypto"
+	"github.com/redis/go-redis/v9"
 
 	"github.com/lightchain/worker/internal/metrics"
 	"github.com/lightchain/worker/internal/ollama"
@@ -806,6 +807,19 @@ func hexNibble(c byte) (byte, bool) {
 		return c - 'A' + 10, true
 	}
 	return 0, false
+}
+
+// RedisOptions parses REDIS_URL into client options. REDIS_PASSWORD, when set,
+// replaces any password embedded in the URL.
+func RedisOptions(redisURL, password string) (*redis.Options, error) {
+	opts, err := redis.ParseURL(redisURL)
+	if err != nil {
+		return nil, err
+	}
+	if password != "" {
+		opts.Password = password
+	}
+	return opts, nil
 }
 
 func envOrDefault(key, defaultVal string) string {
