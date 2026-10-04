@@ -314,3 +314,46 @@ func TestUndrain_gatewayMode_callsSendUndrain(t *testing.T) {
 	require.NoError(t, h.Undrain(context.Background()))
 	assert.Equal(t, 1, gw.undrainCalls)
 }
+
+// A Redis that requires auth rejects every command from a client that holds
+// no password, so drain and undrain only pass here when the password reaches
+// the client.
+func TestRedisOptions_authenticatesDrainAndUndrain(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name     string
+		userinfo string // REDIS_URL userinfo, in front of the server address
+		password string // REDIS_PASSWORD
+	}{
+		{name: "REDIS_PASSWORD with a password-less REDIS_URL", password: "s3cret"},
+		{name: "password in REDIS_URL wins over REDIS_PASSWORD", userinfo: ":s3cret@", password: "stale"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			mr := miniredis.RunT(t)
+			mr.RequireAuth("s3cret")
+
+			opts, err := RedisOptions("redis://"+tt.userinfo+mr.Addr(), tt.password)
+			require.NoError(t, err)
+			rdb := redis.NewClient(opts)
+			t.Cleanup(func() { _ = rdb.Close() })
+
+			h := &DrainHandler{
+				RedisClient: rdb,
+				WorkerAddr:  testDrainWorker,
+				SkipConfirm: true,
+				Logger:      discardLogger(),
+			}
+			key := pkgtypes.DrainRedisKey(testDrainWorker.Hex())
+
+			require.NoError(t, h.Drain(context.Background()))
+			assert.True(t, mr.Exists(key))
+
+			require.NoError(t, h.Undrain(context.Background()))
+			assert.False(t, mr.Exists(key))
+		})
+	}
+}
