@@ -246,6 +246,13 @@ func (c *ChainClient) Reinstate(ctx context.Context) error {
 	})
 }
 
+// TopUpStake submits a topUpStake transaction, adding amount (wei) to this worker's stake.
+func (c *ChainClient) TopUpStake(ctx context.Context, amount *big.Int) error {
+	return c.submitPreparedTx(ctx, "TopUpStake", amount, func(opts *bind.TransactOpts) (*types.Transaction, error) {
+		return c.registry.TopUpStake(opts)
+	})
+}
+
 // GetMinWorkerStake reads the minimum stake required to register from the AIConfig contract.
 func (c *ChainClient) GetMinWorkerStake(ctx context.Context) (*big.Int, error) {
 	stake, err := c.aiConfig.GetMinWorkerStake(&bind.CallOpts{Context: ctx})
