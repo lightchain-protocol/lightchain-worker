@@ -7,7 +7,11 @@
 #
 # It runs `/usr/local/bin/lightchain-worker watch`: the one worker binary, put
 # there by the installer (docs/install.md, step 1), from a release that has the
-# `watch` command (`lightchain-worker help` lists it).
+# `watch` command. Check before enabling the unit, with an empty environment so
+# that nothing can start: `env -i /usr/local/bin/lightchain-worker help` must
+# list `watch`. A worker-only binary (cmd/sidecar: /bin/worker in the Docker
+# image) ignores its arguments, so at that path this unit would start it as a
+# second worker.
 #
 # Install, as root, for worker <name> (`worker` on a host set up by docs/install.md):
 #   install -m 644 lightchain-worker-watch@.service /etc/systemd/system/
@@ -31,9 +35,9 @@
 # Optional in watch.env: WATCH_INTERVAL (30s), WATCH_COOLDOWN (1h, minimum gap
 # between repeat alerts for a check that stays failing), WATCH_MISSED_CLAIMS (3:
 # sessions in a row lost to other workers while eligible; 0 disables),
-# WATCH_WORKER_ADDRESS (the worker's address, for a keystore without an address
-# field: watch then exits with "keystore … has no address field". Default: that
-# field of the keystore at WORKER_KEYSTORE_PATH, read without the password).
+# WATCH_WORKER_ADDRESS (the worker's address. Default: the address field of the
+# keystore at WORKER_KEYSTORE_PATH, read without the password; set the variable
+# when watch exits with "keystore … has no address field").
 #
 # Docker workers (external-worker guide): run the same image beside the worker,
 # in its network namespace so 127.0.0.1:9101/healthz is the worker's:

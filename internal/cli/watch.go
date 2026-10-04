@@ -415,15 +415,15 @@ func (h *WatchHandler) now() time.Time {
 
 // WatchWorkerAddress picks the worker `watch` reports on: the --worker flag,
 // then WATCH_WORKER_ADDRESS (zero = unset), then the keystore's address field.
-func WatchWorkerAddress(flag string, env common.Address, keystorePath string) (common.Address, error) {
+func WatchWorkerAddress(flag string, envAddr common.Address, keystorePath string) (common.Address, error) {
 	switch {
 	case flag != "":
 		if !common.IsHexAddress(flag) {
 			return common.Address{}, fmt.Errorf("--worker must be a hex address, got %q", flag)
 		}
 		return common.HexToAddress(flag), nil
-	case env != (common.Address{}):
-		return env, nil
+	case envAddr != (common.Address{}):
+		return envAddr, nil
 	case keystorePath != "":
 		return KeystoreAddress(keystorePath)
 	}

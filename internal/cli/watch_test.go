@@ -636,30 +636,35 @@ func TestWatchWorkerAddress_FlagThenEnvThenKeystore(t *testing.T) {
 	flagAddr := common.HexToAddress("0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")
 	envAddr := common.HexToAddress("0xcccccccccccccccccccccccccccccccccccccccc")
 
-	cases := map[string]struct {
+	cases := []struct {
+		name     string
 		flag     string
 		env      common.Address
 		keystore string
 		want     common.Address
+		wantErr  string
 	}{
-		"flag first":                {flagAddr.Hex(), envAddr, ks, flagAddr},
-		"env before the keystore":   {"", envAddr, ks, envAddr},
-		"env, keystore has no addr": {"", envAddr, bare, envAddr},
-		"env, no keystore":          {"", envAddr, "", envAddr},
-		"keystore last":             {"", common.Address{}, ks, testAddr},
+		{name: "flag first", flag: flagAddr.Hex(), env: envAddr, keystore: ks, want: flagAddr},
+		{name: "env before the keystore", env: envAddr, keystore: ks, want: envAddr},
+		{name: "env, keystore without an address field", env: envAddr, keystore: bare, want: envAddr},
+		{name: "env, no keystore", env: envAddr, want: envAddr},
+		{name: "keystore last", keystore: ks, want: testAddr},
+		{name: "a bad flag is an error, not a fallback", flag: "nope", env: envAddr, keystore: ks, wantErr: `--worker must be a hex address, got "nope"`},
+		{name: "keystore without an address field", keystore: bare, wantErr: "has no address field — set WATCH_WORKER_ADDRESS or pass --worker"},
+		{name: "nothing set", wantErr: "watch needs --worker, WATCH_WORKER_ADDRESS or WORKER_KEYSTORE_PATH"},
 	}
-	for name, tc := range cases {
-		got, err := WatchWorkerAddress(tc.flag, tc.env, tc.keystore)
-		require.NoError(t, err, name)
-		assert.Equal(t, tc.want, got, name)
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			got, err := WatchWorkerAddress(tc.flag, tc.env, tc.keystore)
+			if tc.wantErr != "" {
+				require.ErrorContains(t, err, tc.wantErr)
+				return
+			}
+			require.NoError(t, err)
+			assert.Equal(t, tc.want, got)
+		})
 	}
-
-	_, err := WatchWorkerAddress("nope", envAddr, ks)
-	assert.ErrorContains(t, err, "--worker", "a bad flag is an error, not a fallback to the next source")
-	_, err = WatchWorkerAddress("", common.Address{}, "")
-	assert.ErrorContains(t, err, "--worker, WATCH_WORKER_ADDRESS or WORKER_KEYSTORE_PATH")
-	_, err = WatchWorkerAddress("", common.Address{}, bare)
-	assert.ErrorContains(t, err, "has no address field — set WATCH_WORKER_ADDRESS or pass --worker")
 }
 
 // TestWatch_SourceHasNoWritePath pins "watch never remediates" at the source:
