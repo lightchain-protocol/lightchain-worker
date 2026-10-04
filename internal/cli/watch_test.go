@@ -332,7 +332,7 @@ func TestWatch_SuspensionAlerts(t *testing.T) {
 	require.Equal(t, []string{"suspended failing"}, titles(got))
 	desc := got[0].Embeds[0].Description
 	assert.Contains(t, desc, time.Unix(fc.until, 0).UTC().Format(time.RFC3339))
-	assert.Contains(t, desc, "reinstate()", "suspension only lifts when the worker reinstates")
+	assert.Contains(t, desc, "`lightchain-worker reinstate`", "suspension only lifts when the worker reinstates")
 
 	fc.suspended = false
 	now = now.Add(h.Interval)
@@ -354,7 +354,7 @@ func TestWatch_SuspensionPastCooldownSaysReinstate(t *testing.T) {
 	got := sink.take()
 	require.Equal(t, []string{"suspended failing"}, titles(got))
 	assert.Contains(t, got[0].Embeds[0].Description, "cooldown ended")
-	assert.Contains(t, got[0].Embeds[0].Description, "reinstate()")
+	assert.Contains(t, got[0].Embeds[0].Description, "`lightchain-worker reinstate`")
 }
 
 func TestWatch_HungRPCStillAlertsWithinTheInterval(t *testing.T) {
