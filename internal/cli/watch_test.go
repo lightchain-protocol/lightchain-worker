@@ -626,6 +626,42 @@ func TestKeystoreAddress_ReadsWithoutPassword(t *testing.T) {
 	assert.Error(t, err)
 }
 
+func TestWatchWorkerAddress_FlagThenEnvThenKeystore(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	ks := filepath.Join(dir, "ks.json")
+	require.NoError(t, os.WriteFile(ks, []byte(`{"address":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","crypto":{}}`), 0o600))
+	bare := filepath.Join(dir, "bare.json")
+	require.NoError(t, os.WriteFile(bare, []byte(`{"crypto":{}}`), 0o600))
+	flagAddr := common.HexToAddress("0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")
+	envAddr := common.HexToAddress("0xcccccccccccccccccccccccccccccccccccccccc")
+
+	cases := map[string]struct {
+		flag     string
+		env      common.Address
+		keystore string
+		want     common.Address
+	}{
+		"flag first":                {flagAddr.Hex(), envAddr, ks, flagAddr},
+		"env before the keystore":   {"", envAddr, ks, envAddr},
+		"env, keystore has no addr": {"", envAddr, bare, envAddr},
+		"env, no keystore":          {"", envAddr, "", envAddr},
+		"keystore last":             {"", common.Address{}, ks, testAddr},
+	}
+	for name, tc := range cases {
+		got, err := WatchWorkerAddress(tc.flag, tc.env, tc.keystore)
+		require.NoError(t, err, name)
+		assert.Equal(t, tc.want, got, name)
+	}
+
+	_, err := WatchWorkerAddress("nope", envAddr, ks)
+	assert.ErrorContains(t, err, "--worker", "a bad flag is an error, not a fallback to the next source")
+	_, err = WatchWorkerAddress("", common.Address{}, "")
+	assert.ErrorContains(t, err, "--worker, WATCH_WORKER_ADDRESS or WORKER_KEYSTORE_PATH")
+	_, err = WatchWorkerAddress("", common.Address{}, bare)
+	assert.ErrorContains(t, err, "has no address field — set WATCH_WORKER_ADDRESS or pass --worker")
+}
+
 // TestWatch_SourceHasNoWritePath pins "watch never remediates" at the source:
 // nothing on the watch code path may load a signing key, build a transaction,
 // or write Redis / drain state.
