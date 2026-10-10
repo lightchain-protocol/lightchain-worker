@@ -8,7 +8,7 @@ A worker claims jobs on-chain through sortition, runs them on your own [Ollama](
 
 - A Linux host (amd64 or arm64) with a GPU, running Ollama. macOS builds exist too, but serving wants a Linux GPU box.
 - Outbound HTTPS and WSS access.
-- Testnet LCAI: **5,000 LCAI** stake (the on-chain minimum, `AIConfig.getMinWorkerStake()`) plus a gas buffer of about **50 LCAI**, so about **5,060 LCAI** in all. Ask the LightChain team or the community channels for testnet LCAI.
+- Testnet LCAI: **5,000 LCAI** stake (the on-chain minimum, `AIConfig.getMinWorkerStake()`) plus a gas buffer of **50 LCAI**. `init` asks for at least **5,050 LCAI**; send about **5,060 LCAI** so the balance stays above the buffer after registering. Ask the LightChain team or the community channels for testnet LCAI.
 
 ## 1. Install the CLI
 
@@ -24,7 +24,7 @@ To check the installer before you run it, download `install.sh` and `checksums.t
 
 ## 2. Pull your models into Ollama
 
-On-chain, a model's id is `keccak256` of its name, and the worker passes that same name to Ollama. So each name you serve must be on the testnet's model list, and Ollama must have a model under exactly that name. The live list is at <https://chat-api.testnet.lightchain.ai/api/indexer/models>.
+On-chain, a model's id is `keccak256` of its name, and the worker passes that same name to Ollama. So each name you serve must be on the testnet's model list, and Ollama must have a model under exactly that name. The live list is at <https://chat-api.testnet.lightchain.ai/api/indexer/models>. It shows each model by its id, which is what `cast keccak NAME` prints; `init` checks your names against the chain before it spends anything.
 
 ```bash
 ollama pull gemma4:e2b
@@ -159,13 +159,14 @@ On its first start the worker does not read the chain's history: it starts its s
 | Registration and key status | `lcw status` |
 | Add a model | `ollama pull NAME`, append it to `SUPPORTED_MODELS`, `lcw init`, `sudo systemctl restart lightchain-worker` |
 | Earnings | `lcw balance`; `lcw withdraw` moves them to the worker address |
-| Stake under the minimum after a slash | `lcw top-up-stake AMOUNT` adds AMOUNT LCAI to the stake after asking (`lcw top-up-stake --yes AMOUNT` does not ask); `lcw preflight` shows how much is missing |
-| Back from a suspension | `lcw reinstate`, once the cooldown is over and the stake is back at the minimum |
+| Stake under the minimum after a slash | `lcw top-up-stake AMOUNT` adds AMOUNT LCAI to the stake after asking (`lcw top-up-stake --yes AMOUNT` does not ask); `lcw preflight` shows how much is missing. Needs a release newer than v0.0.1 |
+| Back from a suspension | `lcw reinstate`, once the cooldown is over and the stake is back at the minimum. Needs a release newer than v0.0.1 |
+| Alerts | `lightchain-worker watch` posts to a Discord webhook when the worker needs attention, and again when it recovers. The unit and its install steps are in [`deploy/lightchain-worker-watch@.service`](../deploy/lightchain-worker-watch@.service) |
 | Upgrade | re-run the installer, then `sudo systemctl restart lightchain-worker` |
 | Stop | `sudo systemctl stop lightchain-worker` drains first: no new sessions, and in-flight jobs get up to `SHUTDOWN_TIMEOUT` to finish |
 | Leave | stop the service, then `lcw deregister` returns the stake once no jobs are active |
 
-Fees accrue in JobRegistry, and the worker settles them to its balance after the dispute window. Timeouts and lost disputes slash a share of the minimum stake, and three offenses suspend the worker for a cooldown. Keep the host up and the models loaded, and avoid killing the service mid-job.
+Fees accrue in JobRegistry, and the worker settles them to its balance after the dispute window. A timeout or a lost dispute counts as an offense, and three offenses suspend the worker for 7 days. On testnet the slash rates are currently 0, so an offense takes no stake; on a network with non-zero rates it also takes a share of the minimum stake. Keep the host up and the models loaded, and avoid killing the service mid-job.
 
 ## Troubleshooting
 
