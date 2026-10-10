@@ -25,6 +25,7 @@ type PreflightChain interface {
 	Balance(ctx context.Context, addr common.Address) (*big.Int, error)
 	IsWorkerRegistered(ctx context.Context, worker common.Address) (bool, error)
 	IsWorkerSuspended(ctx context.Context, worker common.Address) (bool, error)
+	GetSuspendedUntil(ctx context.Context, worker common.Address) (*big.Int, error)
 	GetOffenseCount(ctx context.Context, worker common.Address) (*big.Int, error)
 	GetWorkerStake(ctx context.Context, worker common.Address) (*big.Int, error)
 	GetMinWorkerStake(ctx context.Context) (*big.Int, error)
@@ -213,10 +214,24 @@ func (h *PreflightHandler) checkSuspension(ctx context.Context, r *report) {
 	if n, err := h.Chain.GetOffenseCount(ctx, h.WorkerAddr); err == nil {
 		offenses = n.String()
 	}
-	if suspended {
-		r.failf("suspended", "yes — %s offense(s); wait out the cooldown (getSuspendedUntil) before serving", offenses)
-	} else {
+	if !suspended {
 		r.pass("suspended", "no (%s offense(s) on record)", offenses)
+		return
+	}
+	until, err := h.Chain.GetSuspendedUntil(ctx, h.WorkerAddr)
+	if err != nil {
+		r.failf("suspended", "yes — %s offense(s); the cooldown end could not be read: %v", offenses, err)
+		return
+	}
+	head, err := h.Chain.Head(ctx)
+	if err != nil {
+		r.failf("suspended", "yes — %s offense(s); the latest block could not be read: %v", offenses, err)
+		return
+	}
+	if end, left := cooldown(until, head); left > 0 {
+		r.failf("suspended", "yes — %s offense(s); the cooldown ends %s (%s left), then run `lightchain-worker reinstate`", offenses, end, left)
+	} else {
+		r.failf("suspended", "yes — %s offense(s); the cooldown ended %s — run `lightchain-worker reinstate`", offenses, end)
 	}
 }
 
@@ -228,7 +243,7 @@ func (h *PreflightHandler) checkStake(ctx context.Context, r *report, minStake *
 	}
 	if stake.Cmp(minStake) < 0 {
 		short := new(big.Int).Sub(minStake, stake)
-		r.failf("stake", "%s below minimum %s — topUpStake with at least %s", lcai(stake), lcai(minStake), lcai(short))
+		r.failf("stake", "%s below minimum %s — run `lightchain-worker top-up-stake <amount>` with at least %s", lcai(stake), lcai(minStake), lcai(short))
 		return
 	}
 	r.pass("stake", "%s (minimum %s)", lcai(stake), lcai(minStake))
@@ -450,6 +465,14 @@ func networkName(chainID int64) string {
 	return "unknown network"
 }
 
+// cooldown renders when a suspension cooldown ends and how much of it is left
+// as of the head block, whose timestamp is what the contract compares. The
+// chain accepts reinstate once left is no longer positive.
+func cooldown(until *big.Int, head chain.HeadInfo) (end string, left time.Duration) {
+	end = time.Unix(until.Int64(), 0).UTC().Format(time.RFC3339)
+	return end, time.Duration(until.Int64()-head.Timestamp) * time.Second
+}
+
 func lcaiToWei(n int64) *big.Int {
 	return new(big.Int).Mul(big.NewInt(n), big.NewInt(1_000_000_000_000_000_000))
 }
@@ -460,4 +483,19 @@ func lcai(wei *big.Int) string {
 	f.Quo(f, weiPerEther)
 	s := strings.TrimRight(strings.TrimRight(f.Text('f', 4), "0"), ".")
 	return s + " LCAI"
+}
+
+// ParseLCAI reads a positive LCAI amount in plain decimals ("750", "60.25")
+// as wei.
+func ParseLCAI(s string) (*big.Int, error) {
+	whole, frac, _ := strings.Cut(s, ".")
+	digits := whole + frac
+	if digits == "" || len(frac) > 18 || strings.Trim(digits, "0123456789") != "" {
+		return nil, fmt.Errorf("%q is not an LCAI amount — use plain decimals such as 750 or 60.25", s)
+	}
+	wei, _ := new(big.Int).SetString(digits+strings.Repeat("0", 18-len(frac)), 10)
+	if wei.Sign() == 0 {
+		return nil, errors.New("the amount must be more than 0 LCAI")
+	}
+	return wei, nil
 }

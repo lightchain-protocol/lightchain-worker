@@ -239,6 +239,20 @@ func (c *ChainClient) DeregisterWorker(ctx context.Context) error {
 	})
 }
 
+// Reinstate submits a reinstate transaction, lifting this worker's suspension once its cooldown is over.
+func (c *ChainClient) Reinstate(ctx context.Context) error {
+	return c.submitPreparedTx(ctx, "Reinstate", nil, func(opts *bind.TransactOpts) (*types.Transaction, error) {
+		return c.registry.Reinstate(opts)
+	})
+}
+
+// TopUpStake submits a topUpStake transaction, adding amount (wei) to this worker's stake.
+func (c *ChainClient) TopUpStake(ctx context.Context, amount *big.Int) error {
+	return c.submitPreparedTx(ctx, "TopUpStake", amount, func(opts *bind.TransactOpts) (*types.Transaction, error) {
+		return c.registry.TopUpStake(opts)
+	})
+}
+
 // GetMinWorkerStake reads the minimum stake required to register from the AIConfig contract.
 func (c *ChainClient) GetMinWorkerStake(ctx context.Context) (*big.Int, error) {
 	stake, err := c.aiConfig.GetMinWorkerStake(&bind.CallOpts{Context: ctx})
@@ -1173,11 +1187,29 @@ func (c *ChainClient) Balance(ctx context.Context, addr common.Address) (*big.In
 	return bal, nil
 }
 
+// NonceAt returns how many transactions addr had sent as of the given block.
+func (c *ChainClient) NonceAt(ctx context.Context, addr common.Address, block uint64) (uint64, error) {
+	nonce, err := c.ethClient.NonceAt(ctx, addr, new(big.Int).SetUint64(block))
+	if err != nil {
+		return 0, fmt.Errorf("NonceAt %s at block %d: %w", addr.Hex(), block, err)
+	}
+	return nonce, nil
+}
+
 // IsWorkerSuspended reports whether the worker is currently serving a suspension cooldown.
 func (c *ChainClient) IsWorkerSuspended(ctx context.Context, worker common.Address) (bool, error) {
 	v, err := c.registry.IsWorkerSuspended(&bind.CallOpts{Context: ctx}, worker)
 	if err != nil {
 		return false, fmt.Errorf("IsWorkerSuspended %s: %w", worker.Hex(), err)
+	}
+	return v, nil
+}
+
+// GetSuspendedUntil returns the unix time at which the worker's suspension cooldown ends.
+func (c *ChainClient) GetSuspendedUntil(ctx context.Context, worker common.Address) (*big.Int, error) {
+	v, err := c.registry.GetSuspendedUntil(&bind.CallOpts{Context: ctx}, worker)
+	if err != nil {
+		return nil, fmt.Errorf("GetSuspendedUntil %s: %w", worker.Hex(), err)
 	}
 	return v, nil
 }

@@ -315,13 +315,10 @@ func New(cfg *config.Config) (*Service, error) {
 	switch blobMode {
 	case "redis":
 		// Redis blob mode requires a Redis connection for blob I/O.
-		redisOpts, err = redis.ParseURL(cfg.RedisURL)
+		redisOpts, err = redisOptions(cfg)
 		if err != nil {
 			chainClient.Close()
-			return nil, fmt.Errorf("parse Redis URL %q: %w", cfg.RedisURL, err)
-		}
-		if cfg.RedisPassword != "" {
-			redisOpts.Password = cfg.RedisPassword
+			return nil, err
 		}
 		redisClient = redis.NewClient(redisOpts)
 		blobFetcher = blob.NewRedisBlobFetcher(redisClient)
@@ -360,13 +357,10 @@ func New(cfg *config.Config) (*Service, error) {
 	// External profile (sortition + gateway URL) does all three via the
 	// gateway, so Redis is skipped unless BLOB_MODE=redis already dialed one.
 	if cfg.WorkerGatewayURL == "" && redisClient == nil {
-		redisOpts, err = redis.ParseURL(cfg.RedisURL)
+		redisOpts, err = redisOptions(cfg)
 		if err != nil {
 			chainClient.Close()
-			return nil, fmt.Errorf("parse Redis URL %q: %w", cfg.RedisURL, err)
-		}
-		if cfg.RedisPassword != "" {
-			redisOpts.Password = cfg.RedisPassword
+			return nil, err
 		}
 		redisClient = redis.NewClient(redisOpts)
 	}
@@ -463,7 +457,8 @@ func New(cfg *config.Config) (*Service, error) {
 	var voiceEngine pipeline.VoiceEngine
 	if cfg.STTEnabled || cfg.TTSEnabled {
 		voiceEngine = voice.New(cfg.STTSidecarURL, cfg.TTSSidecarURL, cfg.STTTimeout, cfg.TTSTimeout)
-		logger.Info("voice sidecars configured",
+		logger.Info(
+			"voice sidecars configured",
 			"sttEnabled", cfg.STTEnabled,
 			"sttURL", cfg.STTSidecarURL,
 			"ttsEnabled", cfg.TTSEnabled,
@@ -539,8 +534,8 @@ func New(cfg *config.Config) (*Service, error) {
 			SpeechModelName:      cfg.SpeechModelName,
 			TTSMaxChars:          cfg.TTSMaxChars,
 			TTSTimeout:           cfg.TTSTimeout,
-			SearchMaxResults:    cfg.SearchMaxResults,
-			SearchTimeout:       cfg.SearchTimeout,
+			SearchMaxResults:     cfg.SearchMaxResults,
+			SearchTimeout:        cfg.SearchTimeout,
 		},
 		publisher, // nil for internal profiles — fallback wires RedisResponsePublisher
 		checkpoints,
@@ -617,12 +612,12 @@ func New(cfg *config.Config) (*Service, error) {
 				// inert here because gatewayResponsePublisher reports
 				// SupportsChunks()==false, so there is no streamer to
 				// carry the audio frame - the pipeline logs and skips.
-				STTEnabled:  cfg.STTEnabled,
-				TTSEnabled:  cfg.TTSEnabled,
-				TTSVoice:    cfg.TTSVoice,
-				SpeechModelName: cfg.SpeechModelName,
-				TTSMaxChars: cfg.TTSMaxChars,
-				TTSTimeout:  cfg.TTSTimeout,
+				STTEnabled:       cfg.STTEnabled,
+				TTSEnabled:       cfg.TTSEnabled,
+				TTSVoice:         cfg.TTSVoice,
+				SpeechModelName:  cfg.SpeechModelName,
+				TTSMaxChars:      cfg.TTSMaxChars,
+				TTSTimeout:       cfg.TTSTimeout,
 				SearchMaxResults: cfg.SearchMaxResults,
 				SearchTimeout:    cfg.SearchTimeout,
 			},
@@ -824,6 +819,7 @@ func New(cfg *config.Config) (*Service, error) {
 			ChunkSize:         cfg.SortitionChunkSize,
 			Confirmations:     cfg.SortitionConfirmations,
 			SessionRetryLimit: cfg.SortitionSessionRetryLimit,
+			LookbackBlocks:    cfg.SortitionSessionLookbackBlocks,
 			PollInterval:      cfg.SortitionPollInterval,
 			Logger:            logger,
 		})
@@ -956,7 +952,8 @@ func (p *gatewayResponsePublisher) PublishChunk(
 	kind pkgtypes.FrameKind,
 	_ []byte,
 ) {
-	p.logger.Warn("gateway publisher cannot emit chunk frames; dropping delta",
+	p.logger.Warn(
+		"gateway publisher cannot emit chunk frames; dropping delta",
 		"jobID", jobID,
 		"sequence", sequence,
 		"kind", kind.Normalize(),
@@ -1353,6 +1350,16 @@ func (s *Service) shutdown(ctx context.Context) error {
 	default:
 		return shutdownErr
 	}
+}
+
+// redisOptions parses the configured Redis URL. The URL stays out of the
+// error, which ends up in the log: it can hold the Redis password.
+func redisOptions(cfg *config.Config) (*redis.Options, error) {
+	opts, err := config.RedisOptions(cfg.RedisURL, cfg.RedisPassword)
+	if err != nil {
+		return nil, fmt.Errorf("parse Redis URL: %w", err)
+	}
+	return opts, nil
 }
 
 func asynqRedisClientOptFromRedisOptions(opts *redis.Options) asynq.RedisClientOpt {

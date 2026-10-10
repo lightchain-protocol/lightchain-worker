@@ -45,6 +45,8 @@ type InitHandler struct {
 	LoadECDHKey ECDHKeyLoader // creates the ECDH key when registering
 	Preflight   *PreflightHandler
 	Yes         bool // stake without asking
+	// ReconcileSeed is handed to the registration; see Handler.ReconcileSeed.
+	ReconcileSeed *ReconcileSeed
 
 	In     *bufio.Reader // shared by every prompt so none reads ahead of another
 	Out    io.Writer
@@ -196,11 +198,8 @@ func (h *InitHandler) register(ctx context.Context) error {
 	if bal.Cmp(need) < 0 {
 		h.say("register", "note: that leaves under %d LCAI for gas; top up soon after", gasBufferLCAI)
 	}
-	if !h.Yes {
-		answer, _ := h.ask(fmt.Sprintf("Stake %s and register %s on %s? [y/N] ", lcai(stake), h.WorkerAddr.Hex(), networkName(h.ChainID)))
-		if a := strings.ToLower(answer); a != "y" && a != "yes" {
-			return errors.New("registration not confirmed, nothing was staked — re-run `lightchain-worker init` when ready (or pass --yes)")
-		}
+	if !h.Yes && !confirm(h.Out, h.In, fmt.Sprintf("Stake %s and register %s on %s? [y/N] ", lcai(stake), h.WorkerAddr.Hex(), networkName(h.ChainID))) {
+		return errors.New("registration not confirmed, nothing was staked — re-run `lightchain-worker init` when ready (or pass --yes)")
 	}
 
 	reg := &Handler{
@@ -215,6 +214,7 @@ func (h *InitHandler) register(ctx context.Context) error {
 		Out:         h.Out,
 		Logger:      h.Logger,
 	}
+	reg.ReconcileSeed = h.ReconcileSeed
 	if err := reg.Register(ctx); err != nil {
 		return fmt.Errorf("registration failed: %w — re-run `lightchain-worker init` once fixed; it reads the chain before acting", err)
 	}
@@ -251,11 +251,23 @@ func (h *InitHandler) say(step, format string, args ...any) {
 // ask prints a question and returns the trimmed answer; an error means no
 // answer is coming (no terminal, or end of input).
 func (h *InitHandler) ask(question string) (string, error) {
-	_, _ = fmt.Fprint(h.Out, question)
-	if h.In == nil {
+	return ask(h.Out, h.In, question)
+}
+
+// confirm asks a yes-or-no question for init and top-up-stake; anything but
+// y or yes, including no answer at all, is a no.
+func confirm(out io.Writer, in *bufio.Reader, question string) bool {
+	answer, _ := ask(out, in, question)
+	a := strings.ToLower(answer)
+	return a == "y" || a == "yes"
+}
+
+func ask(out io.Writer, in *bufio.Reader, question string) (string, error) {
+	_, _ = fmt.Fprint(out, question)
+	if in == nil {
 		return "", io.EOF
 	}
-	line, err := h.In.ReadString('\n')
+	line, err := in.ReadString('\n')
 	if err != nil && line == "" {
 		return "", err
 	}

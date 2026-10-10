@@ -36,6 +36,8 @@ type RegistrationConfig struct {
 	// takes precedence if set, otherwise RedisURL (direct mode).
 	RedisURL         string
 	WorkerGatewayURL string
+	// RedisPassword, when set, replaces any password embedded in RedisURL.
+	RedisPassword string
 
 	// OllamaURL and BeaconAPIURL are consulted only by the preflight
 	// subcommand. Defaults match the sidecar so preflight probes what the
@@ -79,6 +81,7 @@ func LoadRegistration() (*RegistrationConfig, error) {
 		EncryptionKeystorePath: envOrDefault("ENCRYPTION_KEYSTORE_PATH", "data/worker-encryption.key"),
 		RPCURL:                 envOrDefault("RPC_URL", "http://localhost:8545"),
 		RedisURL:               os.Getenv("REDIS_URL"),
+		RedisPassword:          os.Getenv("REDIS_PASSWORD"),
 		WorkerGatewayURL:       os.Getenv("WORKER_GATEWAY_URL"),
 		OllamaURL:              envOrDefault("OLLAMA_URL", "http://localhost:11434"),
 		BeaconAPIURL:           envOrDefault("BEACON_API_URL", "http://localhost:3500"),

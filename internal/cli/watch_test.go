@@ -332,7 +332,7 @@ func TestWatch_SuspensionAlerts(t *testing.T) {
 	require.Equal(t, []string{"suspended failing"}, titles(got))
 	desc := got[0].Embeds[0].Description
 	assert.Contains(t, desc, time.Unix(fc.until, 0).UTC().Format(time.RFC3339))
-	assert.Contains(t, desc, "reinstate()", "suspension only lifts when the worker reinstates")
+	assert.Contains(t, desc, "`lightchain-worker reinstate`", "suspension only lifts when the worker reinstates")
 
 	fc.suspended = false
 	now = now.Add(h.Interval)
@@ -354,7 +354,7 @@ func TestWatch_SuspensionPastCooldownSaysReinstate(t *testing.T) {
 	got := sink.take()
 	require.Equal(t, []string{"suspended failing"}, titles(got))
 	assert.Contains(t, got[0].Embeds[0].Description, "cooldown ended")
-	assert.Contains(t, got[0].Embeds[0].Description, "reinstate()")
+	assert.Contains(t, got[0].Embeds[0].Description, "`lightchain-worker reinstate`")
 }
 
 func TestWatch_HungRPCStillAlertsWithinTheInterval(t *testing.T) {
@@ -388,6 +388,7 @@ func TestWatch_StakeBelowMinimumAlerts(t *testing.T) {
 	got := sink.take()
 	require.Equal(t, []string{"stake failing"}, titles(got))
 	assert.Contains(t, got[0].Embeds[0].Description, "4925 LCAI below the on-chain minimum 5000 LCAI")
+	assert.Contains(t, got[0].Embeds[0].Description, "`lightchain-worker top-up-stake", "the alert names its fix")
 }
 
 func TestWatch_NotRegisteredAlertsOnceNotPerDerivedCheck(t *testing.T) {
@@ -623,6 +624,47 @@ func TestKeystoreAddress_ReadsWithoutPassword(t *testing.T) {
 	assert.ErrorContains(t, err, "no address")
 	_, err = KeystoreAddress(filepath.Join(dir, "missing.json"))
 	assert.Error(t, err)
+}
+
+func TestWatchWorkerAddress_FlagThenEnvThenKeystore(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	ks := filepath.Join(dir, "ks.json")
+	require.NoError(t, os.WriteFile(ks, []byte(`{"address":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","crypto":{}}`), 0o600))
+	bare := filepath.Join(dir, "bare.json")
+	require.NoError(t, os.WriteFile(bare, []byte(`{"crypto":{}}`), 0o600))
+	flagAddr := common.HexToAddress("0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")
+	envAddr := common.HexToAddress("0xcccccccccccccccccccccccccccccccccccccccc")
+
+	cases := []struct {
+		name     string
+		flag     string
+		env      common.Address
+		keystore string
+		want     common.Address
+		wantErr  string
+	}{
+		{name: "flag first", flag: flagAddr.Hex(), env: envAddr, keystore: ks, want: flagAddr},
+		{name: "env before the keystore", env: envAddr, keystore: ks, want: envAddr},
+		{name: "env, keystore without an address field", env: envAddr, keystore: bare, want: envAddr},
+		{name: "env, no keystore", env: envAddr, want: envAddr},
+		{name: "keystore last", keystore: ks, want: testAddr},
+		{name: "a bad flag is an error, not a fallback", flag: "nope", env: envAddr, keystore: ks, wantErr: `--worker must be a hex address, got "nope"`},
+		{name: "keystore without an address field", keystore: bare, wantErr: "has no address field — set WATCH_WORKER_ADDRESS or pass --worker"},
+		{name: "nothing set", wantErr: "watch needs --worker, WATCH_WORKER_ADDRESS or WORKER_KEYSTORE_PATH"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			got, err := WatchWorkerAddress(tc.flag, tc.env, tc.keystore)
+			if tc.wantErr != "" {
+				require.ErrorContains(t, err, tc.wantErr)
+				return
+			}
+			require.NoError(t, err)
+			assert.Equal(t, tc.want, got)
+		})
+	}
 }
 
 // TestWatch_SourceHasNoWritePath pins "watch never remediates" at the source:

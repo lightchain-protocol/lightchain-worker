@@ -186,11 +186,10 @@ func (h *WatchHandler) chainFindings(ctx context.Context) ([]finding, error) {
 		if err != nil {
 			return nil, err
 		}
-		end := time.Unix(until.Int64(), 0).UTC().Format(time.RFC3339)
-		if until.Int64() > head.Timestamp {
-			f.problem = fmt.Sprintf("worker is suspended by WorkerRegistry until %s; after that it must send reinstate() to claim again", end)
+		if end, left := cooldown(until, head); left > 0 {
+			f.problem = fmt.Sprintf("worker is suspended by WorkerRegistry until %s; after that run `lightchain-worker reinstate` to claim again", end)
 		} else {
-			f.problem = fmt.Sprintf("suspension cooldown ended %s but the worker is still suspended — it must send reinstate() to claim again", end)
+			f.problem = fmt.Sprintf("suspension cooldown ended %s but the worker is still suspended — run `lightchain-worker reinstate` to claim again", end)
 		}
 	}
 	out = append(out, f)
@@ -205,7 +204,7 @@ func (h *WatchHandler) chainFindings(ctx context.Context) ([]finding, error) {
 	}
 	f = finding{check: "stake"}
 	if stake.Cmp(minStake) < 0 {
-		f.problem = fmt.Sprintf("%s below the on-chain minimum %s — top up the stake", lcai(stake), lcai(minStake))
+		f.problem = fmt.Sprintf("%s below the on-chain minimum %s — top it up with `lightchain-worker top-up-stake <amount>`", lcai(stake), lcai(minStake))
 	}
 	out = append(out, f)
 
@@ -414,6 +413,23 @@ func (h *WatchHandler) now() time.Time {
 	return time.Now()
 }
 
+// WatchWorkerAddress picks the worker `watch` reports on: the --worker flag,
+// then WATCH_WORKER_ADDRESS (zero = unset), then the keystore's address field.
+func WatchWorkerAddress(flag string, envAddr common.Address, keystorePath string) (common.Address, error) {
+	switch {
+	case flag != "":
+		if !common.IsHexAddress(flag) {
+			return common.Address{}, fmt.Errorf("--worker must be a hex address, got %q", flag)
+		}
+		return common.HexToAddress(flag), nil
+	case envAddr != (common.Address{}):
+		return envAddr, nil
+	case keystorePath != "":
+		return KeystoreAddress(keystorePath)
+	}
+	return common.Address{}, errors.New("watch needs --worker, WATCH_WORKER_ADDRESS or WORKER_KEYSTORE_PATH")
+}
+
 // KeystoreAddress reads the address field of a v3 keystore file without
 // decrypting it, so `watch` never needs the keystore password.
 func KeystoreAddress(path string) (common.Address, error) {
@@ -428,7 +444,7 @@ func KeystoreAddress(path string) (common.Address, error) {
 		return common.Address{}, fmt.Errorf("parse keystore %s: %w", path, err)
 	}
 	if !common.IsHexAddress(ks.Address) {
-		return common.Address{}, fmt.Errorf("keystore %s has no address field — pass --worker", path)
+		return common.Address{}, fmt.Errorf("keystore %s has no address field — set WATCH_WORKER_ADDRESS or pass --worker", path)
 	}
 	return common.HexToAddress(ks.Address), nil
 }

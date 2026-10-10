@@ -57,8 +57,12 @@ type JobWatcherOpts struct {
 	// wedge the watcher and starve every job behind it. Defaults to 10 when
 	// zero.
 	SessionRetryLimit int
-	PollInterval      time.Duration
-	Logger            *slog.Logger
+	// LookbackBlocks is how far behind the safe head a worker with no stored
+	// cursor starts scanning, instead of at the first block. Jobs submitted
+	// before that are not served. It has no effect once a cursor is stored.
+	LookbackBlocks uint64
+	PollInterval   time.Duration
+	Logger         *slog.Logger
 	// syncServe is an internal test hook. When true, HandleJobPayload is called
 	// synchronously in RunOnce rather than in a goroutine, making unit tests
 	// fully deterministic without WaitGroups or polling. Must not be set in
@@ -79,6 +83,7 @@ type JobWatcher struct {
 	chunk             uint64
 	confs             uint64
 	sessionRetryLimit int
+	lookback          uint64
 	// notActiveRetries counts consecutive chain.ErrSessionNotActive passes per
 	// jobID. Only ever touched from RunOnce, which Start() calls sequentially
 	// off a single ticker goroutine, so no mutex is needed. Cleared on success
@@ -115,6 +120,7 @@ func NewJobWatcher(o JobWatcherOpts) *JobWatcher {
 		chunk:             chunk,
 		confs:             o.Confirmations,
 		sessionRetryLimit: retryLimit,
+		lookback:          o.LookbackBlocks,
 		notActiveRetries:  make(map[uint64]int),
 		interval:          interval,
 		log:               o.Logger,
@@ -184,9 +190,13 @@ func (w *JobWatcher) RunOnce(ctx context.Context) error {
 		safeHead = head.Number - w.confs
 	}
 
-	cursor, err := w.cursor.Get(cursorJobSubmitted)
+	cursor, fresh, err := w.cursor.GetOrSeed(cursorJobSubmitted, safeHead, w.lookback)
 	if err != nil {
 		return err
+	}
+	if fresh {
+		w.log.Info("no job cursor stored; starting behind the safe head",
+			"cursor", cursor, "safeHead", safeHead)
 	}
 
 	if safeHead <= cursor {

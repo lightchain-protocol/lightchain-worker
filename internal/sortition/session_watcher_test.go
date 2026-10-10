@@ -111,12 +111,14 @@ func (m *mockClaimClient) ClaimSession(_ context.Context, reqID uint64) error {
 	return nil
 }
 
-// newSW builds a SessionWatcher backed by a temp CursorStore, with cursor at 0.
+// newSW builds a SessionWatcher backed by a temp CursorStore, with cursor at 0
+// (stored: an absent one would start the watcher at the safe head instead).
 // Returns both the watcher and its CursorStore for test assertions.
 func newSW(t *testing.T, mc *mockClaimClient, counter *atomic.Int32) (*SessionWatcher, *CursorStore) {
 	t.Helper()
 	cs, err := NewCursorStore(t.TempDir())
 	require.NoError(t, err)
+	require.NoError(t, cs.Set(cursorSessionRequested, 0))
 	return NewSessionWatcher(SessionWatcherOpts{
 		Client:        mc,
 		Cursor:        cs,
@@ -167,6 +169,7 @@ func TestSessionWatcher_AdvancesCursor(t *testing.T) {
 	}
 	cs, err := NewCursorStore(t.TempDir())
 	require.NoError(t, err)
+	require.NoError(t, cs.Set(cursorSessionRequested, 0))
 	sw := NewSessionWatcher(SessionWatcherOpts{
 		Client:        mc,
 		Cursor:        cs,
@@ -309,6 +312,7 @@ func newSWWithCaps(t *testing.T, mc *mockClaimClient, counter *atomic.Int32, own
 	t.Helper()
 	cs, err := NewCursorStore(t.TempDir())
 	require.NoError(t, err)
+	require.NoError(t, cs.Set(cursorSessionRequested, 0))
 	return NewSessionWatcher(SessionWatcherOpts{
 		Client:          mc,
 		Cursor:          cs,
@@ -436,6 +440,7 @@ func restartedWatcher(t *testing.T, lookback uint64) (*mockClaimClient, *Session
 	dir := t.TempDir()
 	cs1, err := NewCursorStore(dir)
 	require.NoError(t, err)
+	require.NoError(t, cs1.Set(cursorSessionRequested, 0))
 	first := newSWWithCursor(t, mc, &counter, cs1, lookback)
 	require.NoError(t, first.RunOnce(context.Background()))
 	require.Empty(t, mc.claimed, "ineligible at discovery: no claim")
@@ -524,4 +529,130 @@ func TestSessionWatcher_LookbackGivesUpAfterMaxAttempts(t *testing.T) {
 		}
 	}
 	require.Equal(t, reseedMaxAttempts, attempts, "look-back attempted exactly reseedMaxAttempts times")
+}
+
+// ──────────────────────────────────────────────
+// First pass of a fresh worker (no cursor on disk)
+// ──────────────────────────────────────────────
+
+// A worker with no cursor must not scan the chain from the first block: it
+// starts LookbackBlocks behind the safe head, the same window a restarted
+// worker re-scans behind its cursor.
+func TestSessionWatcher_NoCursorStartsWithinLookbackOfSafeHead(t *testing.T) {
+	var counter atomic.Int32
+	mc := &mockClaimClient{
+		head: chain.HeadInfo{Number: 10_005}, // safe head 10_000 at 5 confirmations
+		requested: []chain.SessionRequestedEvent{
+			{ReqID: 1, BlockNumber: 50},     // months old: behind the look-back
+			{ReqID: 2, BlockNumber: 9_990},  // inside the look-back
+			{ReqID: 3, BlockNumber: 10_003}, // not confirmed yet
+		},
+		eligible: map[uint64]bool{1: true, 2: true, 3: true},
+	}
+	cs, err := NewCursorStore(t.TempDir())
+	require.NoError(t, err)
+	sw := NewSessionWatcher(SessionWatcherOpts{
+		Client:         mc,
+		Cursor:         cs,
+		Worker:         common.HexToAddress("0x0000000000000000000000000000000000000001"),
+		JobCounter:     &counter,
+		MaxConcurrent:  4,
+		ChunkSize:      5000,
+		Confirmations:  5,
+		Logger:         testLogger(t),
+		LookbackBlocks: 60,
+	})
+
+	require.NoError(t, sw.RunOnce(context.Background()))
+	require.Equal(t, [][2]uint64{{9_941, 10_000}}, mc.filterRanges,
+		"only the look-back window behind the safe head is scanned")
+	require.Equal(t, []uint64{2}, mc.claimed)
+	got, err := cs.Get(cursorSessionRequested)
+	require.NoError(t, err)
+	require.Equal(t, uint64(10_000), got, "the cursor ends the pass at the safe head")
+
+	// Later passes scan forward from there, as for any worker with a cursor.
+	mc.head = chain.HeadInfo{Number: 10_015}
+	require.NoError(t, sw.RunOnce(context.Background()))
+	require.Equal(t, [][2]uint64{{9_941, 10_000}, {10_001, 10_010}}, mc.filterRanges)
+	require.Equal(t, []uint64{2, 3}, mc.claimed)
+}
+
+// On a chain shorter than the look-back the window is clamped at the first block.
+func TestSessionWatcher_NoCursorOnShortChainStartsAtFirstBlock(t *testing.T) {
+	var counter atomic.Int32
+	mc := &mockClaimClient{
+		head:      chain.HeadInfo{Number: 100},
+		requested: []chain.SessionRequestedEvent{{ReqID: 1, BlockNumber: 10}},
+		eligible:  map[uint64]bool{1: true},
+	}
+	cs, err := NewCursorStore(t.TempDir())
+	require.NoError(t, err)
+	sw := newSWWithCursor(t, mc, &counter, cs, 2000)
+
+	require.NoError(t, sw.RunOnce(context.Background()))
+	require.Equal(t, [][2]uint64{{1, 100}}, mc.filterRanges)
+	require.Equal(t, []uint64{1}, mc.claimed)
+}
+
+// A stored cursor stays authoritative however far behind the head it is, even a
+// stored 0: that is a cursor, not the absence of one, so discovery resumes
+// right after it instead of jumping to the head.
+func TestSessionWatcher_StoredCursorIsAuthoritative(t *testing.T) {
+	var counter atomic.Int32
+	mc := &mockClaimClient{
+		head: chain.HeadInfo{Number: 10_000},
+		requested: []chain.SessionRequestedEvent{
+			{ReqID: 1, BlockNumber: 50},
+			{ReqID: 2, BlockNumber: 9_990},
+		},
+		eligible: map[uint64]bool{1: true, 2: true},
+	}
+	cs, err := NewCursorStore(t.TempDir())
+	require.NoError(t, err)
+	require.NoError(t, cs.Set(cursorSessionRequested, 0))
+	sw := newSWWithCursor(t, mc, &counter, cs, 60)
+
+	require.NoError(t, sw.RunOnce(context.Background()))
+	require.Equal(t, [][2]uint64{{1, 5000}, {5001, 10_000}}, mc.filterRanges)
+	require.ElementsMatch(t, []uint64{1, 2}, mc.claimed)
+}
+
+// The first scan of a worker with no cursor fails the pass like any discovery
+// scan and is retried until it succeeds; it is never given up on the way the
+// look-back behind a stored cursor is.
+func TestSessionWatcher_NoCursorRetriesAFailedFirstScan(t *testing.T) {
+	var counter atomic.Int32
+	mc := &mockClaimClient{
+		head:      chain.HeadInfo{Number: 10_000},
+		requested: []chain.SessionRequestedEvent{{ReqID: 1, BlockNumber: 9_990}},
+		eligible:  map[uint64]bool{1: true},
+	}
+	cs, err := NewCursorStore(t.TempDir())
+	require.NoError(t, err)
+	sw := newSWWithCursor(t, mc, &counter, cs, 60)
+
+	mc.filterErr, mc.filterErrBelow = errors.New("rate limited"), 10_000
+	for i := 0; i <= reseedMaxAttempts; i++ {
+		require.Error(t, sw.RunOnce(context.Background()))
+	}
+	mc.filterErr = nil
+	require.NoError(t, sw.RunOnce(context.Background()))
+	require.Equal(t, []uint64{1}, mc.claimed)
+}
+
+// A safe head of 0 (a node still syncing, or a chain younger than the
+// confirmations) must not pin the worker to a scan from the first block once
+// the real head shows up.
+func TestSessionWatcher_NoCursorIsNotSeededAtSafeHeadZero(t *testing.T) {
+	var counter atomic.Int32
+	mc := &mockClaimClient{head: chain.HeadInfo{Number: 0}}
+	cs, err := NewCursorStore(t.TempDir())
+	require.NoError(t, err)
+	sw := newSWWithCursor(t, mc, &counter, cs, 60)
+	require.NoError(t, sw.RunOnce(context.Background()))
+
+	mc.head = chain.HeadInfo{Number: 10_000}
+	require.NoError(t, sw.RunOnce(context.Background()))
+	require.Equal(t, [][2]uint64{{9_941, 10_000}}, mc.filterRanges)
 }

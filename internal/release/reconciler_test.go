@@ -117,6 +117,40 @@ func TestReconciler_ResumesFromCursorPlusOne(t *testing.T) {
 	assert.Equal(t, uint64(1001), observedLo, "resume must be cursor+1")
 }
 
+// A worker that registered with a never-used key has its cursor seeded behind
+// its registration by the CLI. Its first pass starts right after that cursor:
+// nothing earlier is read, and a job completed from there on is found.
+func TestReconciler_SeededCursorSkipsOnlyBlocksBeforeIt(t *testing.T) {
+	t.Parallel()
+	store := newReconcilerStore(t)
+	worker := defaultIdentityForTest().WorkerAddress
+
+	const registrationBlock = 2_000_001
+	require.NoError(t, store.SetReconcileBlock(context.Background(), registrationBlock-1))
+
+	var scanned [][2]uint64
+	ch := &stubChain{
+		headFn: func() (chain.HeadInfo, error) { return chain.HeadInfo{Number: 2_000_050, Timestamp: 1000}, nil },
+		filterFn: func(_ common.Address, lo, hi uint64) ([]chain.JobCompletedEvent, error) {
+			scanned = append(scanned, [2]uint64{lo, hi})
+			return []chain.JobCompletedEvent{{JobID: 9, Worker: worker, BlockNumber: registrationBlock}}, nil
+		},
+		stateFn: func(uint64) (chain.JobStateInfo, error) {
+			return chain.JobStateInfo{State: chain.JobStateCompleted, Worker: worker, CompletedAt: 900, EscrowedFee: big.NewInt(1)}, nil
+		},
+	}
+
+	r := NewReconciler(store, ch, worker, DefaultConfig(), nil)
+	require.NoError(t, r.Run(context.Background()))
+
+	assert.Equal(t, [][2]uint64{{registrationBlock, 2_000_045}}, scanned,
+		"one query from the registration block to the safe head, not 400 from block 1")
+	pending, err := store.Pending(context.Background())
+	require.NoError(t, err)
+	require.Len(t, pending, 1)
+	assert.Equal(t, uint64(9), pending[0].JobID)
+}
+
 func TestReconciler_UsesStartBlockOnFirstRun(t *testing.T) {
 	t.Parallel()
 	store := newReconcilerStore(t)

@@ -24,7 +24,7 @@ import (
 // decrypted), the RPC, Redis's heartbeat hash and two HTTP endpoints.
 func runWatch() {
 	fs := flag.NewFlagSet("watch", flag.ExitOnError)
-	workerFlag := fs.String("worker", "", "Worker address (default: the address field of WORKER_KEYSTORE_PATH)")
+	workerFlag := fs.String("worker", "", "Worker address (default: WATCH_WORKER_ADDRESS, then the address field of WORKER_KEYSTORE_PATH)")
 	if err := fs.Parse(os.Args[2:]); err != nil {
 		quitProcess(1)
 	}
@@ -47,21 +47,9 @@ func runWatch() {
 		quitProcess(1)
 	}
 
-	var workerAddr common.Address
-	switch {
-	case *workerFlag != "":
-		if !common.IsHexAddress(*workerFlag) {
-			logger.Error("--worker must be a hex address", "value", *workerFlag)
-			quitProcess(1)
-		}
-		workerAddr = common.HexToAddress(*workerFlag)
-	case cfg.WorkerKeystorePath != "":
-		if workerAddr, err = cli.KeystoreAddress(cfg.WorkerKeystorePath); err != nil {
-			logger.Error("read worker address", "error", err)
-			quitProcess(1)
-		}
-	default:
-		logger.Error("watch needs --worker or WORKER_KEYSTORE_PATH")
+	workerAddr, err := cli.WatchWorkerAddress(*workerFlag, wcfg.WorkerAddress, cfg.WorkerKeystorePath)
+	if err != nil {
+		logger.Error("read worker address", "error", err)
 		quitProcess(1)
 	}
 
@@ -94,13 +82,10 @@ func runWatch() {
 	}
 	// Gateway profiles heartbeat through the worker-gateway, not Redis.
 	if cfg.WorkerGatewayURL == "" {
-		opts, err := redis.ParseURL(wcfg.RedisURL)
+		opts, err := config.RedisOptions(wcfg.RedisURL, wcfg.RedisPassword)
 		if err != nil {
 			logger.Error("parse REDIS_URL", "error", err)
 			quitProcess(1)
-		}
-		if wcfg.RedisPassword != "" {
-			opts.Password = wcfg.RedisPassword
 		}
 		rdb := redis.NewClient(opts)
 		defer func() { _ = rdb.Close() }()

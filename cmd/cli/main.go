@@ -17,6 +17,9 @@
 //	drain       Mark worker ineligible for new sessions (selection-only)
 //	undrain     Reverse drain — restore worker eligibility
 //	deregister  Deregister worker and withdraw stake
+//	reinstate   Lift a suspension once its cooldown is over
+//	top-up-stake [--yes] <amount>
+//	            Add LCAI to the worker's stake, e.g. after a slash
 //	status      Check on-chain registration status
 //	preflight   Read-only go-live checks (RPC, registration, stake, models, gateway, Ollama, beacon)
 //	watch       Read-only daemon that posts webhook alerts when the worker stops being able to claim
@@ -75,6 +78,10 @@ func main() {
 		runRegister()
 	case "add-models":
 		runAddModels()
+	case "reinstate":
+		runReinstate()
+	case "top-up-stake":
+		runTopUpStake()
 	case "deregister":
 		runDeregister()
 	case "drain":
@@ -119,6 +126,14 @@ Commands:
   drain       Mark worker ineligible for new sessions (selection-only)
   undrain     Reverse drain — restore worker eligibility
   deregister  Deregister worker and withdraw stake
+  reinstate   Lift a suspension once its cooldown is over. Sends nothing unless
+              the worker is suspended and its stake meets the on-chain minimum;
+              before the cooldown ends it prints when that is.
+  top-up-stake [--yes] <amount>
+              Add <amount> LCAI (e.g. 750 or 60.25) to the worker's stake, as a
+              slash can leave it under the on-chain minimum. Asks before
+              sending; --yes, ahead of the amount, skips the question. A
+              suspended worker still needs reinstate afterwards.
   status      Check on-chain registration status
   preflight   Read-only go-live checks: RPC, registration, stake vs on-chain
               minimum, models, gateway, Ollama, beacon. Exit 1 on any failure.
@@ -131,7 +146,10 @@ Commands:
 
 balance/withdraw/release additionally require JOB_REGISTRY_ADDRESS.
 release additionally reads RELEASE_STATE_PATH (and other RELEASE_* vars).
-drain/undrain require REDIS_URL (direct mode) or WORKER_GATEWAY_URL
+init/register write RELEASE_STATE_PATH too when they register a never-used key
+(needs JOB_REGISTRY_ADDRESS): the worker then looks for its completed jobs from
+its registration on instead of scanning the whole chain on its first start.
+drain/undrain require REDIS_URL (direct mode, with REDIS_PASSWORD if set) or WORKER_GATEWAY_URL
 (gateway mode). In direct mode, LIGHTCHAIN_DRAIN_TTL optionally
 overrides the chain-derived default TTL (disputeWindow + slack).
 LIGHTCHAIN_DRAIN_SLACK overrides the slack added to the dispute
@@ -174,8 +192,9 @@ is minted server-side). OLLAMA_URL and BEACON_API_URL default to the
 sidecar's localhost values.
 
 watch flags:
-  --worker <address>    Watch this address (default: the address field of
-                        WORKER_KEYSTORE_PATH, read without the password).
+  --worker <address>    Watch this address (default: WATCH_WORKER_ADDRESS, then
+                        the address field of WORKER_KEYSTORE_PATH, read
+                        without the password).
 watch reads the worker's env file plus WATCH_WEBHOOK_URL (required),
 WATCH_INTERVAL (30s), WATCH_COOLDOWN (1h: minimum gap between repeat
 alerts for a check that stays failing) and WATCH_MISSED_CLAIMS (3: sessions
@@ -260,6 +279,7 @@ func runRegister() {
 		Out:         os.Stdout,
 		Logger:      logger,
 	}
+	h.ReconcileSeed = newReconcileSeed(cfg, chainClient, logger)
 
 	ctx, cancel := context.WithTimeout(context.Background(), txTimeout)
 	defer cancel()
@@ -316,6 +336,69 @@ func runDeregister() {
 	if err := h.Deregister(ctx); err != nil {
 		logger.Error("deregistration failed", "error", err)
 		os.Exit(1)
+	}
+}
+
+func runReinstate() {
+	cfg, logger := loadAndValidateCfg()
+	signingKey, workerAddr := loadSigningKey(cfg, logger)
+
+	chainClient := dialChain(cfg, signingKey, logger)
+	defer chainClient.Close()
+
+	h := &cli.Handler{
+		Reinstatement: chainClient,
+		WorkerAddr:    workerAddr,
+		Out:           os.Stdout,
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), txTimeout)
+	defer cancel()
+
+	if err := h.Reinstate(ctx); err != nil {
+		fmt.Fprintln(os.Stderr, "reinstate:", err)
+		quitProcess(1)
+	}
+}
+
+func runTopUpStake() {
+	fs := flag.NewFlagSet("top-up-stake", flag.ExitOnError)
+	yes := fs.Bool("yes", false, "Send without asking")
+	if err := fs.Parse(os.Args[2:]); err != nil {
+		quitProcess(1)
+	}
+	if fs.NArg() != 1 {
+		fmt.Fprintln(os.Stderr, "usage: lightchain-worker top-up-stake [--yes] <amount in LCAI>")
+		quitProcess(1)
+		return
+	}
+	amount, err := cli.ParseLCAI(fs.Arg(0))
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "top-up-stake:", err)
+		quitProcess(1)
+		return
+	}
+
+	cfg, logger := loadAndValidateCfg()
+	signingKey, workerAddr := loadSigningKey(cfg, logger)
+
+	chainClient := dialChain(cfg, signingKey, logger)
+	defer chainClient.Close()
+
+	h := &cli.Handler{
+		Reinstatement: chainClient,
+		WorkerAddr:    workerAddr,
+		Yes:           *yes,
+		In:            bufio.NewReader(os.Stdin),
+		Out:           os.Stdout,
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), txTimeout)
+	defer cancel()
+
+	if err := h.TopUpStake(ctx, amount); err != nil {
+		fmt.Fprintln(os.Stderr, "top-up-stake:", err)
+		quitProcess(1)
 	}
 }
 
@@ -494,6 +577,7 @@ func runInit() {
 	defer chainClient.Close()
 	h.Chain = chainClient
 	h.Preflight = newPreflightHandler(cfg, chainClient, signingKey, h.WorkerAddr, modelIDs, modelNames, logger)
+	h.ReconcileSeed = newReconcileSeed(cfg, chainClient, logger)
 
 	// Covers the stake prompt, the registration and model transactions, and preflight.
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
@@ -501,6 +585,26 @@ func runInit() {
 	if err := h.Run(ctx); err != nil {
 		fmt.Fprintln(os.Stderr, "init:", err)
 		quitProcess(1)
+	}
+}
+
+// newReconcileSeed wires what `init` and `register` need to have a fresh
+// worker's release reconciler resume after the safe head read at its
+// registration. It reads the same RELEASE_* variables as `release` and the
+// sidecar, so all three use one state file. Nil (they cannot be read) only
+// skips the seed: registration never depends on it.
+func newReconcileSeed(cfg *config.RegistrationConfig, chainClient *chain.ChainClient, logger *slog.Logger) *cli.ReconcileSeed {
+	releaseCfg, err := release.ConfigFromEnv()
+	if err != nil {
+		logger.Warn("release config invalid; the release state will not be prepared", "error", err)
+		return nil
+	}
+	return &cli.ReconcileSeed{
+		Chain:         chainClient,
+		ChainID:       uint64(cfg.ChainID),
+		JobRegistry:   cfg.JobRegistryAddress,
+		StatePath:     releaseCfg.StatePath,
+		Confirmations: releaseCfg.Confirmations,
 	}
 }
 
@@ -573,7 +677,7 @@ func newDrainHandler(
 		return nil
 	}
 
-	opts, err := redis.ParseURL(cfg.RedisURL)
+	opts, err := config.RedisOptions(cfg.RedisURL, cfg.RedisPassword)
 	if err != nil {
 		logger.Error("parse REDIS_URL failed", "error", err)
 		quitProcess(1)
