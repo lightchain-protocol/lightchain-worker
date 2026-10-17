@@ -177,10 +177,28 @@ const SelfContainedCapability = "self-contained"
 // SearchCapability is declared by a worker configured for web search.
 const SearchCapability = "search"
 
+// PublicOutputCapability is declared by a worker that serves public-output
+// jobs: envelope v4 `output: public`, answered as the plaintext public
+// response R (github.com/lightchain/pkg/publicresp) instead of ciphertext.
+// A session that requires it never lands on a worker that would encrypt.
+const PublicOutputCapability = "public-output"
+
+// ExactProfileCapability is declared by an operator who runs the pinned
+// deterministic profile for exact-match jobs (one GPU class, one engine
+// build, no batching). It is an operator assertion, measured in shadow mode.
+const ExactProfileCapability = "exact-profile"
+
 // DesiredCapabilities is the capability list this binary declares on chain:
-// self-contained always, search only when it is configured.
-func DesiredCapabilities(search bool) []string {
+// self-contained always, search only when it is configured, public-output
+// unless the operator turned it off, exact-profile only when asserted.
+func DesiredCapabilities(search, publicOutput, exactProfile bool) []string {
 	caps := []string{SelfContainedCapability}
+	if publicOutput {
+		caps = append(caps, PublicOutputCapability)
+	}
+	if publicOutput && exactProfile {
+		caps = append(caps, ExactProfileCapability)
+	}
 	if search {
 		caps = append(caps, SearchCapability)
 	}

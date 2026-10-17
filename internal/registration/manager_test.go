@@ -584,7 +584,7 @@ func TestDesiredCapabilities_DeclaresSelfContained(t *testing.T) {
 				},
 			}
 
-			NewManager(mock, testAddr, nil, newLogger()).EnsureCapabilities(context.Background(), DesiredCapabilities(tc.search))
+			NewManager(mock, testAddr, nil, newLogger()).EnsureCapabilities(context.Background(), DesiredCapabilities(tc.search, false, false))
 
 			require.NotNil(t, setMask)
 			assert.Zero(t, setMask.Cmp(big.NewInt(tc.want)), "declared mask %s", setMask)
@@ -609,10 +609,22 @@ func TestDesiredCapabilities_SelfContainedNotRegistered(t *testing.T) {
 		},
 	}
 
-	NewManager(mock, testAddr, nil, logger).EnsureCapabilities(context.Background(), DesiredCapabilities(false))
+	NewManager(mock, testAddr, nil, logger).EnsureCapabilities(context.Background(), DesiredCapabilities(false, false, false))
 
 	assert.Contains(t, logs.String(), "capability not registered on-chain")
 	assert.Contains(t, logs.String(), SelfContainedCapability)
 	require.NotNil(t, setMask, "the dropped search bit must still be cleared")
 	assert.Zero(t, setMask.Sign())
+}
+
+func TestDesiredCapabilities_PublicOutputAndExactProfile(t *testing.T) {
+	t.Parallel()
+
+	assert.Equal(t, []string{SelfContainedCapability}, DesiredCapabilities(false, false, false))
+	assert.Equal(t, []string{SelfContainedCapability, PublicOutputCapability}, DesiredCapabilities(false, true, false))
+	assert.ElementsMatch(t,
+		[]string{SelfContainedCapability, SearchCapability, PublicOutputCapability, ExactProfileCapability},
+		DesiredCapabilities(true, true, true))
+	assert.Equal(t, []string{SelfContainedCapability}, DesiredCapabilities(false, false, true),
+		"exact-profile is meaningless without public output")
 }

@@ -530,6 +530,9 @@ func New(cfg *config.Config) (*Service, error) {
 			StreamChunkTokens:    cfg.StreamChunkTokens,
 			StreamChunkInterval:  cfg.StreamChunkInterval,
 			ModelOptions:         cfg.ModelOptions,
+			PublicOutput:         cfg.PublicOutputEnabled,
+			PublicMaxNumCtx:      cfg.OllamaNumCtx,
+			PublicMaxNumPredict:  cfg.OllamaNumPredict,
 			DeadlineGuardEnabled: cfg.DeadlineGuardEnabled,
 			SettleReserve:        cfg.SettleReserve,
 			CompletionReserve:    cfg.CompletionReserve,
@@ -604,7 +607,10 @@ func New(cfg *config.Config) (*Service, error) {
 				AckOverlapEnabled: cfg.AckOverlapEnabled,
 				// MODEL_OPTIONS applies in gateway mode too: tier caps are
 				// generation parameters, independent of the delivery channel.
-				ModelOptions: cfg.ModelOptions,
+				ModelOptions:        cfg.ModelOptions,
+				PublicOutput:        cfg.PublicOutputEnabled,
+				PublicMaxNumCtx:     cfg.OllamaNumCtx,
+				PublicMaxNumPredict: cfg.OllamaNumPredict,
 				// The deadline guard matters just as much in gateway mode:
 				// the gateway retries failed jobs with its own backoff, and
 				// every guard abort is cheap (pre-inference), so the
@@ -784,7 +790,9 @@ func New(cfg *config.Config) (*Service, error) {
 		// Every failure degrades to an empty mask — unconstrained requests
 		// stay claimable and the on-chain claimSession check remains the
 		// guarantee for constrained ones.
-		desiredCaps := registration.DesiredCapabilities(cfg.SearchEnabled && cfg.TavilyAPIKey != "")
+		desiredCaps := registration.DesiredCapabilities(
+			cfg.SearchEnabled && cfg.TavilyAPIKey != "", cfg.PublicOutputEnabled, cfg.ExactProfile,
+		)
 		capCtx, capCancel := context.WithTimeout(context.Background(), 30*time.Second)
 		registration.NewManager(chainClient, workerAddr, nil, logger).EnsureCapabilities(capCtx, desiredCaps)
 		capCancel()

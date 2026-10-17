@@ -163,6 +163,20 @@ type HandlerConfig struct {
 	// an empty map reproduces pre-override request bodies byte for byte.
 	ModelOptions map[string]ollama.ClientOptions
 
+	// PublicOutput serves envelope v4 public-output jobs (config
+	// PUBLIC_OUTPUT). Such a job runs on a pinned copy of the inference
+	// client (the envelope's numCtx and numPredict, temperature 0, the
+	// deterministic seed, thinking off, the envelope's format) and commits
+	// the plaintext public response R instead of a ciphertext. When off,
+	// a public job is refused without retry rather than silently
+	// encrypted: an encrypted answer can never be delivered to the
+	// contract that asked for it, and refusing lets the fee be refunded.
+	// PublicMaxNumCtx and PublicMaxNumPredict bound what a job may ask
+	// for (0 or negative: no bound); a job over them is refused the same way.
+	PublicOutput        bool
+	PublicMaxNumCtx     int
+	PublicMaxNumPredict int
+
 	// DeadlineGuardEnabled turns on the on-chain deadline guard: the
 	// pipeline reads job.deadline at pickup, before inference, and before
 	// the stage-8a blob tx, and aborts with a no-retry error when the job
@@ -197,16 +211,16 @@ type HandlerConfig struct {
 	// answer is unaffected). TTSTimeout bounds one synthesis call; zero
 	// falls back to 20 s. It also feeds the deadline budget check together
 	// with a fixed stream margin.
-	STTEnabled  bool
-	TTSEnabled  bool
-	TTSVoice    string
+	STTEnabled bool
+	TTSEnabled bool
+	TTSVoice   string
 	// SpeechModelName is the model whose jobs settle audio rather than
 	// text. Empty leaves the speech path inert.
-	SpeechModelName string
-	TTSMaxChars int
-	TTSTimeout  time.Duration
-	SearchMaxResults    int
-	SearchTimeout       time.Duration
+	SpeechModelName  string
+	TTSMaxChars      int
+	TTSTimeout       time.Duration
+	SearchMaxResults int
+	SearchTimeout    time.Duration
 }
 
 // ResponsePublisher publishes encrypted responses for real-time delivery.
@@ -1208,11 +1222,23 @@ func (h *JobHandler) runInferencePipeline(
 	envelope, err := promptenv.Decode([]byte(promptText))
 	if err != nil {
 		err = fmt.Errorf("stage 5 (decode prompt): %w", err)
-		// A malformed self-contained job fails the same way on every attempt.
-		if errors.Is(err, promptenv.ErrInvalidSelfContained) {
+		// A malformed self-contained or public job fails the same way on
+		// every attempt.
+		if errors.Is(err, promptenv.ErrInvalidSelfContained) || errors.Is(err, promptenv.ErrInvalidPublic) {
 			return nil, 0, noRetry(err)
 		}
 		return nil, 0, err
+	}
+	// A public-output job replaces the operator's generation knobs with the
+	// envelope's and commits its answer in the clear. Anything that stops
+	// that from being replayable is a refusal, not a best effort.
+	var pub *publicJob
+	if envelope.Public() {
+		pub, err = h.preparePublicJob(&envelope, prompt, searchEnabled, modelName)
+		if err != nil {
+			return nil, 0, noRetry(fmt.Errorf("stage 5 (public output): %w", err))
+		}
+		infClient, effectiveOpts, overrideApplied = pub.client, pub.client.Options(), true
 	}
 	// The speech model reads one text aloud and has no chat call for a
 	// conversation, so a self-contained job for it can never be served.
@@ -1357,21 +1383,35 @@ func (h *JobHandler) runInferencePipeline(
 	// disputer can reproduce the exact augmented prompt on replay. For plain
 	// (non-search) jobs EncodeResponse returns raw answer bytes — byte-identical
 	// to the legacy format.
+	//
+	// A public-output job commits the canonical public response R in
+	// plaintext instead: the terminal frame, the blob and completeJob all
+	// carry R itself, and keccak256(R) is what the agent contract checks.
 	rec = h.metrics.StartStage(metrics.StageEncrypt, model, delivery)
-	respBytes, encErr := searchaug.EncodeResponse(response, searchSources)
-	if encErr != nil {
-		rec.End(metrics.OutcomeError, metrics.CacheMiss)
-		return nil, 0, fmt.Errorf("stage 6 (encode response): %w", encErr)
-	}
-	ciphertext, err := pkgcrypto.Encrypt(sessionKey, respBytes)
-	if err != nil {
-		rec.End(metrics.OutcomeError, metrics.CacheMiss)
-		return nil, streamer.frames(), fmt.Errorf("stage 6 (encrypt response): %w", err)
+	var ciphertext []byte
+	if pub != nil {
+		ciphertext, err = pub.encode(response)
+		if err != nil {
+			rec.End(metrics.OutcomeError, metrics.CacheMiss)
+			return nil, streamer.frames(), noRetry(fmt.Errorf("stage 6 (encode public response): %w", err))
+		}
+	} else {
+		respBytes, encErr := searchaug.EncodeResponse(response, searchSources)
+		if encErr != nil {
+			rec.End(metrics.OutcomeError, metrics.CacheMiss)
+			return nil, 0, fmt.Errorf("stage 6 (encode response): %w", encErr)
+		}
+		ciphertext, err = pkgcrypto.Encrypt(sessionKey, respBytes)
+		if err != nil {
+			rec.End(metrics.OutcomeError, metrics.CacheMiss)
+			return nil, streamer.frames(), fmt.Errorf("stage 6 (encrypt response): %w", err)
+		}
 	}
 	d = rec.End(metrics.OutcomeOK, metrics.CacheMiss)
 	logger.Info(
 		"stage 6 complete",
 		"stage", "encrypt",
+		"public", pub != nil,
 		"ciphertextBytes", len(ciphertext),
 		"durationMs", d.Milliseconds(),
 	)

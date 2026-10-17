@@ -57,11 +57,18 @@ type Config struct {
 	// Web search (Tavily). SearchEnabled gates advertisement of the "search"
 	// capability and the per-job search stage. When false the worker behaves
 	// exactly as before.
-	SearchEnabled    bool
-	TavilyAPIKey     string
-	TavilyURL        string
-	SearchTimeout    time.Duration
-	SearchMaxResults int
+	SearchEnabled bool
+	// PublicOutputEnabled serves envelope v4 public-output jobs and
+	// advertises the "public-output" capability. Default on; turn it off
+	// on an engine without JSON-schema `format` support. ExactProfile
+	// additionally advertises "exact-profile": the operator asserts the
+	// pinned deterministic profile for exact-match action jobs.
+	PublicOutputEnabled bool
+	ExactProfile        bool
+	TavilyAPIKey        string
+	TavilyURL           string
+	SearchTimeout       time.Duration
+	SearchMaxResults    int
 	// OllamaStream selects stream=true inference. When true the worker
 	// publishes incremental `chunk` frames as tokens arrive, collapsing
 	// time-to-first-token from full generation time to ~1s. The terminal
@@ -461,6 +468,11 @@ func Load() (*Config, error) {
 	}
 	cfg.OllamaTimeout = parseDuration("OLLAMA_TIMEOUT", "120s", &errs)
 	cfg.SearchEnabled = parseBool("SEARCH_ENABLED", false, &errs)
+	cfg.PublicOutputEnabled = parseBool("PUBLIC_OUTPUT", true, &errs)
+	cfg.ExactProfile = parseBool("EXACT_PROFILE", false, &errs)
+	if cfg.ExactProfile && !cfg.PublicOutputEnabled {
+		errs = append(errs, "EXACT_PROFILE requires PUBLIC_OUTPUT")
+	}
 	cfg.SearchTimeout = parseDuration("SEARCH_TIMEOUT", "10s", &errs)
 	cfg.SearchMaxResults = parseInt("SEARCH_MAX_RESULTS", 5, &errs)
 	cfg.AckTxTimeout = parseDuration("ACK_TX_TIMEOUT", "15s", &errs)
