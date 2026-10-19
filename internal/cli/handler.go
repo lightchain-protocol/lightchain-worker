@@ -180,7 +180,7 @@ func (h *Handler) RemoveModels(ctx context.Context) error {
 		h.Logger.Info("model removed", "model", h.ModelNames[i])
 	}
 
-	fmt.Fprintf(h.Out, "Removed %d of %d models for worker %s\n", removed, len(h.ModelIDs), h.WorkerAddr.Hex())
+	_, _ = fmt.Fprintf(h.Out, "Removed %d of %d models for worker %s\n", removed, len(h.ModelIDs), h.WorkerAddr.Hex())
 	if len(failed) > 0 {
 		return fmt.Errorf("%d model(s) not removed (a model the worker never supported reverts): %s",
 			len(failed), strings.Join(failed, "; "))

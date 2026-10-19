@@ -73,7 +73,7 @@ func runPublicJob(t *testing.T, plaintext, engineText string, cfg func(*HandlerC
 	t.Helper()
 	mr := miniredis.RunT(t)
 	rc := redis.NewClient(&redis.Options{Addr: mr.Addr()})
-	t.Cleanup(func() { rc.Close() })
+	t.Cleanup(func() { _ = rc.Close() })
 
 	run := &publicRun{plaintext: plaintext}
 	sessionKey := testSessionKey(t)
