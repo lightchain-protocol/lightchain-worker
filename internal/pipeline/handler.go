@@ -287,6 +287,7 @@ type ReleaseTracker interface {
 // the gateway via HandleJobPayload.
 type JobHandler struct {
 	chainClient       JobExecutionClient
+	abandonFailedJobs bool
 	blobFetcher       BlobFetcher
 	blobSubmitter     BlobSubmitter
 	keyStore          SessionKeyGetter
@@ -753,14 +754,67 @@ const errorFramePublishTimeout = 5 * time.Second
 // failed. It stays silent when the answer was already delivered, because an
 // error frame then would replace a delivered answer with an error.
 func (h *JobHandler) reportFailure(ctx context.Context, p JobPayload, err error) {
-	if h.responsePublisher == nil || errors.Is(err, errAnswerDelivered) {
+	if errors.Is(err, errAnswerDelivered) {
 		return
 	}
-	// A cancelled job context (timeout, shutdown) is often why the job
-	// failed; the consumer still needs to hear about it.
-	pubCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), errorFramePublishTimeout)
-	defer cancel()
-	h.responsePublisher.PublishError(pubCtx, p.JobID, p.SessionID, p.CorrelationID)
+	if h.responsePublisher != nil {
+		// A cancelled job context (timeout, shutdown) is often why the job
+		// failed; the consumer still needs to hear about it.
+		pubCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), errorFramePublishTimeout)
+		defer cancel()
+		h.responsePublisher.PublishError(pubCtx, p.JobID, p.SessionID, p.CorrelationID)
+	}
+	h.abandonOnChain(ctx, p, err)
+}
+
+// jobAbandoner is implemented by chain clients that can hand a failed job back
+// to the registry (JobRegistry.abandonJob). Optional so test doubles and older
+// deployments without the method keep working unchanged.
+type jobAbandoner interface {
+	AbandonJob(ctx context.Context, jobID uint64) error
+}
+
+// abandonTxTimeout bounds the best-effort abandon tx so a dead RPC cannot
+// hold the handler after the job already failed.
+const abandonTxTimeout = 90 * time.Second
+
+// SetAbandonFailedJobs turns on the on-chain abandon of failed jobs. Off by
+// default: JobRegistry.abandonJob only exists from the abandonJob upgrade on,
+// and before it every call would just revert.
+func (h *JobHandler) SetAbandonFailedJobs(on bool) { h.abandonFailedJobs = on }
+
+// abandonOnChain settles a failed job on chain so it stops counting toward this
+// worker's in-flight cap. Until the job settles the registry keeps it
+// Acknowledged for deadline + resolutionTimeout (48 h on mainnet), and a worker
+// with maxConcurrentJobs of those is refused by SessionManager.eligibleNow:
+// its models look available and every request for them times out. Best effort:
+// a failure here is logged and nothing else, the keeper's no-fault settle still
+// clears the job later. Runs in the background so the error frame the consumer
+// is waiting on is not delayed by a transaction.
+func (h *JobHandler) abandonOnChain(ctx context.Context, p JobPayload, cause error) {
+	if !h.abandonFailedJobs || h.chainClient == nil {
+		return
+	}
+	ab, ok := h.chainClient.(jobAbandoner)
+	if !ok {
+		return
+	}
+	// A job whose answer is already on chain must not be abandoned.
+	if errors.Is(cause, errAnswerDelivered) {
+		return
+	}
+	go func() {
+		txCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), abandonTxTimeout)
+		defer cancel()
+		if err := ab.AbandonJob(txCtx, p.JobID); err != nil {
+			// JobNotInState: it completed, timed out or was already settled meanwhile; nothing to do.
+			h.logger.Warn("abandonJob failed; the keeper's no-fault settle will clear it later",
+				"jobID", p.JobID, "sessionID", p.SessionID, "error", err)
+			return
+		}
+		h.logger.Info("job abandoned on chain: fee refunded, in-flight slot released",
+			"jobID", p.JobID, "sessionID", p.SessionID, "cause", cause.Error())
+	}()
 }
 
 // processJob executes the 8-stage inference pipeline.

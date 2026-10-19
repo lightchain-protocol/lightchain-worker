@@ -559,6 +559,7 @@ func New(cfg *config.Config) (*Service, error) {
 	// A chat job's earlier jobs come from the chain on every intake, as the
 	// disputer finds them to re-run the job, never from a dispatcher's index.
 	handler.SetPriorJobLister(chainClient)
+	handler.SetAbandonFailedJobs(cfg.AbandonFailedJobs)
 
 	// --- Gateway mode: skip Asynq and direct Redis heartbeat ---
 	// SortitionEnabled takes precedence: if both are set we already warned above
@@ -644,6 +645,7 @@ func New(cfg *config.Config) (*Service, error) {
 			gwHandler.SetVoiceEngine(voiceEngine)
 		}
 		gwHandler.SetPriorJobLister(chainClient)
+		gwHandler.SetAbandonFailedJobs(cfg.AbandonFailedJobs)
 
 		logger.Info(
 			"worker service initialized (gateway mode)",
@@ -821,6 +823,8 @@ func New(cfg *config.Config) (*Service, error) {
 			Logger:          logger,
 			OwnCapabilities: ownCaps,
 			LookbackBlocks:  cfg.SortitionSessionLookbackBlocks,
+
+			MaxRequestAgeBlocks: cfg.SortitionMaxRequestAgeBlocks,
 		})
 		jobWatcher = sortition.NewJobWatcher(sortition.JobWatcherOpts{
 			Client:            chainClient,

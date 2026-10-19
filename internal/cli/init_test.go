@@ -198,6 +198,8 @@ func (c *initChain) RegisterWorker(_ context.Context, encKey []byte, stake *big.
 	return nil
 }
 
+func (c *initChain) RemoveSupportedModel(context.Context, [32]byte) error { return nil }
+
 func (c *initChain) AddSupportedModel(_ context.Context, id [32]byte) error {
 	c.addCalls = append(c.addCalls, id)
 	if c.addErr != nil {

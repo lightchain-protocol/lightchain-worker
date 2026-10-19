@@ -155,6 +155,39 @@ func (h *Handler) AddModels(ctx context.Context) error {
 	return nil
 }
 
+// RemoveModels removes models from an already-registered worker's on-chain
+// list. SUPPORTED_MODELS in the environment only decides what the worker
+// serves; sortition routes by the registry, so a model the box can no longer
+// serve has to leave the registry too or its session requests keep landing
+// here and timing out.
+func (h *Handler) RemoveModels(ctx context.Context) error {
+	if len(h.ModelIDs) == 0 {
+		return fmt.Errorf("SUPPORTED_MODELS is required for remove-models: list the models to remove")
+	}
+	if len(h.ModelNames) != len(h.ModelIDs) {
+		return fmt.Errorf("ModelNames length %d does not match ModelIDs length %d", len(h.ModelNames), len(h.ModelIDs))
+	}
+
+	var failed []string
+	removed := 0
+	for i, modelID := range h.ModelIDs {
+		if err := h.Client.RemoveSupportedModel(ctx, modelID); err != nil {
+			h.Logger.Error("remove model failed", "model", h.ModelNames[i], "index", i, "error", err)
+			failed = append(failed, fmt.Sprintf("%q: %v", h.ModelNames[i], err))
+			continue
+		}
+		removed++
+		h.Logger.Info("model removed", "model", h.ModelNames[i])
+	}
+
+	fmt.Fprintf(h.Out, "Removed %d of %d models for worker %s\n", removed, len(h.ModelIDs), h.WorkerAddr.Hex())
+	if len(failed) > 0 {
+		return fmt.Errorf("%d model(s) not removed (a model the worker never supported reverts): %s",
+			len(failed), strings.Join(failed, "; "))
+	}
+	return nil
+}
+
 // Deregister removes the worker from the registry and withdraws stake.
 func (h *Handler) Deregister(ctx context.Context) error {
 	mgr := registration.NewManager(h.Client, h.WorkerAddr, nil, h.Logger)

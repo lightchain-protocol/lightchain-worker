@@ -51,6 +51,7 @@ func (m *mockClient) RegisterWorker(ctx context.Context, encryptionPubKey []byte
 func (m *mockClient) AddSupportedModel(ctx context.Context, modelID [32]byte) error {
 	return m.addSupportedModelFn(ctx, modelID)
 }
+func (m *mockClient) RemoveSupportedModel(context.Context, [32]byte) error { return nil }
 
 func (m *mockClient) DeregisterWorker(ctx context.Context) error {
 	return m.deregisterWorkerFn(ctx)
