@@ -224,6 +224,13 @@ func (c *ChainClient) AddSupportedModel(ctx context.Context, modelID [32]byte) e
 	})
 }
 
+// RemoveSupportedModel drops a model from this worker's on-chain list (WorkerRegistry.removeSupportedModel).
+func (c *ChainClient) RemoveSupportedModel(ctx context.Context, modelID [32]byte) error {
+	return c.submitPreparedTx(ctx, "RemoveSupportedModel", nil, func(opts *bind.TransactOpts) (*types.Transaction, error) {
+		return c.registry.RemoveSupportedModel(opts, modelID)
+	})
+}
+
 // SetCapabilities declares this worker's full on-chain capability mask (overwrite, not merge)..
 func (c *ChainClient) SetCapabilities(ctx context.Context, mask *big.Int) error {
 	return c.submitPreparedTx(ctx, "SetCapabilities", nil, func(opts *bind.TransactOpts) (*types.Transaction, error) {
@@ -673,6 +680,17 @@ func (c *ChainClient) AcknowledgeJobAsync(
 		return common.Hash{}, nil, err
 	}
 	return pending.Hash(), pending.Wait, nil
+}
+
+// AbandonJob hands a job the worker cannot finish back to the registry
+// (JobRegistry.abandonJob): the consumer's fee is refunded and the job leaves
+// this worker's in-flight count at once instead of after deadline +
+// resolutionTimeout. Without it a worker that fails a few jobs an hour fills
+// the maxConcurrentJobs cap and the chain refuses its session claims.
+func (c *ChainClient) AbandonJob(ctx context.Context, jobID uint64) error {
+	return c.submitPreparedTx(ctx, "AbandonJob", nil, func(opts *bind.TransactOpts) (*types.Transaction, error) {
+		return c.jobRegistry.AbandonJob(opts, new(big.Int).SetUint64(jobID))
+	})
 }
 
 // CompleteJob submits a completeJob transaction with a single bytes32 response

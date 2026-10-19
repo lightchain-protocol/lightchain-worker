@@ -303,6 +303,52 @@ func TestSessionWatcher_DropsExpiredRequest(t *testing.T) {
 	require.NotContains(t, sw.pending, uint64(1), "expired request must be pruned from pending")
 }
 
+// A request older than MaxRequestAgeBlocks was abandoned by its consumer (the
+// consumer-api stops waiting after its claim timeout); claiming it would only
+// spend a tx on a session nobody uses. A fresh request on the same pass is
+// still claimed.
+func TestSessionWatcher_DropsStaleRequest(t *testing.T) {
+	var counter atomic.Int32
+	mc := &mockClaimClient{
+		head: chain.HeadInfo{Number: 1000},
+		requested: []chain.SessionRequestedEvent{
+			{ReqID: 1, BlockNumber: 100, RequestBlock: 100}, // 900 blocks old
+			{ReqID: 2, BlockNumber: 990, RequestBlock: 990}, // 10 blocks old
+		},
+		eligible: map[uint64]bool{1: true, 2: true},
+	}
+	cs, err := NewCursorStore(t.TempDir())
+	require.NoError(t, err)
+	require.NoError(t, cs.Set(cursorSessionRequested, 0))
+	sw := NewSessionWatcher(SessionWatcherOpts{
+		Client:              mc,
+		Cursor:              cs,
+		Worker:              common.HexToAddress("0x0000000000000000000000000000000000000001"),
+		JobCounter:          &counter,
+		MaxConcurrent:       4,
+		ChunkSize:           5000,
+		Logger:              testLogger(t),
+		MaxRequestAgeBlocks: 150,
+	})
+	require.NoError(t, sw.RunOnce(context.Background()))
+	require.Equal(t, []uint64{2}, mc.claimed, "only the fresh request is claimed")
+	require.NotContains(t, sw.pending, uint64(1), "stale request must leave pending")
+	require.NotContains(t, sw.requestBlock, uint64(1), "stale request bookkeeping must be dropped")
+}
+
+// With the age check off (the default of a zero option) nothing is dropped for age.
+func TestSessionWatcher_AgeCheckDisabledByDefault(t *testing.T) {
+	var counter atomic.Int32
+	mc := &mockClaimClient{
+		head:      chain.HeadInfo{Number: 1000},
+		requested: []chain.SessionRequestedEvent{{ReqID: 1, BlockNumber: 100, RequestBlock: 100}},
+		eligible:  map[uint64]bool{1: true},
+	}
+	sw, _ := newSW(t, mc, &counter)
+	require.NoError(t, sw.RunOnce(context.Background()))
+	require.Equal(t, []uint64{1}, mc.claimed)
+}
+
 // ──────────────────────────────────────────────
 // Capability-aware claiming
 // ──────────────────────────────────────────────

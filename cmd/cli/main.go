@@ -78,6 +78,8 @@ func main() {
 		runRegister()
 	case "add-models":
 		runAddModels()
+	case "remove-models":
+		runRemoveModels()
 	case "reinstate":
 		runReinstate()
 	case "top-up-stake":
@@ -312,6 +314,35 @@ func runAddModels() {
 
 	if err := h.AddModels(ctx); err != nil {
 		logger.Error("add-models failed", "error", err)
+		os.Exit(1)
+	}
+}
+
+// runRemoveModels takes SUPPORTED_MODELS as the list of models to REMOVE from
+// the worker's on-chain set, e.g.
+//   SUPPORTED_MODELS=deepseek-r1:32b lightchain-worker remove-models
+func runRemoveModels() {
+	cfg, logger := loadAndValidateCfg()
+	signingKey, workerAddr := loadSigningKey(cfg, logger)
+	modelIDs, modelNames := parseModels(cfg, logger)
+
+	chainClient := dialChain(cfg, signingKey, logger)
+	defer chainClient.Close()
+
+	h := &cli.Handler{
+		Client:     chainClient,
+		WorkerAddr: workerAddr,
+		ModelIDs:   modelIDs,
+		ModelNames: modelNames,
+		Out:        os.Stdout,
+		Logger:     logger,
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), txTimeout)
+	defer cancel()
+
+	if err := h.RemoveModels(ctx); err != nil {
+		logger.Error("remove-models failed", "error", err)
 		os.Exit(1)
 	}
 }

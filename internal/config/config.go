@@ -57,11 +57,18 @@ type Config struct {
 	// Web search (Tavily). SearchEnabled gates advertisement of the "search"
 	// capability and the per-job search stage. When false the worker behaves
 	// exactly as before.
-	SearchEnabled    bool
-	TavilyAPIKey     string
-	TavilyURL        string
-	SearchTimeout    time.Duration
-	SearchMaxResults int
+	SearchEnabled bool
+	// PublicOutputEnabled serves envelope v4 public-output jobs and
+	// advertises the "public-output" capability. Default on; turn it off
+	// on an engine without JSON-schema `format` support. ExactProfile
+	// additionally advertises "exact-profile": the operator asserts the
+	// pinned deterministic profile for exact-match action jobs.
+	PublicOutputEnabled bool
+	ExactProfile        bool
+	TavilyAPIKey        string
+	TavilyURL           string
+	SearchTimeout       time.Duration
+	SearchMaxResults    int
 	// OllamaStream selects stream=true inference. When true the worker
 	// publishes incremental `chunk` frames as tokens arrive, collapsing
 	// time-to-first-token from full generation time to ~1s. The terminal
@@ -312,6 +319,11 @@ type Config struct {
 
 	// Sortition mode (Phase 3 — worker self-claims sessions, no dispatcher).
 	SortitionEnabled       bool
+	// AbandonFailedJobs makes the worker call JobRegistry.abandonJob for a job
+	// it failed, refunding the consumer and freeing its in-flight slot at once
+	// instead of after deadline + resolutionTimeout. Needs the abandonJob
+	// contract upgrade; off by default until it is live (ABANDON_FAILED_JOBS).
+	AbandonFailedJobs bool
 	SessionManagerAddress  common.Address
 	SortitionStateDir      string
 	SortitionChunkSize     uint64
@@ -326,6 +338,12 @@ type Config struct {
 	// (1800 blocks at 2 s slots, 600 at 6 s); raise it where callers open
 	// requests with longer expiries. Defaults to 2000; 0 disables.
 	SortitionSessionLookbackBlocks uint64
+	// SortitionMaxRequestAgeBlocks drops a pending session request once it is
+	// this many blocks old without a claim. The consumer-api stops waiting 60 s
+	// after it requested the session and never provides keys for it, so a
+	// claim after that only spends gas on a session nobody uses. Defaults to
+	// 150 (5 min at 2 s slots, 15 min at 6 s); 0 disables.
+	SortitionMaxRequestAgeBlocks uint64
 	// SortitionSessionRetryLimit bounds how many passes the JobWatcher retries
 	// a job whose session is not Active before giving up and skipping it, so
 	// one session that never returns to Active cannot wedge the watcher and
@@ -461,6 +479,12 @@ func Load() (*Config, error) {
 	}
 	cfg.OllamaTimeout = parseDuration("OLLAMA_TIMEOUT", "120s", &errs)
 	cfg.SearchEnabled = parseBool("SEARCH_ENABLED", false, &errs)
+	cfg.AbandonFailedJobs = parseBool("ABANDON_FAILED_JOBS", false, &errs)
+	cfg.PublicOutputEnabled = parseBool("PUBLIC_OUTPUT", true, &errs)
+	cfg.ExactProfile = parseBool("EXACT_PROFILE", false, &errs)
+	if cfg.ExactProfile && !cfg.PublicOutputEnabled {
+		errs = append(errs, "EXACT_PROFILE requires PUBLIC_OUTPUT")
+	}
 	cfg.SearchTimeout = parseDuration("SEARCH_TIMEOUT", "10s", &errs)
 	cfg.SearchMaxResults = parseInt("SEARCH_MAX_RESULTS", 5, &errs)
 	cfg.AckTxTimeout = parseDuration("ACK_TX_TIMEOUT", "15s", &errs)
@@ -564,6 +588,7 @@ func Load() (*Config, error) {
 	cfg.SortitionPollInterval = parseDuration("SORTITION_POLL_INTERVAL", "1s", &errs)
 	cfg.SortitionConfirmations = parseUint64("SORTITION_CONFIRMATIONS", 0, &errs)
 	cfg.SortitionSessionLookbackBlocks = parseUint64("SORTITION_SESSION_LOOKBACK_BLOCKS", 2000, &errs)
+	cfg.SortitionMaxRequestAgeBlocks = parseUint64("SORTITION_MAX_REQUEST_AGE_BLOCKS", 150, &errs)
 	cfg.SortitionSessionRetryLimit = parseInt("SORTITION_SESSION_RETRY_LIMIT", 10, &errs)
 
 	if len(errs) > 0 {
