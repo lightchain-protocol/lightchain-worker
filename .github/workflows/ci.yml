@@ -67,8 +67,9 @@ jobs:
 
       # New issues only: those on lines changed since the previous commit, which for a pull request is the branch it
       # merges into. The findings the code already had do not fail the check.
-      - uses: golangci/golangci-lint-action@v9
+      - uses: golangci/golangci-lint-action@ba0d7d2ec06a0ea1cb5fa41b2e4a3ab91d21278a # v9.3.0
         with:
+          version: v2.14.0
           working-directory: worker
           args: --new-from-rev=HEAD~
 
@@ -101,17 +102,17 @@ jobs:
           git -C pkg checkout --quiet FETCH_HEAD
           echo "pkg at $(git -C pkg rev-parse --short HEAD)"
 
-      - uses: docker/setup-buildx-action@v4
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
 
       - if: github.event_name == 'push'
-        uses: docker/login-action@v4
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ github.token }}
 
       - id: meta
-        uses: docker/metadata-action@v6
+        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
         with:
           images: ghcr.io/lightchain-protocol/worker
           # No "latest" tag, which a version tag would otherwise add: a deployment names the version or the commit.
@@ -123,7 +124,7 @@ jobs:
             type=sha,prefix=,enable=${{ github.ref_type != 'tag' }}
 
       # A pull request builds the image and throws it away; only a push publishes it.
-      - uses: docker/build-push-action@v7
+      - uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: .
           file: worker/Dockerfile
