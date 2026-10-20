@@ -44,4 +44,6 @@ git tag v1.2.3 <commit> && git push origin v1.2.3
 
 CI runs the checks on the tag, publishes the image as `ghcr.io/lightchain-protocol/worker:v1.2.3`, and creates the GitHub release with everything `make release` writes to `dist/`: one CLI binary per platform (`lightchain-worker-{linux,darwin}-{amd64,arm64}`), `install.sh`, and a `checksums.txt` (SHA-256) covering them all. The release notes are generated from the merged pull requests and can be edited afterwards.
 
+Release binaries and the image carry the tag: `lightchain-worker version` prints it, with the commit when the build recorded one, and the worker logs it on start. A plain `go build` reports `dev`.
+
 The installer downloads from `…/releases/latest/download/` (or `…/releases/download/<tag>/` with `LIGHTCHAIN_WORKER_VERSION`), so a release must carry all of those files. A tag with a hyphen (`v1.2.3-rc.1`) becomes a pre-release: it can be installed by naming it, and `latest` stays where it was.

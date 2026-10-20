@@ -130,6 +130,8 @@ jobs:
           push: ${{ github.event_name == 'push' }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
+          # The tag, branch or commit the image is published as, so lightchain-worker version names it.
+          build-args: VERSION=${{ steps.meta.outputs.version }}
 
   # A version tag only, and after the image, so a release never exists without the image of the same version. A tag
   # with a hyphen (v1.2.3-rc.1) becomes a pre-release, which GitHub does not serve as "latest", so the installer's

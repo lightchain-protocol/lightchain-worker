@@ -28,6 +28,7 @@ import (
 	pkgtypes "github.com/lightchain/pkg/types"
 
 	"github.com/lightchain/worker/internal/blob"
+	"github.com/lightchain/worker/internal/buildinfo"
 	"github.com/lightchain/worker/internal/chain"
 	"github.com/lightchain/worker/internal/config"
 	gw "github.com/lightchain/worker/internal/gateway"
@@ -1461,6 +1462,8 @@ func checksumHexNoPrefix(addr common.Address) string {
 // down and returns the process exit code. The sidecar binary and the CLI's
 // `run` command both use it, so a host can serve with the CLI binary alone.
 func Main() int {
+	slog.Info("lightchain worker starting", "build", buildinfo.String())
+
 	cfg, err := config.Load()
 	if err != nil {
 		slog.Error("config load failed", "error", err)
