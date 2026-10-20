@@ -361,7 +361,7 @@ func runRemoveModels() {
 // runAbandonStuck sweeps this worker's in-flight backlog (see cli.AbandonStuck).
 // Each abandon is one transaction, so the budget is txTimeout per job plus the scan.
 func runAbandonStuck() {
-	cfg, logger := loadAndValidateCfg()
+	cfg, logger := loadAndValidateForSettlement()
 	signingKey, workerAddr := loadSigningKey(cfg, logger)
 
 	lookback := uint64(150_000)

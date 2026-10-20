@@ -84,7 +84,7 @@ func AbandonStuck(ctx context.Context, o AbandonStuckOpts) (abandoned int, err e
 			}
 		}
 	}
-	fmt.Fprintf(o.Out, "worker %s: %d jobs submitted in blocks %d-%d\n", o.Worker.Hex(), len(mine), from, head.Number)
+	_, _ = fmt.Fprintf(o.Out, "worker %s: %d jobs submitted in blocks %d-%d\n", o.Worker.Hex(), len(mine), from, head.Number)
 
 	// Phase 2: the ones still in flight.
 	var stuck []uint64
@@ -98,12 +98,12 @@ func AbandonStuck(ctx context.Context, o AbandonStuckOpts) (abandoned int, err e
 			stuck = append(stuck, id)
 		}
 	}
-	fmt.Fprintf(o.Out, "in flight (Submitted/Acknowledged): %d\n", len(stuck))
+	_, _ = fmt.Fprintf(o.Out, "in flight (Submitted/Acknowledged): %d\n", len(stuck))
 	if len(stuck) == 0 {
 		return 0, nil
 	}
 	if o.DryRun {
-		fmt.Fprintf(o.Out, "dry run: would abandon %v\n", stuck)
+		_, _ = fmt.Fprintf(o.Out, "dry run: would abandon %v\n", stuck)
 		return 0, nil
 	}
 
@@ -121,7 +121,7 @@ func AbandonStuck(ctx context.Context, o AbandonStuckOpts) (abandoned int, err e
 		abandoned++
 		log.Info("job abandoned: fee refunded, in-flight slot released", "jobID", id)
 	}
-	fmt.Fprintf(o.Out, "abandoned %d of %d\n", abandoned, len(stuck))
+	_, _ = fmt.Fprintf(o.Out, "abandoned %d of %d\n", abandoned, len(stuck))
 	if len(failed) > 0 {
 		return abandoned, fmt.Errorf("%d job(s) could not be abandoned (already settled, or the tx reverted): %v", len(failed), failed)
 	}
