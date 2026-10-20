@@ -34,6 +34,7 @@ import (
 	"log/slog"
 	"os"
 	"slices"
+	"strconv"
 	"strings"
 	"time"
 
@@ -80,6 +81,8 @@ func main() {
 		runAddModels()
 	case "remove-models":
 		runRemoveModels()
+	case "abandon-stuck":
+		runAbandonStuck()
 	case "reinstate":
 		runReinstate()
 	case "top-up-stake":
@@ -125,6 +128,14 @@ Commands:
   keygen      Generate/load ECDH encryption key and print public key hex
   register    Register worker on-chain (stake + encryption key + models)
   add-models  Add models to an already-registered worker
+  remove-models
+              Remove the models named in SUPPORTED_MODELS from the worker's
+              on-chain list (sortition routes by the registry, not the env)
+  abandon-stuck
+              Hand back every job of this worker still Submitted/Acknowledged
+              on chain (JobRegistry.abandonJob): refunds the consumer, frees the
+              in-flight slot. ABANDON_LOOKBACK_BLOCKS (default 150000) bounds
+              the scan, ABANDON_DRY_RUN=1 only lists.
   drain       Mark worker ineligible for new sessions (selection-only)
   undrain     Reverse drain — restore worker eligibility
   deregister  Deregister worker and withdraw stake
@@ -343,6 +354,43 @@ func runRemoveModels() {
 
 	if err := h.RemoveModels(ctx); err != nil {
 		logger.Error("remove-models failed", "error", err)
+		os.Exit(1)
+	}
+}
+
+// runAbandonStuck sweeps this worker's in-flight backlog (see cli.AbandonStuck).
+// Each abandon is one transaction, so the budget is txTimeout per job plus the scan.
+func runAbandonStuck() {
+	cfg, logger := loadAndValidateForSettlement()
+	signingKey, workerAddr := loadSigningKey(cfg, logger)
+
+	lookback := uint64(150_000)
+	if v := os.Getenv("ABANDON_LOOKBACK_BLOCKS"); v != "" {
+		n, err := strconv.ParseUint(v, 10, 64)
+		if err != nil {
+			logger.Error("ABANDON_LOOKBACK_BLOCKS must be a whole number of blocks", "value", v)
+			os.Exit(2)
+		}
+		lookback = n
+	}
+	dryRun := os.Getenv("ABANDON_DRY_RUN") == "1"
+
+	chainClient := dialChain(cfg, signingKey, logger)
+	defer chainClient.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Minute)
+	defer cancel()
+
+	n, err := cli.AbandonStuck(ctx, cli.AbandonStuckOpts{
+		Client:         chainClient,
+		Worker:         workerAddr,
+		LookbackBlocks: lookback,
+		DryRun:         dryRun,
+		Out:            os.Stdout,
+		Logger:         logger,
+	})
+	if err != nil {
+		logger.Error("abandon-stuck finished with errors", "abandoned", n, "error", err)
 		os.Exit(1)
 	}
 }
