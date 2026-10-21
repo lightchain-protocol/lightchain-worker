@@ -31,12 +31,13 @@ jobs:
     outputs:
       pkg: ${{ steps.pkg.outputs.rev }}
     steps:
-      # Two commits deep, so the lint step can compare with the commit before this one.
+      # Deep enough for the lint step's base: two commits for a pull request, the whole history for a push (all of it
+      # is a few megabytes).
       - &checkout
         uses: actions/checkout@v7
         with:
           path: worker
-          fetch-depth: 2
+          fetch-depth: ${{ github.event_name == 'push' && '0' || '2' }}
           persist-credentials: false
 
       # The shared package at the branch this build is for: the pull request's target, or the pushed branch. A version
@@ -65,13 +66,15 @@ jobs:
 
       - run: go build ./...
 
-      # New issues only: those on lines changed since the previous commit, which for a pull request is the branch it
-      # merges into. The findings the code already had do not fail the check.
+      # New issues only: those on lines this run's change touches. A pull request compares with the branch it merges
+      # into, a push with the commit the branch was on before, so every commit of a push is linted, not only the
+      # last. A tag has no earlier commit and compares with its parent. The findings the code already had do not fail
+      # the check.
       - uses: golangci/golangci-lint-action@ba0d7d2ec06a0ea1cb5fa41b2e4a3ab91d21278a # v9.3.0
         with:
           version: v2.14.0
           working-directory: worker
-          args: --new-from-rev=HEAD~
+          args: --new-from-rev=${{ github.event_name == 'push' && github.ref_type == 'branch' && github.event.before || 'HEAD~' }}
 
       - run: go test ./...
 
