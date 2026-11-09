@@ -90,9 +90,19 @@ type JobWatcher struct {
 	// off a single ticker goroutine, so no mutex is needed. Cleared on success
 	// or on give-up.
 	notActiveRetries map[uint64]int
-	interval         time.Duration
-	log              *slog.Logger
-	syncServe        bool
+	// dispatched maps each job this process has handed to HandleJobPayload to
+	// the block of its JobSubmitted event. Capacity and transient-error stops
+	// park the cursor before an event's block, so the next pass rescans the
+	// whole block; jobs in it that were already handed over (in flight or
+	// finished) are skipped instead of dispatched again. Entries are pruned
+	// once the cursor has moved past their block, which bounds the set by the
+	// jobs in the blocks still ahead of the cursor. Only touched from runOnce
+	// (sequential), so no mutex is needed. Empty after a restart: the
+	// on-chain completion check covers that case.
+	dispatched map[uint64]uint64
+	interval   time.Duration
+	log        *slog.Logger
+	syncServe  bool
 	// jobs counts the serve goroutines still running, so Start can wait for
 	// them before it returns.
 	jobs sync.WaitGroup
@@ -126,6 +136,7 @@ func NewJobWatcher(o JobWatcherOpts) *JobWatcher {
 		sessionRetryLimit: retryLimit,
 		lookback:          o.LookbackBlocks,
 		notActiveRetries:  make(map[uint64]int),
+		dispatched:        make(map[uint64]uint64),
 		interval:          interval,
 		log:               o.Logger,
 		syncServe:         o.syncServe,
@@ -148,7 +159,22 @@ func (w *JobWatcher) stopAndRetry(ev chain.JobSubmittedEvent, lo uint64) error {
 	if ev.BlockNumber > 0 {
 		stopAt = ev.BlockNumber - 1
 	}
-	return w.cursor.Set(cursorJobSubmitted, stopAt)
+	return w.setCursor(stopAt)
+}
+
+// setCursor persists the cursor and drops dispatched entries at or below it:
+// the cursor never moves back past a persisted position, so those blocks are
+// never rescanned.
+func (w *JobWatcher) setCursor(block uint64) error {
+	if err := w.cursor.Set(cursorJobSubmitted, block); err != nil {
+		return err
+	}
+	for id, b := range w.dispatched {
+		if b <= block {
+			delete(w.dispatched, id)
+		}
+	}
+	return nil
 }
 
 // Start polls on each tick until ctx is cancelled, then returns once the jobs
@@ -178,9 +204,13 @@ func (w *JobWatcher) Start(ctx, jobCtx context.Context) {
 // the pipeline via HandleJobPayload. Cursor is advanced to each chunk's hi
 // after the chunk is processed, unless capacity forced an early return.
 //
-// Replay-on-restart is safe: the pipeline checks HasJobAcknowledged and
-// HasJobCompleted on-chain before re-doing work, so re-serving an already-done
-// job is idempotent. No separate served-set is maintained.
+// A stop parks the cursor before the event's block, so the next pass rescans
+// that whole block. Re-serving a job is idempotent in the pipeline but not
+// free: each re-dispatch takes a job slot and chain RPC, and at capacity that
+// makes the watcher stop at the same event on every pass while the jobs
+// behind it miss their deadlines. So a job is served at most once per
+// process (the dispatched set), and after a restart a job already completed
+// on chain is skipped.
 //
 // A serve error (e.g. transient pipeline failure) is logged at warn and is
 // not fatal to the pass — the cursor still advances. The pipeline's own
@@ -234,12 +264,17 @@ func (w *JobWatcher) runOnce(ctx, jobCtx context.Context) error {
 				continue
 			}
 
+			// Already handed to the pipeline by this process (in flight or
+			// finished): a rescan of its block must not serve it again.
+			if _, done := w.dispatched[ev.JobID]; done {
+				continue
+			}
+
 			// Capacity check: if already at max concurrent jobs, stop this pass
 			// WITHOUT advancing the cursor past this event. Persist cursor to one
 			// block before this event so the next poll pass rescans from
-			// ev.BlockNumber. Replay is safe because HandleJobPayload is
-			// idempotent — the pipeline checks HasJobAcknowledged/HasJobCompleted
-			// on-chain before re-running any stage.
+			// ev.BlockNumber; the events in that block that were already served
+			// are skipped above.
 			if int(w.counter.Load()) >= w.maxJobs {
 				if stopErr := w.stopAndRetry(ev, lo); stopErr != nil {
 					return stopErr
@@ -291,7 +326,7 @@ func (w *JobWatcher) runOnce(ctx, jobCtx context.Context) error {
 				continue
 			}
 
-			promptHash, _, submitBlock, _, blobErr := w.c.GetJobBlobInfo(ctx, ev.JobID)
+			promptHash, _, submitBlock, completeBlock, blobErr := w.c.GetJobBlobInfo(ctx, ev.JobID)
 			if blobErr != nil {
 				// TRANSIENT: stop-and-retry (see stopAndRetry doc).
 				w.log.Warn("get job blob info failed, retrying next pass",
@@ -300,6 +335,15 @@ func (w *JobWatcher) runOnce(ctx, jobCtx context.Context) error {
 					return stopErr
 				}
 				return nil
+			}
+			if completeBlock != 0 {
+				// Completed on chain (completeJob sets completionBlockNumber).
+				// Reached after a restart, when the dispatched set is empty
+				// and the cursor still sits before this block. Serving it
+				// again would only send a completeJob that reverts.
+				w.log.Info("job already completed on chain, skipping",
+					"jobId", ev.JobID, "completionBlock", completeBlock)
+				continue
 			}
 			si, siErr := w.c.GetSessionInfo(ctx, ev.SessionID)
 			if siErr != nil {
@@ -328,6 +372,7 @@ func (w *JobWatcher) runOnce(ctx, jobCtx context.Context) error {
 			// jobs itself once it has decoded the prompt, and only for a job
 			// that is not self-contained.
 
+			w.dispatched[ev.JobID] = ev.BlockNumber
 			if w.syncServe {
 				// Test hook: synchronous serve makes tests deterministic without
 				// goroutine synchronisation primitives or polling.
@@ -345,7 +390,7 @@ func (w *JobWatcher) runOnce(ctx, jobCtx context.Context) error {
 			}
 		}
 
-		if setErr := w.cursor.Set(cursorJobSubmitted, hi); setErr != nil {
+		if setErr := w.setCursor(hi); setErr != nil {
 			return setErr
 		}
 	}

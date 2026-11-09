@@ -36,8 +36,9 @@ type mockServeClient struct {
 }
 
 type mockBlobInfo struct {
-	promptHash  common.Hash
-	submitBlock uint64
+	promptHash    common.Hash
+	submitBlock   uint64
+	completeBlock uint64 // non-zero once the job is completed on chain
 }
 
 func (m *mockServeClient) Head(_ context.Context) (chain.HeadInfo, error) {
@@ -60,7 +61,7 @@ func (m *mockServeClient) FilterJobSubmitted(_ context.Context, from, to uint64)
 
 func (m *mockServeClient) GetJobBlobInfo(_ context.Context, jobID uint64) (common.Hash, common.Hash, uint64, uint64, error) {
 	if r, ok := m.blobInfos[jobID]; ok {
-		return r.promptHash, common.Hash{}, r.submitBlock, 0, nil
+		return r.promptHash, common.Hash{}, r.submitBlock, r.completeBlock, nil
 	}
 	return common.Hash{}, common.Hash{}, 0, 0, errors.New("no blob info")
 }
@@ -528,4 +529,157 @@ func TestJobWatcher_StoredCursorIsAuthoritative(t *testing.T) {
 	require.NoError(t, jw.RunOnce(context.Background()))
 	require.Equal(t, [][2]uint64{{1, 5000}, {5001, 10_000}}, mc.filterRanges)
 	require.Len(t, sink.received(), 2)
+}
+
+// ── no re-dispatch of jobs already served ────────────────────────────────────
+
+// slotSink models the pipeline's slot accounting: every HandleJobPayload call
+// takes a job slot (counter) and keeps it until the test completes the job,
+// which also marks it completed on chain. It records every call.
+type slotSink struct {
+	counter  *atomic.Int32
+	chain    *mockServeClient
+	calls    map[uint64]int
+	inFlight []uint64
+}
+
+func (s *slotSink) HandleJobPayload(_ context.Context, p pipeline.JobPayload) error {
+	s.calls[p.JobID]++
+	s.counter.Add(1)
+	s.inFlight = append(s.inFlight, p.JobID)
+	return nil
+}
+
+// completeAll finishes every in-flight job: frees its slot and records the
+// completion on chain at block completeAt.
+func (s *slotSink) completeAll(completeAt uint64) {
+	for _, id := range s.inFlight {
+		bi := s.chain.blobInfos[id]
+		bi.completeBlock = completeAt
+		s.chain.blobInfos[id] = bi
+		s.counter.Add(-1)
+	}
+	s.inFlight = nil
+}
+
+// sameBlockChain returns a chain with n jobs for this worker (IDs 1..n), all
+// submitted in block 20, plus one job for another worker in the same block.
+func sameBlockChain(n int) *mockServeClient {
+	mc := &mockServeClient{
+		head:          chain.HeadInfo{Number: 100},
+		encWorkerKeys: map[uint64][]byte{10: []byte("encKey")},
+		blobInfos:     map[uint64]mockBlobInfo{},
+		sessionInfos:  map[uint64]chain.SessionInfo{10: {Worker: testMyWorker, Status: 1}},
+	}
+	for id := uint64(1); id <= uint64(n); id++ {
+		mc.jobSubmitted = append(mc.jobSubmitted, chain.JobSubmittedEvent{
+			JobID: id, SessionID: 10, Worker: testMyWorker, BlockNumber: 20,
+		})
+		if id == 2 {
+			mc.jobSubmitted = append(mc.jobSubmitted, chain.JobSubmittedEvent{
+				JobID: 100, SessionID: 11, Worker: testOtherWorker, BlockNumber: 20,
+			})
+		}
+		mc.blobInfos[id] = mockBlobInfo{submitBlock: 20}
+	}
+	return mc
+}
+
+// TestJobWatcher_SameBlockAtCapacity_DispatchesEachJobOnce is the 2026-11-09
+// devnet starvation: six jobs for this worker land in one block and the
+// worker runs two at a time. Capacity parks the cursor before that block, so
+// every pass rescans it. Jobs already handed to the pipeline must not be
+// handed over again: a re-dispatch takes a slot, the watcher hits capacity at
+// the same event again, and the jobs behind it starve.
+func TestJobWatcher_SameBlockAtCapacity_DispatchesEachJobOnce(t *testing.T) {
+	const nJobs = 6
+	var counter atomic.Int32
+	mc := sameBlockChain(nJobs)
+	sink := &slotSink{counter: &counter, chain: mc, calls: map[uint64]int{}}
+	cs, err := NewCursorStore(t.TempDir())
+	require.NoError(t, err)
+	require.NoError(t, cs.Set(cursorJobSubmitted, 0))
+	jw := NewJobWatcher(JobWatcherOpts{
+		Client:        mc,
+		KeyChecker:    &mockKeyChecker{canDecrypt: true},
+		Sink:          sink,
+		Cursor:        cs,
+		Worker:        testMyWorker,
+		JobCounter:    &counter,
+		MaxConcurrent: 2,
+		ChunkSize:     5000,
+		Logger:        testLogger(t),
+		syncServe:     true,
+	})
+
+	// Each pass, the jobs started in the previous pass finish. Ten passes is
+	// far more than the three a correct watcher needs for six jobs at two.
+	for pass := 1; pass <= 10; pass++ {
+		require.NoError(t, jw.RunOnce(context.Background()))
+		sink.completeAll(30 + uint64(pass))
+	}
+
+	total := 0
+	for _, n := range sink.calls {
+		total += n
+	}
+	t.Logf("HandleJobPayload calls: %d total for %d jobs, per job %v", total, nJobs, sink.calls)
+	for id := uint64(1); id <= nJobs; id++ {
+		require.Equal(t, 1, sink.calls[id], "job %d must be dispatched exactly once", id)
+	}
+	require.Equal(t, nJobs, total, "no job dispatched more than once, none missed")
+	require.NotContains(t, sink.calls, uint64(100), "other worker's job must not be dispatched")
+
+	got, err := cs.Get(cursorJobSubmitted)
+	require.NoError(t, err)
+	require.Equal(t, uint64(100), got, "cursor must reach the safe head once every job is served")
+	require.Empty(t, jw.dispatched, "dispatched set must be pruned once the cursor passes the block")
+}
+
+// TestJobWatcher_Restart_SkipsJobCompletedOnChain covers a restart: the
+// in-memory dispatched set is empty and the cursor still sits before the
+// block, so the rescan must recognise the job completed on chain and skip it
+// rather than hand it to the pipeline again.
+func TestJobWatcher_Restart_SkipsJobCompletedOnChain(t *testing.T) {
+	var counter atomic.Int32
+	mc := sameBlockChain(3)
+	bi := mc.blobInfos[1]
+	bi.completeBlock = 25 // job 1 finished before the restart
+	mc.blobInfos[1] = bi
+	sink := &mockJobSink{}
+	jw, cs := newJW(t, mc, &mockKeyChecker{canDecrypt: true}, sink, &counter)
+	require.NoError(t, cs.Set(cursorJobSubmitted, 19)) // parked before block 20
+
+	require.NoError(t, jw.RunOnce(context.Background()))
+
+	var ids []uint64
+	for _, p := range sink.received() {
+		ids = append(ids, p.JobID)
+	}
+	require.Equal(t, []uint64{2, 3}, ids, "completed job 1 is skipped, the rest are served")
+	got, err := cs.Get(cursorJobSubmitted)
+	require.NoError(t, err)
+	require.Equal(t, uint64(100), got)
+}
+
+// TestJobWatcher_RetryableFailureBeforeDispatch_StillRetried verifies that a
+// job whose lookup failed before it reached HandleJobPayload is not treated
+// as dispatched: the next pass serves it.
+func TestJobWatcher_RetryableFailureBeforeDispatch_StillRetried(t *testing.T) {
+	var counter atomic.Int32
+	mc := sameBlockChain(1)
+	sessions := mc.sessionInfos
+	mc.sessionInfos = map[uint64]chain.SessionInfo{} // GetSessionInfo fails
+	sink := &mockJobSink{}
+	jw, cs := newJW(t, mc, &mockKeyChecker{canDecrypt: true}, sink, &counter)
+
+	require.NoError(t, jw.RunOnce(context.Background()))
+	require.Empty(t, sink.received())
+	got, err := cs.Get(cursorJobSubmitted)
+	require.NoError(t, err)
+	require.Equal(t, uint64(19), got)
+
+	mc.sessionInfos = sessions
+	require.NoError(t, jw.RunOnce(context.Background()))
+	require.Len(t, sink.received(), 1, "job must be served once the lookup succeeds")
 }
