@@ -6,12 +6,14 @@ import (
 	"errors"
 	"fmt"
 	"math/big"
+	"math/rand/v2"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/ethereum/go-ethereum/accounts/abi/bind"
+	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/crypto"
 	"github.com/stretchr/testify/assert"
@@ -102,16 +104,16 @@ func TestBlobTxSubmitter_ResetNonceOnPreBroadcastSendFailure(t *testing.T) {
 }
 
 // TestBlobTxSubmitter_ParallelBlobBroadcasts verifies that concurrent
-// SubmitBlobTx invocations can overlap inside the SendTransaction..WaitMined
-// window — they both enter the coordinator under ClassBlob, and geth's
-// blobpool orders them by nonce internally. This is the throughput win
-// over the old single-slot BroadcastSerializer.
+// SubmitBlobTx invocations overlap inside the WaitMined window — they both
+// enter the coordinator under ClassBlob and only the short nonce..Send
+// section is serialized by the send slot. This is the throughput win over
+// the old single-slot BroadcastSerializer.
 //
-// KZG runs ~9s outside the critical section. To avoid a race where G1's
-// entire tx completes before G2 even finishes KZG, we block both inside
-// SendTransaction via a countdown barrier: neither proceeds past Send
-// until both have arrived. That guarantees both are simultaneously
-// "in flight" for the maxInFlight check.
+// KZG runs outside every critical section. To avoid a race where G1's
+// entire tx completes before G2 even finishes KZG, both are held inside
+// WaitMined by a countdown barrier: neither returns until both have
+// arrived, which can only happen if WaitMined is not serialized. Sends are
+// asserted to be serialized (max in-flight 1).
 func TestBlobTxSubmitter_ParallelBlobBroadcasts(t *testing.T) {
 	t.Parallel()
 
@@ -119,25 +121,22 @@ func TestBlobTxSubmitter_ParallelBlobBroadcasts(t *testing.T) {
 	var inFlight, maxInFlight atomic.Int32
 	barrier := make(chan struct{}, goroutines)
 
-	sendFn := func() error {
-		// Signal arrival and wait for the other goroutine.
-		barrier <- struct{}{}
-		// Hold until both have arrived. A full barrier has N entries, so
-		// we spin-observe until the channel is full.
-		for len(barrier) < goroutines {
-			time.Sleep(5 * time.Millisecond)
-		}
-		return nil
-	}
-
 	backend := mockBlobTxBackend{
 		gasTipCap:   big.NewInt(1),
 		inFlight:    &inFlight,
 		maxInFlight: &maxInFlight,
-		sendFn:      sendFn,
 	}
 
 	waitMined := func(ctx context.Context, _ bind.DeployBackend, tx *types.Transaction) (*types.Receipt, error) {
+		// Signal arrival and hold until every goroutine is waiting too.
+		barrier <- struct{}{}
+		for len(barrier) < goroutines {
+			select {
+			case <-time.After(5 * time.Millisecond):
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			}
+		}
 		return &types.Receipt{Status: types.ReceiptStatusSuccessful, TxHash: tx.Hash()}, nil
 	}
 
@@ -154,13 +153,16 @@ func TestBlobTxSubmitter_ParallelBlobBroadcasts(t *testing.T) {
 		coordinator: coordinator,
 	}
 
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+
 	var wg sync.WaitGroup
 	errs := make([]error, goroutines)
 	wg.Add(goroutines)
 	for i := 0; i < goroutines; i++ {
 		go func(idx int) {
 			defer wg.Done()
-			_, err := submitter.SubmitBlobTx(context.Background(), []byte(fmt.Sprintf("ciphertext-%d", idx)))
+			_, err := submitter.SubmitBlobTx(ctx, []byte(fmt.Sprintf("ciphertext-%d", idx)))
 			errs[idx] = err
 		}(i)
 	}
@@ -169,8 +171,77 @@ func TestBlobTxSubmitter_ParallelBlobBroadcasts(t *testing.T) {
 	for i, err := range errs {
 		assert.NoError(t, err, "goroutine %d", i)
 	}
-	assert.Equal(t, int32(goroutines), maxInFlight.Load(),
-		"concurrent blob broadcasts must run in parallel (max in-flight %d, want %d)", maxInFlight.Load(), goroutines)
+	assert.Equal(t, int32(1), maxInFlight.Load(),
+		"blob SendTransaction calls must be serialized so they reach the node in nonce order")
+}
+
+// TestBlobTxSubmitter_ConcurrentSendsArriveInNonceOrder reproduces the
+// 2026-11-09 devnet stall: two jobs on one key took nonces N and N+1, N+1
+// reached geth first and the blobpool rejected it as gapped ("nonce too
+// high: tx nonce 19, gapped nonce 18"), leaving a permanent hole. The
+// backend here applies the same rule — any blob tx whose nonce is not the
+// sender's next one is rejected — and the real NonceManager is used, so
+// every submission must succeed with a contiguous nonce sequence. A
+// jittered signTx widens the NextNonce..Send window the race lives in.
+func TestBlobTxSubmitter_ConcurrentSendsArriveInNonceOrder(t *testing.T) {
+	t.Parallel()
+
+	const (
+		goroutines = 8
+		iterations = 6
+		startNonce = 18
+	)
+
+	key := testSigningKey(t)
+	backend := &gapRejectingBlobBackend{next: startNonce}
+	nonceMgr := workerchain.NewNonceManager(backend, crypto.PubkeyToAddress(key.PublicKey))
+
+	coordinator := workerchain.NewSubpoolCoordinator(nil, 0)
+	defer coordinator.Close()
+
+	submitter := &BlobTxSubmitter{
+		txBackend:  backend,
+		signingKey: key,
+		signTx: func(tx *types.Transaction, signer types.Signer, k *ecdsa.PrivateKey) (*types.Transaction, error) {
+			time.Sleep(time.Duration(rand.IntN(500)) * time.Microsecond)
+			return types.SignTx(tx, signer, k)
+		},
+		waitMined: func(_ context.Context, _ bind.DeployBackend, tx *types.Transaction) (*types.Receipt, error) {
+			return &types.Receipt{Status: types.ReceiptStatusSuccessful, TxHash: tx.Hash()}, nil
+		},
+		chainID:     big.NewInt(1),
+		nonceMgr:    nonceMgr,
+		maxGasPrice: big.NewInt(2),
+		coordinator: coordinator,
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	defer cancel()
+
+	var wg sync.WaitGroup
+	var failed atomic.Int32
+	wg.Add(goroutines)
+	for g := 0; g < goroutines; g++ {
+		go func(g int) {
+			defer wg.Done()
+			for i := 0; i < iterations; i++ {
+				if _, err := submitter.SubmitBlobTx(ctx, []byte(fmt.Sprintf("ciphertext-%d-%d", g, i))); err != nil {
+					failed.Add(1)
+				}
+			}
+		}(g)
+	}
+	wg.Wait()
+
+	backend.mu.Lock()
+	defer backend.mu.Unlock()
+	assert.Zero(t, backend.gapped, "blob txs must never reach the node ahead of their predecessor")
+	assert.Zero(t, failed.Load(), "every submission must succeed")
+	want := make([]uint64, 0, goroutines*iterations)
+	for n := uint64(startNonce); n < startNonce+goroutines*iterations; n++ {
+		want = append(want, n)
+	}
+	assert.Equal(t, want, backend.accepted, "accepted nonces must be contiguous")
 }
 
 // TestBlobTxSubmitter_CtxCancelDuringCrossClassWait asserts that a blob
@@ -720,6 +791,42 @@ func (m mockBlobTxBackend) SendTransaction(ctx context.Context, _ *types.Transac
 		}
 	}
 	return m.sendErr
+}
+
+// gapRejectingBlobBackend emulates geth's blobpool admission for a single
+// sender: a blob tx is accepted only at exactly the sender's next nonce,
+// with the same error strings geth returns otherwise. It also serves
+// PendingNonceAt so a real chain.NonceManager can re-seed from it.
+type gapRejectingBlobBackend struct {
+	mu       sync.Mutex
+	next     uint64
+	accepted []uint64
+	gapped   int
+}
+
+func (b *gapRejectingBlobBackend) SuggestGasTipCap(context.Context) (*big.Int, error) {
+	return big.NewInt(1), nil
+}
+
+func (b *gapRejectingBlobBackend) PendingNonceAt(context.Context, common.Address) (uint64, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.next, nil
+}
+
+func (b *gapRejectingBlobBackend) SendTransaction(_ context.Context, tx *types.Transaction) error {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	switch n := tx.Nonce(); {
+	case n > b.next:
+		b.gapped++
+		return fmt.Errorf("nonce too high: tx nonce %d, gapped nonce %d", n, b.next)
+	case n < b.next:
+		return fmt.Errorf("nonce too low: next nonce %d, tx nonce %d", b.next, n)
+	}
+	b.accepted = append(b.accepted, tx.Nonce())
+	b.next++
+	return nil
 }
 
 // capturingBlobTxBackend is a test backend that invokes onSend on every

@@ -14,9 +14,12 @@ import (
 // Reserver grants exclusivity PER SUBPOOL per sender (el/core/txpool/blobpool/
 // blobpool.go:336 — "ensure exclusivity across subpools"), not per-tx. Within
 // a subpool, multiple pending txs from the same sender are allowed and
-// ordered by nonce (blobpool.go:354: map[address][]blobTxMeta). So the only
-// serialization we need is across classes; within a class the pool handles
-// ordering.
+// kept sorted by nonce (blobpool.go:354: map[address][]blobTxMeta), so the
+// coordinator only serializes across classes. That does NOT make arrival
+// order irrelevant: the blobpool rejects a blob tx whose nonce is ahead of
+// the sender's next one (beyond a tiny reorder buffer), so blob senders
+// must also submit in nonce order — BlobTxSubmitter does that with its own
+// per-key send slot.
 type TxClass int
 
 const (
@@ -147,9 +150,10 @@ type BroadcastToken struct {
 // done. On success, a placeholder is added to inflight[class] and a token
 // is returned. The caller must pair Enter with exactly one Done or Abandon.
 //
-// Same-class concurrent Enter calls do NOT block each other — geth's pool
-// serializes them by nonce internally, and NonceManager ensures strictly
-// increasing nonces.
+// Same-class concurrent Enter calls do NOT block each other. NonceManager
+// hands out strictly increasing nonces; for legacy txs geth's legacypool
+// queues an out-of-order arrival until the gap fills, while blob callers
+// must send in nonce order themselves (see TxClass).
 func (c *SubpoolCoordinator) Enter(ctx context.Context, class TxClass) (*BroadcastToken, error) {
 	for {
 		c.mu.Lock()
