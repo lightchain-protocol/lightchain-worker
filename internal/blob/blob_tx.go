@@ -92,15 +92,28 @@ func encodeBlobTxPayload(data []byte, label string) (*blobTxPayload, error) {
 //
 // Broadcast concurrency is governed by a shared
 // chain.SubpoolCoordinator (see internal/chain/subpool_coordinator.go),
-// which serializes ACROSS tx classes (blob vs legacy) but allows
-// unbounded within-class parallelism. Within the blobpool, geth already
-// orders multiple pending blob txs from the same sender by nonce — the
-// coordinator just prevents cross-subpool reservation conflicts with
-// legacy (ACK, CompleteJob) txs from this same signing key.
+// which serializes ACROSS tx classes (blob vs legacy) so blob txs never
+// collide with legacy (ACK, CompleteJob) txs from this same signing key
+// on geth's per-subpool sender reservation.
+//
+// Within the blob class the coordinator does not order anything, and
+// geth does not either: unlike the legacypool, which queues a gapped tx
+// until its predecessor arrives, the blobpool only keeps a tiny
+// log10(nonce)-sized reorder buffer and otherwise rejects a blob tx whose
+// nonce is ahead of the sender's next one ("nonce too high: tx nonce N+1,
+// gapped nonce N"). Two jobs that take N and N+1 from the NonceManager
+// and race to SendTransaction can therefore lose N+1 and leave a hole
+// that stalls every later tx from this key until WaitMined times out
+// (local devnet, 2026-11-09). sendSlot closes that window: nonce
+// allocation, signing and SendTransaction (plus the rejection handling
+// that resets or releases the nonce) run as one critical section per
+// submitter, i.e. per signing key, so blob txs reach the node in nonce
+// order. WaitMined runs outside it, so mining waits stay parallel.
 //
 // coordinatorOnce lazy-initializes the coordinator when constructed via
 // struct literal without one (the NewBlobTxSubmitter constructor injects
-// the shared instance from the service layer).
+// the shared instance from the service layer). sendSlotOnce does the same
+// for sendSlot.
 type BlobTxSubmitter struct {
 	ethClient       *ethclient.Client
 	txBackend       BlobTxBackend
@@ -112,6 +125,11 @@ type BlobTxSubmitter struct {
 	maxGasPrice     *big.Int
 	coordinator     *workerchain.SubpoolCoordinator
 	coordinatorOnce sync.Once
+	// sendSlot is a one-token semaphore (a channel rather than a
+	// sync.Mutex so waiters can give up on ctx) guarding nonce allocation
+	// through SendTransaction. See the type comment.
+	sendSlot     chan struct{}
+	sendSlotOnce sync.Once
 	// stuckTracker is the shared per-sender stuck-nonce tracker. Nil-safe
 	// via stuckNonceTracker() lazy init for tests that don't inject one.
 	stuckTracker     *workerchain.StuckNonceTracker
@@ -141,6 +159,20 @@ func (s *BlobTxSubmitter) broadcastCoordinator() *workerchain.SubpoolCoordinator
 		}
 	})
 	return s.coordinator
+}
+
+// acquireSendSlot blocks until this submitter's send critical section is
+// free or ctx is done. The returned func releases it.
+func (s *BlobTxSubmitter) acquireSendSlot(ctx context.Context) (func(), error) {
+	s.sendSlotOnce.Do(func() {
+		s.sendSlot = make(chan struct{}, 1)
+	})
+	select {
+	case s.sendSlot <- struct{}{}:
+		return func() { <-s.sendSlot }, nil
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
 }
 
 // stuckNonceTracker returns the shared tracker, lazy-initializing a private
@@ -285,62 +317,71 @@ func (s *BlobTxSubmitter) SubmitBlobTx(ctx context.Context, data []byte) ([][32]
 		return nil, fmt.Errorf("wait for blob broadcast slot: %w", err)
 	}
 
-	nonce, err := s.nonceMgr.NextNonce(ctx)
+	signedTx, nonce, err := s.broadcastBlobTx(ctx, txBackend, signTx, payload, gasTipCap, mutexWaitMs)
 	if err != nil {
-		return nil, fmt.Errorf("get nonce for blob tx: %w", err)
-	}
-
-	// Lease, as in chain.broadcastPreparedTx. Unused until the tx is about to
-	// go out; past that point treat it as spent, because handing back a nonce
-	// that did reach the pool is the more dangerous of the two mistakes.
-	nonceConsumed := false
-	defer func() { s.nonceMgr.ReleaseNonce(nonce, nonceConsumed) }()
-
-	signedTx, err := s.signBlobTx(payload, nonce, gasTipCap, s.maxGasPrice, big.NewInt(defaultBlobFeeCapWei), signTx)
-	if err != nil {
-		return nil, fmt.Errorf("sign blob tx: %w", err)
-	}
-	if err := ctx.Err(); err != nil {
-		return nil, fmt.Errorf("broadcast blob tx: %w", err)
-	}
-
-	nonceConsumed = true
-	if err := s.submitAndWait(ctx, txBackend, signTx, waitMined, signedTx, token, nonce, mutexWaitMs); err != nil {
 		return nil, err
-	}
-	return [][32]byte{[32]byte(payload.versionedHash)}, nil
-}
-
-// submitAndWait broadcasts the already-signed blob tx, registers its hash on
-// the coordinator token, waits for it to be mined, and returns nil iff a
-// successful receipt is observed. On send failure it delegates to
-// handleSendError (which manages nonce reset and stuck-nonce tracking). On
-// WaitMined failure it resets the nonce — see the inline comment for the
-// 2026-04-23 testnet incident that motivated this. On mined-but-reverted
-// receipt, returns an error WITHOUT resetting the nonce, because the tx
-// genuinely consumed it.
-func (s *BlobTxSubmitter) submitAndWait(
-	ctx context.Context,
-	txBackend BlobTxBackend,
-	signTx func(tx *types.Transaction, signer types.Signer, key *ecdsa.PrivateKey) (*types.Transaction, error),
-	waitMined func(ctx context.Context, b bind.DeployBackend, tx *types.Transaction) (*types.Receipt, error),
-	signedTx *types.Transaction,
-	token *workerchain.BroadcastToken,
-	nonce uint64,
-	mutexWaitMs int64,
-) error {
-	txHash := signedTx.Hash()
-
-	broadcastStart := time.Now()
-	if err := txBackend.SendTransaction(ctx, signedTx); err != nil {
-		s.handleSendError(ctx, txBackend, signTx, err, nonce, txHash, mutexWaitMs)
-		return fmt.Errorf("send blob tx: %w", err)
 	}
 
 	// Broadcast accepted by the pool — record the hash on the coordinator
 	// token so janitor eviction logs can identify a stuck entry by tx hash
 	// if this goroutine leaks.
-	token.Registered(txHash)
+	token.Registered(signedTx.Hash())
+
+	if err := s.waitBlobTxMined(ctx, waitMined, signedTx, nonce); err != nil {
+		return nil, err
+	}
+	return [][32]byte{[32]byte(payload.versionedHash)}, nil
+}
+
+// broadcastBlobTx reserves a nonce, signs the blob tx and sends it, all
+// inside the per-submitter send slot so concurrent submissions reach the
+// node in nonce order (see the BlobTxSubmitter comment). The nonce lease
+// is settled before the slot is released: on a rejection, handleSendError's
+// ResetNonce (and any stuck-nonce replacement broadcast) and the lease
+// release all land before the next sender calls NextNonce, so it gets the
+// corrected counter rather than the stale one. As in
+// chain.broadcastPreparedTx, the lease ends at broadcast, not at mining.
+func (s *BlobTxSubmitter) broadcastBlobTx(
+	ctx context.Context,
+	txBackend BlobTxBackend,
+	signTx func(tx *types.Transaction, signer types.Signer, key *ecdsa.PrivateKey) (*types.Transaction, error),
+	payload *blobTxPayload,
+	gasTipCap *big.Int,
+	mutexWaitMs int64,
+) (*types.Transaction, uint64, error) {
+	releaseSlot, err := s.acquireSendSlot(ctx)
+	if err != nil {
+		return nil, 0, fmt.Errorf("wait for blob send slot: %w", err)
+	}
+	defer releaseSlot()
+
+	nonce, err := s.nonceMgr.NextNonce(ctx)
+	if err != nil {
+		return nil, 0, fmt.Errorf("get nonce for blob tx: %w", err)
+	}
+
+	// Lease, as in chain.broadcastPreparedTx. Unused until the tx is about to
+	// go out; past that point treat it as spent, because handing back a nonce
+	// that did reach the pool is the more dangerous of the two mistakes.
+	// Deferred after releaseSlot, so it runs first, inside the slot.
+	nonceConsumed := false
+	defer func() { s.nonceMgr.ReleaseNonce(nonce, nonceConsumed) }()
+
+	signedTx, err := s.signBlobTx(payload, nonce, gasTipCap, s.maxGasPrice, big.NewInt(defaultBlobFeeCapWei), signTx)
+	if err != nil {
+		return nil, 0, fmt.Errorf("sign blob tx: %w", err)
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, 0, fmt.Errorf("broadcast blob tx: %w", err)
+	}
+
+	nonceConsumed = true
+	txHash := signedTx.Hash()
+	broadcastStart := time.Now()
+	if err := txBackend.SendTransaction(ctx, signedTx); err != nil {
+		s.handleSendError(ctx, txBackend, signTx, err, nonce, txHash, mutexWaitMs)
+		return nil, 0, fmt.Errorf("send blob tx: %w", err)
+	}
 
 	if s.logger != nil {
 		s.logger.Info("blob tx broadcast, waiting for receipt",
@@ -351,6 +392,23 @@ func (s *BlobTxSubmitter) submitAndWait(
 			"broadcastMs", time.Since(broadcastStart).Milliseconds(),
 		)
 	}
+	return signedTx, nonce, nil
+}
+
+// waitBlobTxMined waits for an already-broadcast blob tx to be mined and
+// returns nil iff a successful receipt is observed. It runs outside the
+// send slot, so waits from concurrent submissions overlap. On WaitMined
+// failure it resets the nonce — see the inline comment for the 2026-04-23
+// testnet incident that motivated this. On mined-but-reverted receipt,
+// returns an error WITHOUT resetting the nonce, because the tx genuinely
+// consumed it.
+func (s *BlobTxSubmitter) waitBlobTxMined(
+	ctx context.Context,
+	waitMined func(ctx context.Context, b bind.DeployBackend, tx *types.Transaction) (*types.Receipt, error),
+	signedTx *types.Transaction,
+	nonce uint64,
+) error {
+	txHash := signedTx.Hash()
 
 	waitStart := time.Now()
 	receipt, err := waitMined(ctx, s.ethClient, signedTx)
@@ -500,9 +558,10 @@ func (s *BlobTxSubmitter) maybeSubmitReplacementBlobTx(
 }
 
 // submitReplacementBlobTx broadcasts a bumped-fee blob tx at the given
-// nonce to evict a stuck mempool entry. Called from within SubmitBlobTx's
-// error branch while the shared broadcast serializer is still held, so no
-// additional Acquire is needed here.
+// nonce to evict a stuck mempool entry. Called from broadcastBlobTx's
+// error branch while both the coordinator token and this submitter's send
+// slot are held, so the replacement cannot interleave with another blob
+// send from this key and no additional acquire is needed here.
 //
 // Fee bumps are 2^bumpNumber × the configured baseline. First replacement
 // (bumpNumber=1) is 2× everything, second (bumpNumber=2) is 4×, etc. Cap
