@@ -11,6 +11,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/lightchain/worker/internal/hwinfo"
+
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/hibiken/asynq"
 	"github.com/redis/go-redis/v9"
@@ -134,8 +136,28 @@ func TestService_gatewayHeartbeatPayload_advertisesModelsAndCapabilities(t *test
 		"capabilities": ["search"],
 		"protocolVersion": 2,
 		"ollamaStatus": "unreachable",
-		"uptimeSeconds": 90
+		"uptimeSeconds": 90,
+		"workerVersion": "`+hwinfo.WorkerVersion()+`"
 	}`, string(body))
+}
+
+// The operator programme verifies hardware from the heartbeat, so a worker
+// with a GPU prober must send its report and a version string.
+func TestService_gatewayHeartbeatPayload_carriesGPUReportAndVersion(t *testing.T) {
+	t.Parallel()
+
+	s := &Service{
+		cfg:        &config.Config{},
+		jobCounter: &atomic.Int32{},
+		gpuProber:  hwinfo.NewProber("http://127.0.0.1:1", time.Minute),
+	}
+
+	p := s.gatewayHeartbeatPayload("ready", time.Second)
+	assert.NotEmpty(t, p.WorkerVersion)
+	if assert.NotNil(t, p.GPU) {
+		assert.NotEmpty(t, p.GPU.Source)
+		assert.NotNil(t, p.GPU.Devices)
+	}
 }
 
 // oneJobClient is a chain holding a single JobSubmitted event for worker.

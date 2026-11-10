@@ -18,6 +18,8 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/lightchain/worker/internal/hwinfo"
+
 	ethkeystore "github.com/ethereum/go-ethereum/accounts/keystore"
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/crypto"
@@ -106,6 +108,8 @@ type Service struct {
 	// The Redis monitor carries its own copy.
 	advertisedModels []string
 	advertisedCaps   []string
+	// gpuProber reads the GPU report both heartbeats carry.
+	gpuProber *hwinfo.Prober
 
 	// Release subsystem. Store is always non-nil (the Tracker writes to it
 	// from the pipeline regardless of cfg.ReleaseEnabled). Scheduler and
@@ -686,6 +690,7 @@ func New(cfg *config.Config) (*Service, error) {
 			gwHandler:         gwHandler,
 			advertisedModels:  modelHexStrings,
 			advertisedCaps:    capabilities,
+			gpuProber:         hwinfo.NewProber(cfg.OllamaURL, time.Minute),
 			releaseStore:      releaseStore,
 			releaseTracker:    releaseTracker,
 			releaseScheduler:  releaseScheduler,
@@ -723,9 +728,11 @@ func New(cfg *config.Config) (*Service, error) {
 	// Heartbeat: internal profiles advertise via Redis; the external profile
 	// heartbeats through the gateway HTTP API in runSortitionMode instead.
 	addrHex := checksumHexNoPrefix(workerAddr)
+	gpuProber := hwinfo.NewProber(cfg.OllamaURL, time.Minute)
 	var monitor *heartbeat.Monitor
 	if redisClient != nil {
 		monitor = heartbeat.NewMonitor(redisClient, monitorCfg, addrHex, modelHexStrings, capabilities, jobCounter, cfg.MaxConcurrentJobs, logger, metricsCollector)
+		monitor.SetGPUProber(gpuProber)
 
 		// Gate startup on a real heartbeat write
 		startCtx, startCancel := context.WithTimeout(context.Background(), startupHeartbeatTimeout)
@@ -872,6 +879,7 @@ func New(cfg *config.Config) (*Service, error) {
 		streamPub:         extStreamPub,
 		advertisedModels:  modelHexStrings,
 		advertisedCaps:    capabilities,
+		gpuProber:         gpuProber,
 	}, nil
 }
 
@@ -1080,7 +1088,7 @@ func (s *Service) gatewayHeartbeatLoop(ctx context.Context) {
 // whose runtime reports "unreachable", so a constant here would keep a worker
 // with a dead Ollama in rotation.
 func (s *Service) gatewayHeartbeatPayload(ollamaStatus string, uptime time.Duration) gw.HeartbeatPayload {
-	return gw.HeartbeatPayload{
+	p := gw.HeartbeatPayload{
 		ActiveJobs:      int(s.jobCounter.Load()),
 		MaxJobs:         s.cfg.MaxConcurrentJobs,
 		Models:          s.advertisedModels,
@@ -1088,7 +1096,13 @@ func (s *Service) gatewayHeartbeatPayload(ollamaStatus string, uptime time.Durat
 		ProtocolVersion: pkgtypes.WorkerProtocolVersion,
 		OllamaStatus:    ollamaStatus,
 		Uptime:          int64(uptime.Seconds()),
+		WorkerVersion:   hwinfo.WorkerVersion(),
 	}
+	if s.gpuProber != nil {
+		gpu := s.gpuProber.Report(context.Background())
+		p.GPU = &gpu
+	}
+	return p
 }
 
 // runGatewayMode runs the worker in gateway mode: connects to the worker-gateway

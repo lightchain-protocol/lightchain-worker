@@ -13,6 +13,8 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/lightchain/worker/internal/hwinfo"
+
 	"github.com/redis/go-redis/v9"
 
 	pkgtypes "github.com/lightchain/pkg/types"
@@ -58,6 +60,9 @@ type Monitor struct {
 	logger       *slog.Logger
 	jobCounter   *atomic.Int32
 	maxJobs      int
+	// gpu is optional — when nil the heartbeat reports gpuUtil 0 and a "none" GPU report.
+	gpu *hwinfo.Prober
+
 	// metrics is optional — when nil the monitor still writes to Redis but
 	// does not update OllamaUp / HeartbeatLastEmit. Production constructs
 	// always pass non-nil; some tests pass nil to keep them focused.
@@ -137,6 +142,16 @@ func (m *Monitor) Start(ctx context.Context) {
 	}()
 }
 
+// Heartbeat fields this worker adds next to the shared ones in pkg/types.
+// Readers that do not know them ignore them.
+const (
+	hbFieldWorkerVersion = "workerVersion" // release version or dev+<revision>
+	hbFieldGPU           = "gpu"           // JSON-encoded hwinfo.GPUReport
+)
+
+// SetGPUProber makes the heartbeat carry the GPU report and a non-zero gpuUtil.
+func (m *Monitor) SetGPUProber(p *hwinfo.Prober) { m.gpu = p }
+
 // Stop signals the heartbeat goroutine to exit and waits for it to finish.
 // Stop is idempotent — calling it multiple times is safe.
 func (m *Monitor) Stop() {
@@ -174,6 +189,16 @@ func (m *Monitor) emit(ctx context.Context) error {
 		return fmt.Errorf("marshal capabilities: %w", err)
 	}
 
+	gpuUtil := 0
+	gpuJSON := []byte(`{"source":"none","devices":[],"vramInUseBytes":0}`)
+	if m.gpu != nil {
+		report := m.gpu.Report(ctx)
+		gpuUtil = report.MaxUtilization()
+		if b, err := json.Marshal(report); err == nil {
+			gpuJSON = b
+		}
+	}
+
 	ttl := KeyTTL(m.cfg.Interval)
 	key := pkgtypes.HeartbeatRedisKey(m.workerAddr)
 
@@ -183,7 +208,9 @@ func (m *Monitor) emit(ctx context.Context) error {
 		pkgtypes.HBFieldActiveJobs:      activeJobs,
 		pkgtypes.HBFieldMaxJobs:         m.maxJobs,
 		pkgtypes.HBFieldLatencyMs:       0,
-		pkgtypes.HBFieldGPUUtil:         strconv.FormatFloat(0, 'f', -1, 64),
+		pkgtypes.HBFieldGPUUtil:         strconv.FormatFloat(float64(gpuUtil), 'f', -1, 64),
+		hbFieldWorkerVersion:            hwinfo.WorkerVersion(),
+		hbFieldGPU:                      string(gpuJSON),
 		pkgtypes.HBFieldStatus:          pkgtypes.HeartbeatStatusActive,
 		pkgtypes.HBFieldModels:          string(modelsJSON),
 		pkgtypes.HBFieldOllamaStatus:    ollamaStatus,

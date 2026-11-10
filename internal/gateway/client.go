@@ -17,6 +17,8 @@ import (
 	"sync"
 	"time"
 
+	"github.com/lightchain/worker/internal/hwinfo"
+
 	"github.com/ethereum/go-ethereum/crypto"
 
 	"github.com/lightchain/worker/internal/pipeline"
@@ -276,6 +278,10 @@ type HeartbeatPayload struct {
 	ProtocolVersion int      `json:"protocolVersion"`
 	OllamaStatus    string   `json:"ollamaStatus"`
 	Uptime          int64    `json:"uptimeSeconds"`
+	// WorkerVersion and GPU let the operator programme verify the build and
+	// the hardware a worker runs on.
+	WorkerVersion string            `json:"workerVersion"`
+	GPU           *hwinfo.GPUReport `json:"gpu,omitempty"`
 }
 
 // --- HTTP helpers ---
