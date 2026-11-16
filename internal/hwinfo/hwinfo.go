@@ -79,16 +79,32 @@ type GPUReport struct {
 	VRAMInUseBytes int64 `json:"vramInUseBytes"`
 }
 
-// MaxUtilization is the busiest device's utilisation, for the legacy
-// single-number gpuUtil heartbeat field.
-func (r GPUReport) MaxUtilization() int {
+// NoGPU is the report for a worker that reads neither the driver nor Ollama.
+func NoGPU() GPUReport { return GPUReport{Source: SourceNone, Devices: []GPUDevice{}} }
+
+// Utilization is the busiest device's utilisation as a fraction (0 to 1), the
+// unit of the single-number gpuUtil heartbeat field that worker selection reads.
+func (r GPUReport) Utilization() float64 {
 	m := 0
 	for _, d := range r.Devices {
 		if d.UtilizationPct > m {
 			m = d.UtilizationPct
 		}
 	}
-	return m
+	return float64(m) / 100
+}
+
+// MemoryMiB sums total and used memory over all devices. Without driver
+// access it reports the VRAM Ollama's loaded models hold as used, total 0.
+func (r GPUReport) MemoryMiB() (total, used int64) {
+	if len(r.Devices) == 0 {
+		return 0, r.VRAMInUseBytes >> 20
+	}
+	for _, d := range r.Devices {
+		total += int64(d.MemoryTotalMiB)
+		used += int64(d.MemoryUsedMiB)
+	}
+	return total, used
 }
 
 // commandRunner runs nvidia-smi; replaced in tests.
@@ -105,10 +121,14 @@ type Prober struct {
 	client    *http.Client
 	run       commandRunner
 	ttl       time.Duration
+	// firstWait bounds how long Report waits for the very first probe.
+	firstWait time.Duration
 
-	mu      sync.Mutex
-	cached  GPUReport
-	fetched time.Time
+	mu       sync.Mutex
+	cached   GPUReport
+	fetched  time.Time
+	inflight chan struct{} // closed when the running probe ends; nil when none runs
+	called   bool          // Report has run before, so it no longer waits
 }
 
 // NewProber returns a Prober that falls back to ollamaURL when nvidia-smi is
@@ -122,20 +142,50 @@ func NewProber(ollamaURL string, ttl time.Duration) *Prober {
 		client:    &http.Client{Timeout: 3 * time.Second},
 		run:       execRunner,
 		ttl:       ttl,
+		firstWait: time.Second,
+		cached:    NoGPU(),
 	}
 }
 
-// Report returns the cached GPU report, refreshing it once the ttl has passed.
-// It never fails: an unreadable GPU is reported as source "none".
+// Report returns the latest GPU report and starts a refresh once the ttl has
+// passed. The probe runs in its own goroutine, so a hung nvidia-smi (a wedged
+// driver can keep it alive past any kill) never blocks a heartbeat. Only the
+// first call waits for a probe, at most firstWait or until ctx ends; later
+// calls return the previous report while a refresh runs. It never fails: an
+// unreadable GPU is reported as source "none".
 func (p *Prober) Report(ctx context.Context) GPUReport {
 	p.mu.Lock()
-	defer p.mu.Unlock()
-	if !p.fetched.IsZero() && time.Since(p.fetched) < p.ttl {
-		return p.cached
+	if p.inflight == nil && time.Since(p.fetched) >= p.ttl {
+		p.inflight = make(chan struct{})
+		go p.refresh(p.inflight)
 	}
-	p.cached = p.probe(ctx)
-	p.fetched = time.Now()
+	done, first := p.inflight, !p.called
+	p.called = true
+	p.mu.Unlock()
+
+	if done != nil && first {
+		t := time.NewTimer(p.firstWait)
+		defer t.Stop()
+		select {
+		case <-done:
+		case <-t.C:
+		case <-ctx.Done():
+		}
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
 	return p.cached
+}
+
+// refresh probes and stores the result. A probe that never returns leaves
+// inflight set: the report keeps its last value and no further nvidia-smi
+// processes pile up behind the stuck one. A worker restart clears it.
+func (p *Prober) refresh(done chan struct{}) {
+	r := p.probe(context.Background())
+	p.mu.Lock()
+	p.cached, p.fetched, p.inflight = r, time.Now(), nil
+	p.mu.Unlock()
+	close(done)
 }
 
 func (p *Prober) probe(ctx context.Context) GPUReport {
@@ -154,7 +204,7 @@ func (p *Prober) probe(ctx context.Context) GPUReport {
 			return GPUReport{Source: SourceOllama, Devices: []GPUDevice{}, VRAMInUseBytes: vram}
 		}
 	}
-	return GPUReport{Source: SourceNone, Devices: []GPUDevice{}}
+	return NoGPU()
 }
 
 // parseNvidiaSMI parses `--format=csv,noheader,nounits` output for the

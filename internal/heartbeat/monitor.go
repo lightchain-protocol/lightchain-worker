@@ -13,12 +13,11 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/lightchain/worker/internal/hwinfo"
-
 	"github.com/redis/go-redis/v9"
 
 	pkgtypes "github.com/lightchain/pkg/types"
 
+	"github.com/lightchain/worker/internal/hwinfo"
 	"github.com/lightchain/worker/internal/metrics"
 )
 
@@ -189,14 +188,13 @@ func (m *Monitor) emit(ctx context.Context) error {
 		return fmt.Errorf("marshal capabilities: %w", err)
 	}
 
-	gpuUtil := 0
-	gpuJSON := []byte(`{"source":"none","devices":[],"vramInUseBytes":0}`)
+	gpu := hwinfo.NoGPU()
 	if m.gpu != nil {
-		report := m.gpu.Report(ctx)
-		gpuUtil = report.MaxUtilization()
-		if b, err := json.Marshal(report); err == nil {
-			gpuJSON = b
-		}
+		gpu = m.gpu.Report(ctx)
+	}
+	gpuJSON, err := json.Marshal(gpu)
+	if err != nil {
+		return fmt.Errorf("marshal gpu report: %w", err)
 	}
 
 	ttl := KeyTTL(m.cfg.Interval)
@@ -208,7 +206,7 @@ func (m *Monitor) emit(ctx context.Context) error {
 		pkgtypes.HBFieldActiveJobs:      activeJobs,
 		pkgtypes.HBFieldMaxJobs:         m.maxJobs,
 		pkgtypes.HBFieldLatencyMs:       0,
-		pkgtypes.HBFieldGPUUtil:         strconv.FormatFloat(float64(gpuUtil), 'f', -1, 64),
+		pkgtypes.HBFieldGPUUtil:         strconv.FormatFloat(gpu.Utilization(), 'f', -1, 64),
 		hbFieldWorkerVersion:            hwinfo.WorkerVersion(),
 		hbFieldGPU:                      string(gpuJSON),
 		pkgtypes.HBFieldStatus:          pkgtypes.HeartbeatStatusActive,

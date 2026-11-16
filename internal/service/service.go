@@ -18,8 +18,6 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/lightchain/worker/internal/hwinfo"
-
 	ethkeystore "github.com/ethereum/go-ethereum/accounts/keystore"
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/crypto"
@@ -34,6 +32,7 @@ import (
 	"github.com/lightchain/worker/internal/config"
 	gw "github.com/lightchain/worker/internal/gateway"
 	"github.com/lightchain/worker/internal/heartbeat"
+	"github.com/lightchain/worker/internal/hwinfo"
 	"github.com/lightchain/worker/internal/keystore"
 	"github.com/lightchain/worker/internal/metrics"
 	"github.com/lightchain/worker/internal/ollama"
@@ -1069,7 +1068,7 @@ func (s *Service) gatewayHeartbeatLoop(ctx context.Context) {
 	startedAt := time.Now()
 	probe := &http.Client{Timeout: 2 * time.Second}
 	for {
-		payload := s.gatewayHeartbeatPayload(heartbeat.CheckOllama(ctx, probe, s.cfg.OllamaURL), time.Since(startedAt))
+		payload := s.gatewayHeartbeatPayload(ctx, heartbeat.CheckOllama(ctx, probe, s.cfg.OllamaURL), time.Since(startedAt))
 		if err := s.gwClient.SendHeartbeat(ctx, payload); err != nil {
 			s.logger.Warn("gateway heartbeat failed", "error", err)
 		}
@@ -1087,7 +1086,7 @@ func (s *Service) gatewayHeartbeatLoop(ctx context.Context) {
 // uptime are measured by the caller: the consumer API stops offering a worker
 // whose runtime reports "unreachable", so a constant here would keep a worker
 // with a dead Ollama in rotation.
-func (s *Service) gatewayHeartbeatPayload(ollamaStatus string, uptime time.Duration) gw.HeartbeatPayload {
+func (s *Service) gatewayHeartbeatPayload(ctx context.Context, ollamaStatus string, uptime time.Duration) gw.HeartbeatPayload {
 	p := gw.HeartbeatPayload{
 		ActiveJobs:      int(s.jobCounter.Load()),
 		MaxJobs:         s.cfg.MaxConcurrentJobs,
@@ -1099,8 +1098,10 @@ func (s *Service) gatewayHeartbeatPayload(ollamaStatus string, uptime time.Durat
 		WorkerVersion:   hwinfo.WorkerVersion(),
 	}
 	if s.gpuProber != nil {
-		gpu := s.gpuProber.Report(context.Background())
+		gpu := s.gpuProber.Report(ctx)
 		p.GPU = &gpu
+		p.GPUUtil = gpu.Utilization()
+		p.GPUMemTotalMb, p.GPUMemUsedMb = gpu.MemoryMiB()
 	}
 	return p
 }
