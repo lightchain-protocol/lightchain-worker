@@ -585,8 +585,8 @@ func sameBlockChain(n int) *mockServeClient {
 	return mc
 }
 
-// TestJobWatcher_SameBlockAtCapacity_DispatchesEachJobOnce is the 2026-11-09
-// devnet starvation: six jobs for this worker land in one block and the
+// TestJobWatcher_SameBlockAtCapacity_DispatchesEachJobOnce covers same-block
+// starvation at capacity: six jobs for this worker land in one block and the
 // worker runs two at a time. Capacity parks the cursor before that block, so
 // every pass rescans it. Jobs already handed to the pipeline must not be
 // handed over again: a re-dispatch takes a slot, the watcher hits capacity at
