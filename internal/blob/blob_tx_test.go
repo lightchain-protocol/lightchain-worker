@@ -175,10 +175,10 @@ func TestBlobTxSubmitter_ParallelBlobBroadcasts(t *testing.T) {
 		"blob SendTransaction calls must be serialized so they reach the node in nonce order")
 }
 
-// TestBlobTxSubmitter_ConcurrentSendsArriveInNonceOrder reproduces the
-// 2026-11-09 devnet stall: two jobs on one key took nonces N and N+1, N+1
-// reached geth first and the blobpool rejected it as gapped ("nonce too
-// high: tx nonce 19, gapped nonce 18"), leaving a permanent hole. The
+// TestBlobTxSubmitter_ConcurrentSendsArriveInNonceOrder covers the gapped
+// blob nonce stall: two jobs on one key take nonces N and N+1, N+1 reaches
+// geth first and the blobpool rejects it as gapped ("nonce too high: tx
+// nonce N+1, gapped nonce N"), leaving a permanent hole. The
 // backend here applies the same rule — any blob tx whose nonce is not the
 // sender's next one is rejected — and the real NonceManager is used, so
 // every submission must succeed with a contiguous nonce sequence. A

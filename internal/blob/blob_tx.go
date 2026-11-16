@@ -103,8 +103,8 @@ func encodeBlobTxPayload(data []byte, label string) (*blobTxPayload, error) {
 // nonce is ahead of the sender's next one ("nonce too high: tx nonce N+1,
 // gapped nonce N"). Two jobs that take N and N+1 from the NonceManager
 // and race to SendTransaction can therefore lose N+1 and leave a hole
-// that stalls every later tx from this key until WaitMined times out
-// (local devnet, 2026-11-09). sendSlot closes that window: nonce
+// that stalls every later tx from this key until WaitMined times out.
+// sendSlot closes that window: nonce
 // allocation, signing and SendTransaction (plus the rejection handling
 // that resets or releases the nonce) run as one critical section per
 // submitter, i.e. per signing key, so blob txs reach the node in nonce
