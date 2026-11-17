@@ -4,6 +4,9 @@
 # from the orchestrator checkout, where go.work already joins both.
 DIST      ?= dist
 PLATFORMS ?= linux/amd64 linux/arm64 darwin/amd64 darwin/arm64
+# Stamped into the binary and reported as workerVersion in the health payload.
+# CI passes the tag (make release VERSION=v0.0.6-agents.1).
+VERSION   ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
 SHA256    := $(shell command -v sha256sum >/dev/null 2>&1 && echo sha256sum || echo shasum -a 256)
 
 .PHONY: release test-install
@@ -11,7 +14,7 @@ SHA256    := $(shell command -v sha256sum >/dev/null 2>&1 && echo sha256sum || e
 release:
 	rm -rf $(DIST) && mkdir -p $(DIST)
 	for p in $(PLATFORMS); do \
-		CGO_ENABLED=0 GOOS=$${p%/*} GOARCH=$${p#*/} go build -trimpath -ldflags="-s -w" \
+		CGO_ENABLED=0 GOOS=$${p%/*} GOARCH=$${p#*/} go build -trimpath -ldflags="-s -w -X github.com/lightchain/worker/internal/hwinfo.Version=$(VERSION)" \
 			-o $(DIST)/lightchain-worker-$${p%/*}-$${p#*/} ./cmd/cli || exit 1; \
 	done
 	cp scripts/install.sh $(DIST)/

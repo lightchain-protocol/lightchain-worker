@@ -19,6 +19,7 @@ import (
 
 	"github.com/lightchain/worker/internal/chain"
 	"github.com/lightchain/worker/internal/config"
+	"github.com/lightchain/worker/internal/hwinfo"
 	"github.com/lightchain/worker/internal/keystore"
 	"github.com/lightchain/worker/internal/pipeline"
 	"github.com/lightchain/worker/internal/sortition"
@@ -125,7 +126,7 @@ func TestService_gatewayHeartbeatPayload_advertisesModelsAndCapabilities(t *test
 		advertisedCaps:   []string{"search"},
 	}
 
-	body, err := json.Marshal(s.gatewayHeartbeatPayload("unreachable", 90*time.Second))
+	body, err := json.Marshal(s.gatewayHeartbeatPayload(context.Background(), "unreachable", 90*time.Second))
 	assert.NoError(t, err)
 	assert.JSONEq(t, `{
 		"activeJobs": 1,
@@ -134,8 +135,36 @@ func TestService_gatewayHeartbeatPayload_advertisesModelsAndCapabilities(t *test
 		"capabilities": ["search"],
 		"protocolVersion": 2,
 		"ollamaStatus": "unreachable",
-		"uptimeSeconds": 90
+		"uptimeSeconds": 90,
+		"workerVersion": "`+hwinfo.WorkerVersion()+`",
+		"gpuUtil": 0,
+		"gpuMemTotalMb": 0,
+		"gpuMemUsedMb": 0
 	}`, string(body))
+}
+
+// The operator programme verifies hardware from the heartbeat, so a worker
+// with a GPU prober must send its report and a version string, and fill the
+// scalar GPU fields a gateway that does not store gpu still reads.
+func TestService_gatewayHeartbeatPayload_carriesGPUReportAndVersion(t *testing.T) {
+	t.Parallel()
+
+	s := &Service{
+		cfg:        &config.Config{},
+		jobCounter: &atomic.Int32{},
+		gpuProber:  hwinfo.NewProber("http://127.0.0.1:1", time.Minute),
+	}
+
+	p := s.gatewayHeartbeatPayload(context.Background(), "ready", time.Second)
+	assert.NotEmpty(t, p.WorkerVersion)
+	if assert.NotNil(t, p.GPU) {
+		assert.NotEmpty(t, p.GPU.Source)
+		assert.NotNil(t, p.GPU.Devices)
+		assert.InDelta(t, p.GPU.Utilization(), p.GPUUtil, 1e-9)
+		total, used := p.GPU.MemoryMiB()
+		assert.Equal(t, total, p.GPUMemTotalMb)
+		assert.Equal(t, used, p.GPUMemUsedMb)
+	}
 }
 
 // oneJobClient is a chain holding a single JobSubmitted event for worker.

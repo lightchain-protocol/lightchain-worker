@@ -134,6 +134,9 @@ jobs:
           push: ${{ github.event_name == 'push' }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
+          # Reported as workerVersion in the health payload: the tag for a release, else dev+<commit>.
+          build-args: |
+            WORKER_VERSION=${{ github.ref_type == 'tag' && github.ref_name || format('dev+{0}', github.sha) }}
 
   # A version tag only, and after the image, so a release never exists without the image of the same version. A tag
   # with a hyphen (v1.2.3-rc.1) becomes a pre-release, which GitHub does not serve as "latest", so the installer's
@@ -154,7 +157,7 @@ jobs:
       - *go
       - *workspace
 
-      - run: make release
+      - run: make release VERSION="$GITHUB_REF_NAME"
 
       - name: Publish the release
         env:
