@@ -1070,7 +1070,7 @@ func (h *JobHandler) processJob(ctx context.Context, p JobPayload) (err error) {
 		"versionedHash", versionedHash.Hex(),
 		"ciphertextHash", responseCiphertextHash.Hex(),
 	)
-	if cjErr := h.completeJob(ctx, logger, p.JobID, versionedHash, responseCiphertextHash, guard); cjErr != nil {
+	if cjErr := h.completeJob(ctx, logger, p.JobID, versionedHash, responseCiphertextHash, ckpt.HasVersionedHash(), guard); cjErr != nil {
 		rec.End(metrics.OutcomeError, metrics.CacheNone)
 		err = fmt.Errorf("stage 8 (complete job): %w", cjErr)
 		return err
@@ -1894,6 +1894,7 @@ func (h *JobHandler) completeJob(
 	jobID uint64,
 	responseBlobHash [32]byte,
 	responseCiphertextHash [32]byte,
+	priorAttempt bool,
 	guard *deadlineGuard,
 ) error {
 	// On a retry the job has usually already been completed by the earlier
@@ -1901,8 +1902,10 @@ func (h *JobHandler) completeJob(
 	// JobState.Acknowledged requirement. That failure is harmless on its own -
 	// nothing is broadcast - but it used to reset the shared nonce counter
 	// while sibling jobs held allocated nonces, stalling them behind a 30s
-	// Asynq retry. Ask first on the path where the answer is usually yes.
-	if retryCount, _ := asynq.GetRetryCount(ctx); retryCount > 0 {
+	// Asynq retry. Ask first on the path where the answer is usually yes: an
+	// Asynq retry, or priorAttempt (a stage-8a checkpoint shows an earlier
+	// attempt got this far, e.g. a payload job served again).
+	if retryCount, _ := asynq.GetRetryCount(ctx); retryCount > 0 || priorAttempt {
 		if completed, cErr := h.chainClient.HasJobCompleted(ctx, jobID); cErr == nil && completed {
 			logger.Info("stage 8b: job already completed on-chain, skipping",
 				"stage", "complete_job",
