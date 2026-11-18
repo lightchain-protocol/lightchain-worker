@@ -26,6 +26,7 @@ type mockRegClient struct {
 	isWorkerRegisteredFn     func(ctx context.Context, worker common.Address) (bool, error)
 	registerWorkerFn         func(ctx context.Context, encryptionPubKey []byte, stake *big.Int) error
 	addSupportedModelFn      func(ctx context.Context, modelID [32]byte) error
+	removeSupportedModelFn   func(ctx context.Context, modelID [32]byte) error
 	deregisterWorkerFn       func(ctx context.Context) error
 	getMinWorkerStakeFn      func(ctx context.Context) (*big.Int, error)
 	getWorkerEncryptionKeyFn func(ctx context.Context, worker common.Address) ([]byte, error)
@@ -54,6 +55,12 @@ func (m *mockRegClient) RegisterWorker(ctx context.Context, encryptionPubKey []b
 }
 func (m *mockRegClient) AddSupportedModel(ctx context.Context, modelID [32]byte) error {
 	return m.addSupportedModelFn(ctx, modelID)
+}
+func (m *mockRegClient) RemoveSupportedModel(ctx context.Context, modelID [32]byte) error {
+	if m.removeSupportedModelFn == nil {
+		return nil
+	}
+	return m.removeSupportedModelFn(ctx, modelID)
 }
 func (m *mockRegClient) DeregisterWorker(ctx context.Context) error {
 	return m.deregisterWorkerFn(ctx)

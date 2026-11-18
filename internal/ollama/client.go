@@ -31,6 +31,10 @@ const (
 // (re-execution) rely on greedy decoding being reproducible across services.
 const deterministicSeed = 42
 
+// DeterministicSeed is deterministicSeed for callers that record the seed a
+// job ran under (the public response R echoes it).
+const DeterministicSeed = deterministicSeed
+
 // Options mirrors the Ollama request "options" object. Only the knobs the
 // worker needs are modelled. Every field is omitempty so an unset option
 // leaves the server-side default untouched.

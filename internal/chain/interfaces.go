@@ -89,6 +89,10 @@ type RegistrationClient interface {
 	// Per Amendment A-2, this is non-payable — no additional ETH is required per model.
 	AddSupportedModel(ctx context.Context, modelID [32]byte) error
 
+	// RemoveSupportedModel drops a model ID from the worker's supported model set on-chain,
+	// so sortition stops routing that model's session requests to this worker.
+	RemoveSupportedModel(ctx context.Context, modelID [32]byte) error
+
 	// DeregisterWorker removes the worker from the registry and withdraws all stake.
 	DeregisterWorker(ctx context.Context) error
 

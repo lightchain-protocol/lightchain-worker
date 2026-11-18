@@ -1610,3 +1610,70 @@ func TestHandleTask_CheckpointRetained_WhenStage8bFails(t *testing.T) {
 	assert.True(t, ckpt.HasVersionedHash(), "versionedHash must survive stage 8b failure")
 	assert.True(t, ckpt.Delivered, "stage 7 ran successfully before 8b, so delivered must be set")
 }
+
+// TestHandleJobPayload_ReplayOfCompletedJob_SkipsCompleteJobTx asserts that a
+// payload job served a second time after it completed (the tombstoned
+// checkpoint still holds the versioned hash) checks the chain and does not
+// send a completeJob tx that can only revert.
+func TestHandleJobPayload_ReplayOfCompletedJob_SkipsCompleteJobTx(t *testing.T) {
+	t.Parallel()
+	mr := miniredis.RunT(t)
+	rc := redis.NewClient(&redis.Options{Addr: mr.Addr()})
+	t.Cleanup(func() { _ = rc.Close() })
+
+	sessionKey := testSessionKey(t)
+	ecdhKey := testECDHKey(t)
+	encSessionKey := encryptSessionKeyForWorker(t, sessionKey, ecdhKey)
+	promptCiphertext, err := pkgcrypto.Encrypt(sessionKey, []byte("hello"))
+	require.NoError(t, err)
+
+	store := NewCheckpointStore(rc, 2*time.Hour, 10*time.Minute, 256*1024)
+
+	var completeCalls, completedChecks atomic.Int32
+	var completed atomic.Bool
+	chain := &mockChainClient{
+		ackJobFn: func(_ context.Context, _ uint64) error { return nil },
+		completeJobFn: func(_ context.Context, _ uint64, _ [32]byte, _ [32]byte) error {
+			completeCalls.Add(1)
+			if completed.Load() {
+				return fmt.Errorf("execution reverted: job not acknowledged")
+			}
+			completed.Store(true)
+			return nil
+		},
+		hasJobAcknowledgedFn: func(_ context.Context, _ uint64) (bool, error) { return completed.Load(), nil },
+		hasJobCompletedFn: func(_ context.Context, _ uint64) (bool, error) {
+			completedChecks.Add(1)
+			return completed.Load(), nil
+		},
+		getEncWorkerKeyFn: func(_ context.Context, _ uint64) ([]byte, error) { return encSessionKey, nil },
+	}
+	fetcher := &mockBlobFetcher{fetchFn: func(_ context.Context, _ common.Hash, _ uint64) ([]byte, error) {
+		return promptCiphertext, nil
+	}}
+	submitter := &mockBlobSubmitter{submitFn: func(_ context.Context, _ []byte) ([][32]byte, error) {
+		return [][32]byte{{0xab}}, nil
+	}}
+	ollama := &mockOllama{generateFn: func(_ context.Context, _, _ string) (string, error) { return "r", nil }}
+
+	logger := slog.New(slog.NewTextHandler(io.Discard, &slog.HandlerOptions{Level: slog.LevelError}))
+	handler := NewJobHandler(
+		chain, fetcher, submitter, newMockKeyStore(), ollama,
+		rc, testSigningKey(t), ecdhKey, &atomic.Int32{}, logger,
+		HandlerConfig{AckTxTimeout: 5 * time.Second, BlobTxTimeout: 60 * time.Second, RedisPublishTimeout: 5 * time.Second},
+		nil,
+		store,
+		testMetrics(t),
+		metrics.DeliveryGateway,
+		nil,
+	)
+
+	payload := testPayload(t)
+	require.NoError(t, handler.HandleJobPayload(context.Background(), payload))
+	require.Equal(t, int32(1), completeCalls.Load())
+	require.Equal(t, int32(0), completedChecks.Load(), "first attempt has no checkpoint, so no pre-check")
+
+	require.NoError(t, handler.HandleJobPayload(context.Background(), payload))
+	require.Equal(t, int32(1), completeCalls.Load(), "replay of a completed job must not send completeJob")
+	require.Equal(t, int32(1), completedChecks.Load(), "replay asks the chain once")
+}

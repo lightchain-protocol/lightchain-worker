@@ -55,6 +55,13 @@ type SessionWatcherOpts struct {
 	// the look-back. It is also how far behind the safe head a worker with no
 	// stored cursor starts discovery (see CursorStore.GetOrSeed).
 	LookbackBlocks uint64
+	// MaxRequestAgeBlocks drops a request once it is this many blocks behind the
+	// head without a claim. The consumer-api gives up on a request after its
+	// claim timeout (60 s) and never provides session keys for it, but the
+	// request stays Open on chain until its expiry (an hour), so a worker that
+	// frees up late used to claim dozens of abandoned requests at once: one tx
+	// each, for sessions nobody is waiting on. Zero disables the check.
+	MaxRequestAgeBlocks uint64
 }
 
 // SessionWatcher polls the chain for SessionRequested events and claims
@@ -85,6 +92,10 @@ type SessionWatcher struct {
 	// evaluation (nil = not yet fetched). The mask is immutable per request, so a
 	// successful fetch is cached for every later pass.
 	pending map[uint64]*big.Int
+	// requestBlock remembers each pending request's block so the age check in
+	// the evaluation phase needs no extra chain read.
+	requestBlock map[uint64]uint64
+	maxAge       uint64
 }
 
 // NewSessionWatcher constructs a SessionWatcher from the given options.
@@ -115,7 +126,34 @@ func NewSessionWatcher(o SessionWatcherOpts) *SessionWatcher {
 		ownCaps:  ownCaps,
 		lookback: o.LookbackBlocks,
 		pending:  make(map[uint64]*big.Int),
+
+		requestBlock: make(map[uint64]uint64),
+		maxAge:       o.MaxRequestAgeBlocks,
 	}
+}
+
+// discover adds a request to the pending set, remembering its block for the age check.
+func (w *SessionWatcher) discover(r chain.SessionRequestedEvent) {
+	if _, ok := w.pending[r.ReqID]; !ok {
+		w.pending[r.ReqID] = nil // capability mask fetched lazily at evaluation
+	}
+	w.requestBlock[r.ReqID] = r.RequestBlock
+}
+
+// forget drops a request from the pending set and its bookkeeping.
+func (w *SessionWatcher) forget(reqID uint64) {
+	delete(w.pending, reqID)
+	delete(w.requestBlock, reqID)
+}
+
+// tooOld reports whether a pending request is older than MaxRequestAgeBlocks:
+// its consumer gave up on it long ago, so claiming it would only spend a tx.
+func (w *SessionWatcher) tooOld(reqID, head uint64) bool {
+	if w.maxAge == 0 {
+		return false
+	}
+	rb, ok := w.requestBlock[reqID]
+	return ok && rb > 0 && head > rb && head-rb > w.maxAge
 }
 
 // Start runs a ticker loop calling RunOnce on each tick until ctx is cancelled.
@@ -213,7 +251,7 @@ func (w *SessionWatcher) RunOnce(ctx context.Context) error {
 			}
 
 			for _, r := range reqs {
-				w.pending[r.ReqID] = nil // capability mask fetched lazily at evaluation
+				w.discover(r)
 			}
 
 			if err := w.cursor.Set(cursorSessionRequested, hi); err != nil {
@@ -227,6 +265,14 @@ func (w *SessionWatcher) RunOnce(ctx context.Context) error {
 	// prior pass when the worker was ineligible is re-evaluated here every
 	// pass until the sortition claim window widens.
 	for reqID := range w.pending {
+		// Abandoned by its consumer: the consumer-api stops waiting after its
+		// claim timeout and never provides keys, so a late claim is a wasted tx.
+		if w.tooOld(reqID, head.Number) {
+			w.log.Debug("dropping stale session request", "reqId", reqID, "requestBlock", w.requestBlock[reqID], "head", head.Number, "maxAgeBlocks", w.maxAge)
+			w.forget(reqID)
+			continue
+		}
+
 		ri, err := w.c.GetRequestInfo(ctx, reqID)
 		if err != nil {
 			w.log.Warn("getRequestInfo failed", "reqId", reqID, "error", err)
@@ -234,12 +280,12 @@ func (w *SessionWatcher) RunOnce(ctx context.Context) error {
 		}
 
 		if ri.Status != 0 { // not Open (Claimed=1, Ready=2, Expired=3)
-			delete(w.pending, reqID)
+			w.forget(reqID)
 			continue
 		}
 
 		if uint64(time.Now().Unix()) > ri.Expiry {
-			delete(w.pending, reqID)
+			w.forget(reqID)
 			continue
 		}
 
@@ -261,7 +307,7 @@ func (w *SessionWatcher) RunOnce(ctx context.Context) error {
 		if caps.Sign() != 0 && new(big.Int).And(caps, w.ownCaps).Cmp(caps) != 0 {
 			w.log.Debug("skipping request requiring capabilities this worker lacks",
 				"reqId", reqID, "requiredMask", caps.String())
-			delete(w.pending, reqID)
+			w.forget(reqID)
 			continue
 		}
 
@@ -288,7 +334,7 @@ func (w *SessionWatcher) RunOnce(ctx context.Context) error {
 			// Remove optimistically: if our tx lost the race the request's
 			// status will be non-Open on the next pass and it would be pruned
 			// from pending then anyway.
-			delete(w.pending, reqID)
+			w.forget(reqID)
 		}
 		// else: not yet eligible — keep in pending for re-evaluation next pass.
 	}
@@ -318,7 +364,7 @@ func (w *SessionWatcher) reseed(ctx context.Context, cursor uint64) error {
 			return err
 		}
 		for _, r := range reqs {
-			w.pending[r.ReqID] = nil // capability mask fetched lazily at evaluation
+			w.discover(r)
 		}
 		found += len(reqs)
 	}

@@ -133,7 +133,7 @@ func NewSortitionHarness(t testing.TB, opts SortitionOptions) *SortitionHarness 
 	if opts.TavilyURL != "" {
 		searcher = search.NewTavilyClient(opts.TavilyURL, "workertest-key", 10*time.Second)
 	}
-	desiredCaps := registration.DesiredCapabilities(opts.TavilyURL != "")
+	desiredCaps := registration.DesiredCapabilities(opts.TavilyURL != "", true, false)
 	capCtx, capCancel := context.WithTimeout(context.Background(), 30*time.Second)
 	registration.NewManager(chainClient, workerAddr, nil, opts.Logger).EnsureCapabilities(capCtx, desiredCaps)
 	ownCaps, err := chainClient.GetWorkerCapabilities(capCtx, workerAddr)

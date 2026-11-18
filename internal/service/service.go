@@ -33,6 +33,7 @@ import (
 	"github.com/lightchain/worker/internal/config"
 	gw "github.com/lightchain/worker/internal/gateway"
 	"github.com/lightchain/worker/internal/heartbeat"
+	"github.com/lightchain/worker/internal/hwinfo"
 	"github.com/lightchain/worker/internal/keystore"
 	"github.com/lightchain/worker/internal/metrics"
 	"github.com/lightchain/worker/internal/ollama"
@@ -107,6 +108,8 @@ type Service struct {
 	// The Redis monitor carries its own copy.
 	advertisedModels []string
 	advertisedCaps   []string
+	// gpuProber reads the GPU report both heartbeats carry.
+	gpuProber *hwinfo.Prober
 
 	// Release subsystem. Store is always non-nil (the Tracker writes to it
 	// from the pipeline regardless of cfg.ReleaseEnabled). Scheduler and
@@ -531,6 +534,9 @@ func New(cfg *config.Config) (*Service, error) {
 			StreamChunkTokens:    cfg.StreamChunkTokens,
 			StreamChunkInterval:  cfg.StreamChunkInterval,
 			ModelOptions:         cfg.ModelOptions,
+			PublicOutput:         cfg.PublicOutputEnabled,
+			PublicMaxNumCtx:      cfg.OllamaNumCtx,
+			PublicMaxNumPredict:  cfg.OllamaNumPredict,
 			DeadlineGuardEnabled: cfg.DeadlineGuardEnabled,
 			SettleReserve:        cfg.SettleReserve,
 			CompletionReserve:    cfg.CompletionReserve,
@@ -557,6 +563,7 @@ func New(cfg *config.Config) (*Service, error) {
 	// A chat job's earlier jobs come from the chain on every intake, as the
 	// disputer finds them to re-run the job, never from a dispatcher's index.
 	handler.SetPriorJobLister(chainClient)
+	handler.SetAbandonFailedJobs(cfg.AbandonFailedJobs)
 
 	// --- Gateway mode: skip Asynq and direct Redis heartbeat ---
 	// SortitionEnabled takes precedence: if both are set we already warned above
@@ -605,7 +612,10 @@ func New(cfg *config.Config) (*Service, error) {
 				AckOverlapEnabled: cfg.AckOverlapEnabled,
 				// MODEL_OPTIONS applies in gateway mode too: tier caps are
 				// generation parameters, independent of the delivery channel.
-				ModelOptions: cfg.ModelOptions,
+				ModelOptions:        cfg.ModelOptions,
+				PublicOutput:        cfg.PublicOutputEnabled,
+				PublicMaxNumCtx:     cfg.OllamaNumCtx,
+				PublicMaxNumPredict: cfg.OllamaNumPredict,
 				// The deadline guard matters just as much in gateway mode:
 				// the gateway retries failed jobs with its own backoff, and
 				// every guard abort is cheap (pre-inference), so the
@@ -639,6 +649,7 @@ func New(cfg *config.Config) (*Service, error) {
 			gwHandler.SetVoiceEngine(voiceEngine)
 		}
 		gwHandler.SetPriorJobLister(chainClient)
+		gwHandler.SetAbandonFailedJobs(cfg.AbandonFailedJobs)
 
 		logger.Info(
 			"worker service initialized (gateway mode)",
@@ -679,6 +690,7 @@ func New(cfg *config.Config) (*Service, error) {
 			gwHandler:         gwHandler,
 			advertisedModels:  modelHexStrings,
 			advertisedCaps:    capabilities,
+			gpuProber:         hwinfo.NewProber(cfg.OllamaURL, time.Minute),
 			releaseStore:      releaseStore,
 			releaseTracker:    releaseTracker,
 			releaseScheduler:  releaseScheduler,
@@ -716,9 +728,11 @@ func New(cfg *config.Config) (*Service, error) {
 	// Heartbeat: internal profiles advertise via Redis; the external profile
 	// heartbeats through the gateway HTTP API in runSortitionMode instead.
 	addrHex := checksumHexNoPrefix(workerAddr)
+	gpuProber := hwinfo.NewProber(cfg.OllamaURL, time.Minute)
 	var monitor *heartbeat.Monitor
 	if redisClient != nil {
 		monitor = heartbeat.NewMonitor(redisClient, monitorCfg, addrHex, modelHexStrings, capabilities, jobCounter, cfg.MaxConcurrentJobs, logger, metricsCollector)
+		monitor.SetGPUProber(gpuProber)
 
 		// Gate startup on a real heartbeat write
 		startCtx, startCancel := context.WithTimeout(context.Background(), startupHeartbeatTimeout)
@@ -785,7 +799,9 @@ func New(cfg *config.Config) (*Service, error) {
 		// Every failure degrades to an empty mask — unconstrained requests
 		// stay claimable and the on-chain claimSession check remains the
 		// guarantee for constrained ones.
-		desiredCaps := registration.DesiredCapabilities(cfg.SearchEnabled && cfg.TavilyAPIKey != "")
+		desiredCaps := registration.DesiredCapabilities(
+			cfg.SearchEnabled && cfg.TavilyAPIKey != "", cfg.PublicOutputEnabled, cfg.ExactProfile,
+		)
 		capCtx, capCancel := context.WithTimeout(context.Background(), 30*time.Second)
 		registration.NewManager(chainClient, workerAddr, nil, logger).EnsureCapabilities(capCtx, desiredCaps)
 		capCancel()
@@ -814,6 +830,8 @@ func New(cfg *config.Config) (*Service, error) {
 			Logger:          logger,
 			OwnCapabilities: ownCaps,
 			LookbackBlocks:  cfg.SortitionSessionLookbackBlocks,
+
+			MaxRequestAgeBlocks: cfg.SortitionMaxRequestAgeBlocks,
 		})
 		jobWatcher = sortition.NewJobWatcher(sortition.JobWatcherOpts{
 			Client:            chainClient,
@@ -861,6 +879,7 @@ func New(cfg *config.Config) (*Service, error) {
 		streamPub:         extStreamPub,
 		advertisedModels:  modelHexStrings,
 		advertisedCaps:    capabilities,
+		gpuProber:         gpuProber,
 	}, nil
 }
 
@@ -1050,7 +1069,7 @@ func (s *Service) gatewayHeartbeatLoop(ctx context.Context) {
 	startedAt := time.Now()
 	probe := &http.Client{Timeout: 2 * time.Second}
 	for {
-		payload := s.gatewayHeartbeatPayload(heartbeat.CheckOllama(ctx, probe, s.cfg.OllamaURL), time.Since(startedAt))
+		payload := s.gatewayHeartbeatPayload(ctx, heartbeat.CheckOllama(ctx, probe, s.cfg.OllamaURL), time.Since(startedAt))
 		if err := s.gwClient.SendHeartbeat(ctx, payload); err != nil {
 			s.logger.Warn("gateway heartbeat failed", "error", err)
 		}
@@ -1068,8 +1087,8 @@ func (s *Service) gatewayHeartbeatLoop(ctx context.Context) {
 // uptime are measured by the caller: the consumer API stops offering a worker
 // whose runtime reports "unreachable", so a constant here would keep a worker
 // with a dead Ollama in rotation.
-func (s *Service) gatewayHeartbeatPayload(ollamaStatus string, uptime time.Duration) gw.HeartbeatPayload {
-	return gw.HeartbeatPayload{
+func (s *Service) gatewayHeartbeatPayload(ctx context.Context, ollamaStatus string, uptime time.Duration) gw.HeartbeatPayload {
+	p := gw.HeartbeatPayload{
 		ActiveJobs:      int(s.jobCounter.Load()),
 		MaxJobs:         s.cfg.MaxConcurrentJobs,
 		Models:          s.advertisedModels,
@@ -1077,7 +1096,15 @@ func (s *Service) gatewayHeartbeatPayload(ollamaStatus string, uptime time.Durat
 		ProtocolVersion: pkgtypes.WorkerProtocolVersion,
 		OllamaStatus:    ollamaStatus,
 		Uptime:          int64(uptime.Seconds()),
+		WorkerVersion:   hwinfo.WorkerVersion(),
 	}
+	if s.gpuProber != nil {
+		gpu := s.gpuProber.Report(ctx)
+		p.GPU = &gpu
+		p.GPUUtil = gpu.Utilization()
+		p.GPUMemTotalMb, p.GPUMemUsedMb = gpu.MemoryMiB()
+	}
+	return p
 }
 
 // runGatewayMode runs the worker in gateway mode: connects to the worker-gateway
