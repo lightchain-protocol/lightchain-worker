@@ -23,6 +23,7 @@
 //	status      Check on-chain registration status
 //	preflight   Read-only go-live checks (RPC, registration, stake, models, gateway, Ollama, beacon)
 //	watch       Read-only daemon that posts webhook alerts when the worker stops being able to claim
+//	version     Print the build: release tag (or dev+<commit>), Go version, platform
 package main
 
 import (
@@ -47,6 +48,7 @@ import (
 	"github.com/lightchain/worker/internal/cli"
 	"github.com/lightchain/worker/internal/config"
 	"github.com/lightchain/worker/internal/gateway"
+	"github.com/lightchain/worker/internal/hwinfo"
 	"github.com/lightchain/worker/internal/keystore"
 	"github.com/lightchain/worker/internal/release"
 	"github.com/lightchain/worker/internal/service"
@@ -105,6 +107,8 @@ func main() {
 		runWithdraw()
 	case "release":
 		runRelease()
+	case "version", "--version":
+		fmt.Println(hwinfo.Build())
 	case "help", "-h", "--help":
 		printUsage()
 	default:
@@ -156,6 +160,8 @@ Commands:
   watch       Daemon: alert a Discord-compatible webhook when liveness, heartbeat,
               Ollama, registration, suspension, stake or recent claims go bad,
               and again on recovery. Never remediates (no tx, no drain).
+  version     Print the build: release tag (or dev+<commit>), Go version,
+              platform. Include it when reporting a problem.
 
 balance/withdraw/release additionally require JOB_REGISTRY_ADDRESS.
 release additionally reads RELEASE_STATE_PATH (and other RELEASE_* vars).

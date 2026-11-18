@@ -1488,6 +1488,8 @@ func checksumHexNoPrefix(addr common.Address) string {
 // down and returns the process exit code. The sidecar binary and the CLI's
 // `run` command both use it, so a host can serve with the CLI binary alone.
 func Main() int {
+	slog.Info("lightchain worker starting", "build", hwinfo.Build())
+
 	cfg, err := config.Load()
 	if err != nil {
 		slog.Error("config load failed", "error", err)

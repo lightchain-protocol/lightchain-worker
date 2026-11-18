@@ -140,3 +140,11 @@ func TestWorkerVersion(t *testing.T) {
 	got := WorkerVersion()
 	assert.True(t, got == "dev" || strings.HasPrefix(got, "dev+"), "want dev or dev+<rev>, got %q", got)
 }
+
+func TestBuild(t *testing.T) {
+	old := Version
+	defer func() { Version = old }()
+
+	Version = "v1.2.3"
+	assert.Regexp(t, `^lightchain-worker v1\.2\.3 \(go[^,]+, \w+/\w+\)$`, Build())
+}

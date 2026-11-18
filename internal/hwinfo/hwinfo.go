@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"net/http"
 	"os/exec"
+	"runtime"
 	"runtime/debug"
 	"strconv"
 	"strings"
@@ -53,6 +54,12 @@ func WorkerVersion() string {
 		rev += "-dirty"
 	}
 	return "dev+" + rev
+}
+
+// Build is the running build on one line, for `lightchain-worker version` and
+// the start-up log, e.g. "lightchain-worker v1.2.3 (go1.26.0, linux/amd64)".
+func Build() string {
+	return fmt.Sprintf("lightchain-worker %s (%s, %s/%s)", WorkerVersion(), runtime.Version(), runtime.GOOS, runtime.GOARCH)
 }
 
 // GPUDevice is one GPU as nvidia-smi reports it.
