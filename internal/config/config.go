@@ -202,7 +202,8 @@ type Config struct {
 	TTSMaxChars     int
 	TTSTimeout      time.Duration
 
-	// Beacon API (CL node)
+	// Beacon API (CL node): one node, or several separated by commas in
+	// order of preference (blob.NewBeaconClient).
 	BeaconAPIURL string
 
 	// Job execution

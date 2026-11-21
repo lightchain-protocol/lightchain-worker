@@ -80,24 +80,25 @@ func TestDialRPC_FailsOverWhenTheFirstEndpointIsDown(t *testing.T) {
 func TestDialRPC_KeepsWorkingWhenTheNodeInUseStops(t *testing.T) {
 	t.Parallel()
 
-	first := &rpcEndpoint{}
-	node := httptest.NewServer(first)
-	second := &rpcEndpoint{}
-	client, err := DialRPC(node.URL+","+serve(t, second), time.Second)
+	inUse := &rpcEndpoint{}
+	inUseSrv := httptest.NewServer(inUse)
+	t.Cleanup(inUseSrv.Close)
+	next := &rpcEndpoint{}
+	client, err := DialRPC(inUseSrv.URL+", "+serve(t, next), time.Second)
 	require.NoError(t, err)
 	defer client.Close()
 
 	_, err = client.ChainID(context.Background())
 	require.NoError(t, err)
-	require.Equal(t, int32(1), first.hits.Load())
+	require.Equal(t, int32(1), inUse.hits.Load(), "the first endpoint answers while its node is up")
 
-	node.Close()
+	inUseSrv.Close()
 	for range 3 {
 		id, err := client.ChainID(context.Background())
 		require.NoError(t, err)
 		assert.Equal(t, int64(1), id.Int64())
 	}
-	assert.Equal(t, int32(3), second.hits.Load())
+	assert.Equal(t, int32(3), next.hits.Load())
 }
 
 func TestDialRPC_FailsOverWhenTheFirstEndpointHangs(t *testing.T) {

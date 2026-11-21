@@ -77,7 +77,7 @@ sudo chmod 600 /etc/lightchain/worker/env
 
 There is no `REDIS_URL`: the external profile streams results over an authenticated WebSocket to the gateway and sends heartbeats and drain over gateway HTTPS.
 
-`RPC_URL` takes one endpoint, or several separated by commas in order of preference. When one stops answering, the worker moves to the next and stays there until that one fails or the worker restarts.
+`RPC_URL` takes one endpoint, or several separated by commas in order of preference. When one stops answering, the worker moves to the next and stays there until that one fails or the worker restarts. `BEACON_API_URL` takes a list the same way: a blob fetch that fails on one beacon node is retried on the next.
 
 The CLI reads its configuration from the environment. This shell function loads the file for each command; define it once per shell:
 
