@@ -561,6 +561,20 @@ func TestPreflight_OllamaErrorStatus(t *testing.T) {
 	assert.NotContains(t, buf.String(), "ollama pull")
 }
 
+// BEACON_API_URL may list several beacon nodes, as RPC_URL lists endpoints;
+// the preflight checks each one.
+func TestPreflight_BeaconList(t *testing.T) {
+	t.Parallel()
+	key := mustGenerateECDHKey(t)
+	fc := greenChain(time.Now(), key.PublicKey().Bytes())
+	srv := sidecarServer(t, "llama3:8b")
+	h, buf := newPreflight(t, fc, key, srv)
+	h.BeaconURL = srv.URL + ", " + srv.URL + "/"
+
+	require.True(t, h.Run(context.Background()), buf.String())
+	assert.Equal(t, 2, strings.Count(buf.String(), "Prysm/test"))
+}
+
 func TestPreflight_BeaconMalformedBody(t *testing.T) {
 	t.Parallel()
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {

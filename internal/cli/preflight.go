@@ -420,9 +420,16 @@ func (h *PreflightHandler) checkBeacon(ctx context.Context, r *report) {
 		r.skip("beacon", "BEACON_API_URL not set")
 		return
 	}
-	resp, err := httpGet(ctx, h.HTTP, strings.TrimRight(h.BeaconURL, "/")+"/eth/v1/node/version")
+	// One beacon node, or several separated by commas: check each.
+	for u := range strings.SplitSeq(h.BeaconURL, ",") {
+		h.checkBeaconNode(ctx, r, strings.TrimRight(strings.TrimSpace(u), "/"))
+	}
+}
+
+func (h *PreflightHandler) checkBeaconNode(ctx context.Context, r *report, beaconURL string) {
+	resp, err := httpGet(ctx, h.HTTP, beaconURL+"/eth/v1/node/version")
 	if err != nil {
-		r.failf("beacon", "unreachable at %s: %v", h.BeaconURL, err)
+		r.failf("beacon", "unreachable at %s: %v", beaconURL, err)
 		return
 	}
 	defer func() { _ = resp.Body.Close() }()
@@ -432,11 +439,11 @@ func (h *PreflightHandler) checkBeacon(ctx context.Context, r *report) {
 		} `json:"data"`
 	}
 	if resp.StatusCode != http.StatusOK {
-		r.failf("beacon", "%s returned %d", h.BeaconURL, resp.StatusCode)
+		r.failf("beacon", "%s returned %d", beaconURL, resp.StatusCode)
 		return
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&v); err != nil {
-		r.failf("beacon", "%s is not a beacon API (bad /eth/v1/node/version body: %v)", h.BeaconURL, err)
+		r.failf("beacon", "%s is not a beacon API (bad /eth/v1/node/version body: %v)", beaconURL, err)
 		return
 	}
 	r.pass("beacon", "%s", v.Data.Version)
