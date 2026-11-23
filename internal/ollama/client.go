@@ -77,9 +77,11 @@ type GenerateRequest struct {
 
 // GenerateResponse is the JSON body returned from POST /api/generate (stream=false).
 type GenerateResponse struct {
-	Model    string `json:"model"`
-	Response string `json:"response"`
-	Done     bool   `json:"done"`
+	Model      string `json:"model"`
+	Response   string `json:"response"`
+	Thinking   string `json:"thinking"`
+	Done       bool   `json:"done"`
+	DoneReason string `json:"done_reason"`
 }
 
 // ChatMessage is a single message in a chat conversation.
@@ -112,9 +114,10 @@ type ChatRequest struct {
 
 // ChatResponse is the JSON body returned from POST /api/chat (stream=false).
 type ChatResponse struct {
-	Model   string      `json:"model"`
-	Message ChatMessage `json:"message"`
-	Done    bool        `json:"done"`
+	Model      string      `json:"model"`
+	Message    ChatMessage `json:"message"`
+	Done       bool        `json:"done"`
+	DoneReason string      `json:"done_reason"`
 }
 
 // timings are the model's own measurements, present only on the terminal
@@ -132,19 +135,21 @@ type timings struct {
 // stream=true. Every object carries an incremental `response` delta; the
 // last one sets done=true and adds the timing block.
 type generateStreamLine struct {
-	Response string `json:"response"`
-	Thinking string `json:"thinking"`
-	Done     bool   `json:"done"`
-	Error    string `json:"error"`
+	Response   string `json:"response"`
+	Thinking   string `json:"thinking"`
+	Done       bool   `json:"done"`
+	DoneReason string `json:"done_reason"`
+	Error      string `json:"error"`
 	timings
 }
 
 // chatStreamLine is the /api/chat equivalent: the delta arrives in
 // message.content instead of a top-level response field.
 type chatStreamLine struct {
-	Message ChatMessage `json:"message"`
-	Done    bool        `json:"done"`
-	Error   string      `json:"error"`
+	Message    ChatMessage `json:"message"`
+	Done       bool        `json:"done"`
+	DoneReason string      `json:"done_reason"`
+	Error      string      `json:"error"`
 	timings
 }
 
@@ -169,8 +174,10 @@ type StreamHandlers struct {
 // Ollama sends these on the terminal object; the worker used to drop them,
 // so the UI had no way to show tokens or throughput.
 type StreamStats struct {
-	PromptTokens       int
-	EvalTokens         int
+	PromptTokens int
+	EvalTokens   int
+	// ThinkingBytes counts the thinking channel, including a thinking-only
+	// answer that was settled as the response.
 	ThinkingBytes      int
 	LoadDuration       time.Duration
 	PromptEvalDuration time.Duration
@@ -386,11 +393,7 @@ func (c *OllamaClient) Generate(ctx context.Context, model, prompt string) (stri
 	if err := json.Unmarshal(body, &genResp); err != nil {
 		return "", fmt.Errorf("unmarshal generate response: %w", err)
 	}
-	if err := errEmptyGeneration(len(genResp.Response), 0); err != nil {
-		return "", err
-	}
-
-	return genResp.Response, nil
+	return answer(genResp.Response, genResp.Thinking, genResp.DoneReason)
 }
 
 // Chat sends a multi-turn conversation to the Ollama server and returns the assistant's response.
@@ -436,11 +439,7 @@ func (c *OllamaClient) Chat(ctx context.Context, model string, messages []ChatMe
 	if err := json.Unmarshal(body, &chatResp); err != nil {
 		return "", fmt.Errorf("unmarshal chat response: %w", err)
 	}
-	if err := errEmptyGeneration(len(chatResp.Message.Content), len(chatResp.Message.Thinking)); err != nil {
-		return "", err
-	}
-
-	return chatResp.Message.Content, nil
+	return answer(chatResp.Message.Content, chatResp.Message.Thinking, chatResp.DoneReason)
 }
 
 // GenerateStream is the stream=true form of Generate: onToken fires once per
@@ -466,9 +465,9 @@ func (c *OllamaClient) GenerateStream(
 		Images:    images,
 	}
 
-	var full strings.Builder
-	var thinking int
+	var full, thinking strings.Builder
 	var last timings
+	var doneReason string
 	err := c.stream(ctx, "generate", reqBody, func(line []byte) (bool, error) {
 		var chunk generateStreamLine
 		if err := json.Unmarshal(line, &chunk); err != nil {
@@ -478,7 +477,7 @@ func (c *OllamaClient) GenerateStream(
 			return false, fmt.Errorf("ollama generate stream error: %s", chunk.Error)
 		}
 		if chunk.Thinking != "" {
-			thinking += len(chunk.Thinking)
+			thinking.WriteString(chunk.Thinking)
 			if h.OnThinking != nil {
 				if err := h.OnThinking(chunk.Thinking); err != nil {
 					return false, fmt.Errorf("generate thinking callback: %w", err)
@@ -488,7 +487,8 @@ func (c *OllamaClient) GenerateStream(
 		if chunk.Response != "" {
 			// Only the answer accumulates into `full`. That string becomes
 			// the settlement ciphertext, so letting reasoning into it would
-			// change the hash completeJob commits to.
+			// change the hash completeJob commits to. (A thinking-only answer
+			// that stopped normally is settled whole by streamAnswer.)
 			full.WriteString(chunk.Response)
 			if h.OnToken != nil {
 				if err := h.OnToken(chunk.Response); err != nil {
@@ -498,17 +498,51 @@ func (c *OllamaClient) GenerateStream(
 		}
 		if chunk.Done {
 			last = chunk.timings
+			doneReason = chunk.DoneReason
 		}
 		return chunk.Done, nil
 	})
 	if err != nil {
 		return "", StreamStats{}, err
 	}
-	stats := last.stats(thinking)
-	if err := errEmptyGeneration(full.Len(), thinking); err != nil {
-		return "", stats, err
+	stats := last.stats(thinking.Len())
+	text, err := streamAnswer(full.String(), thinking.String(), doneReason, h.OnToken)
+	return text, stats, err
+}
+
+// answer is what a finished generation settles as: its content, or, when the
+// content is empty and the model stopped normally (done_reason "stop"), its
+// thinking. A reasoning build such as qwen3-vl:8b counts output as reasoning
+// until it sees </think>, so a short finished answer can arrive entirely as
+// thinking. Any other done_reason, a missing one included, keeps the empty
+// generation an error: "length" means the budget ran out mid-reasoning, and an
+// unknown reason is not evidence the model finished.
+//
+// ponytail: a model that reasons and stops without ever writing </think> hands
+// its reasoning over as the answer; still better than no answer and a held fee.
+func answer(content, thinking, doneReason string) (string, error) {
+	if content == "" && thinking != "" && doneReason == "stop" {
+		return thinking, nil
 	}
-	return full.String(), stats, nil
+	if err := errEmptyGeneration(len(content), len(thinking)); err != nil {
+		return "", fmt.Errorf("%w (done_reason %q)", err, doneReason)
+	}
+	return content, nil
+}
+
+// streamAnswer is answer for a stream. When the thinking becomes the answer,
+// its deltas went to the reasoning callback (or nowhere), never to onToken, so
+// it is sent once more as a single answer delta: the returned string stays
+// exactly the concatenation of what onToken was handed.
+func streamAnswer(content, thinking, doneReason string, onToken TokenFunc) (string, error) {
+	text, err := answer(content, thinking, doneReason)
+	if err != nil || content != "" || onToken == nil {
+		return text, err
+	}
+	if err := onToken(text); err != nil {
+		return "", fmt.Errorf("answer token callback: %w", err)
+	}
+	return text, nil
 }
 
 // errEmptyGeneration turns a generation that produced no answer into an
@@ -564,9 +598,9 @@ func (c *OllamaClient) ChatStream(
 		Format:    c.opts.Format,
 	}
 
-	var full strings.Builder
-	var thinking int
+	var full, thinking strings.Builder
 	var last timings
+	var doneReason string
 	err := c.stream(ctx, "chat", reqBody, func(line []byte) (bool, error) {
 		var chunk chatStreamLine
 		if err := json.Unmarshal(line, &chunk); err != nil {
@@ -576,7 +610,7 @@ func (c *OllamaClient) ChatStream(
 			return false, fmt.Errorf("ollama chat stream error: %s", chunk.Error)
 		}
 		if chunk.Message.Thinking != "" {
-			thinking += len(chunk.Message.Thinking)
+			thinking.WriteString(chunk.Message.Thinking)
 			if h.OnThinking != nil {
 				if err := h.OnThinking(chunk.Message.Thinking); err != nil {
 					return false, fmt.Errorf("chat thinking callback: %w", err)
@@ -593,17 +627,16 @@ func (c *OllamaClient) ChatStream(
 		}
 		if chunk.Done {
 			last = chunk.timings
+			doneReason = chunk.DoneReason
 		}
 		return chunk.Done, nil
 	})
 	if err != nil {
 		return "", StreamStats{}, err
 	}
-	stats := last.stats(thinking)
-	if err := errEmptyGeneration(full.Len(), thinking); err != nil {
-		return "", stats, err
-	}
-	return full.String(), stats, nil
+	stats := last.stats(thinking.Len())
+	text, err := streamAnswer(full.String(), thinking.String(), doneReason, h.OnToken)
+	return text, stats, err
 }
 
 // stream POSTs reqBody to /api/{name} and feeds each NDJSON line to onLine
