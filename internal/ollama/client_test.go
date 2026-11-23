@@ -696,3 +696,157 @@ func TestWithReasoningAllowance(t *testing.T) {
 	assert.Nil(t, WithReasoningAllowance(nil, []string{"qwen3-vl:8b"}, -1, 4096), "an unlimited base is never capped")
 	assert.Nil(t, WithReasoningAllowance(nil, []string{"qwen3-vl:8b"}, 8192, 4096), "a larger base is never lowered")
 }
+
+// A reasoning build such as qwen3-vl:8b can file a short, finished answer
+// under thinking: its parser counts output as reasoning until it sees
+// </think>. done_reason "stop" says the model ended normally, so the thinking
+// is the answer. The reasoning deltas already went out on their own frame
+// kind; the answer goes out once more as a single answer delta at the end, so
+// the returned string is still exactly what OnToken was handed.
+func TestStream_ThinkingOnlyThatStoppedIsTheAnswer(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name  string
+		path  string
+		lines []string
+		run   func(*OllamaClient, StreamHandlers) (string, StreamStats, error)
+	}{
+		{
+			name: "chat",
+			path: "/api/chat",
+			lines: []string{
+				`{"message":{"role":"assistant","content":"","thinking":"TESTE"},"done":false}`,
+				`{"message":{"role":"assistant","content":"","thinking":" OK"},"done":false}`,
+				`{"message":{"role":"assistant","content":""},"done":true,"done_reason":"stop"}`,
+			},
+			run: func(c *OllamaClient, h StreamHandlers) (string, StreamStats, error) {
+				return c.ChatStream(context.Background(), "qwen3-vl:8b", []ChatMessage{{Role: "user", Content: "reply TESTE OK"}}, h)
+			},
+		},
+		{
+			name: "generate",
+			path: "/api/generate",
+			lines: []string{
+				`{"response":"","thinking":"TESTE"}`,
+				`{"response":"","thinking":" OK"}`,
+				`{"response":"","done":true,"done_reason":"stop"}`,
+			},
+			run: func(c *OllamaClient, h StreamHandlers) (string, StreamStats, error) {
+				return c.GenerateStream(context.Background(), "qwen3-vl:8b", "reply TESTE OK", nil, h)
+			},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			srv := ndjsonServer(t, tc.path, tc.lines, nil)
+			defer srv.Close()
+
+			var thinking, content []string
+			full, stats, err := tc.run(NewOllamaClient(srv.URL, 5*time.Second), StreamHandlers{
+				OnToken:    func(d string) error { content = append(content, d); return nil },
+				OnThinking: func(d string) error { thinking = append(thinking, d); return nil },
+			})
+
+			require.NoError(t, err)
+			assert.Equal(t, "TESTE OK", full)
+			assert.Equal(t, []string{"TESTE", " OK"}, thinking)
+			assert.Equal(t, []string{"TESTE OK"}, content, "the answer goes out once, as one answer delta")
+			assert.Equal(t, 8, stats.ThinkingBytes)
+		})
+	}
+}
+
+// A model that ran out of budget while reasoning (done_reason "length") has
+// not answered: its thinking is a half-finished chain of thought.
+func TestStream_ThinkingOnlyThatHitTheLimitIsEmpty(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name string
+		path string
+		line string
+		run  func(*OllamaClient, StreamHandlers) (string, StreamStats, error)
+	}{
+		{
+			name: "chat",
+			path: "/api/chat",
+			line: `{"message":{"role":"assistant","content":"","thinking":"Let me work through"},"done":true,"done_reason":"length"}`,
+			run: func(c *OllamaClient, h StreamHandlers) (string, StreamStats, error) {
+				return c.ChatStream(context.Background(), "qwen3-vl:30b", []ChatMessage{{Role: "user", Content: "hi"}}, h)
+			},
+		},
+		{
+			name: "generate",
+			path: "/api/generate",
+			line: `{"response":"","thinking":"Let me work through","done":true,"done_reason":"length"}`,
+			run: func(c *OllamaClient, h StreamHandlers) (string, StreamStats, error) {
+				return c.GenerateStream(context.Background(), "qwen3-vl:30b", "hi", nil, h)
+			},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			srv := ndjsonServer(t, tc.path, []string{tc.line}, nil)
+			defer srv.Close()
+
+			var content []string
+			_, _, err := tc.run(NewOllamaClient(srv.URL, 5*time.Second),
+				StreamHandlers{OnToken: func(d string) error { content = append(content, d); return nil }})
+
+			require.ErrorIs(t, err, ErrEmptyGeneration)
+			assert.Contains(t, err.Error(), `done_reason "length"`)
+			assert.Empty(t, content)
+		})
+	}
+}
+
+// The non-stream calls apply the same rule: stop hands over the thinking,
+// anything else (length, or no done_reason at all) stays an empty generation.
+func TestNonStream_ThinkingOnlyAnswerFollowsDoneReason(t *testing.T) {
+	t.Parallel()
+
+	calls := map[string]struct {
+		body string
+		run  func(*OllamaClient) (string, error)
+	}{
+		"chat": {
+			body: `{"message":{"role":"assistant","content":"","thinking":"TESTE OK"},"done":true,"done_reason":%q}`,
+			run: func(c *OllamaClient) (string, error) {
+				return c.Chat(context.Background(), "qwen3-vl:8b", []ChatMessage{{Role: "user", Content: "reply TESTE OK"}})
+			},
+		},
+		"generate": {
+			body: `{"response":"","thinking":"TESTE OK","done":true,"done_reason":%q}`,
+			run: func(c *OllamaClient) (string, error) {
+				return c.Generate(context.Background(), "qwen3-vl:8b", "reply TESTE OK")
+			},
+		},
+	}
+	reasons := map[string]struct{ doneReason, want string }{
+		"stop":   {doneReason: "stop", want: "TESTE OK"},
+		"length": {doneReason: "length"},
+		"none":   {},
+	}
+	for callName, call := range calls {
+		for reasonName, tc := range reasons {
+			t.Run(callName+"/"+reasonName, func(t *testing.T) {
+				t.Parallel()
+				srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					_, _ = fmt.Fprintf(w, call.body, tc.doneReason)
+				}))
+				defer srv.Close()
+
+				got, err := call.run(NewOllamaClient(srv.URL, 5*time.Second))
+				if tc.want == "" {
+					require.ErrorIs(t, err, ErrEmptyGeneration)
+					return
+				}
+				require.NoError(t, err)
+				assert.Equal(t, tc.want, got)
+			})
+		}
+	}
+}
