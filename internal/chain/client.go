@@ -631,6 +631,144 @@ func (c *ChainClient) GetRequiredCapabilities(ctx context.Context, reqID uint64)
 	return c.sessionManager.GetRequiredCapabilities(&bind.CallOpts{Context: ctx}, new(big.Int).SetUint64(reqID))
 }
 
+// SetWorkerPrice sends a setWorkerPrice tx: this worker's per-job price for
+// a model, in wei (0 = the model's governance fee).
+func (c *ChainClient) SetWorkerPrice(ctx context.Context, modelID [32]byte, price *big.Int) error {
+	if err := c.requireSessionManager(); err != nil {
+		return err
+	}
+	return c.submitPreparedTx(ctx, "SetWorkerPrice", nil, func(opts *bind.TransactOpts) (*types.Transaction, error) {
+		return c.sessionManager.SetWorkerPrice(opts, modelID, price)
+	})
+}
+
+// GetWorkerPrice reads a worker's own price for a model as set (0 = not set).
+func (c *ChainClient) GetWorkerPrice(ctx context.Context, worker common.Address, modelID [32]byte) (*big.Int, error) {
+	if err := c.requireSessionManager(); err != nil {
+		return nil, err
+	}
+	return c.sessionManager.GetWorkerPrice(&bind.CallOpts{Context: ctx}, worker, modelID)
+}
+
+// MinWorkerPrice reads the lowest own price SessionManager accepts for a model.
+func (c *ChainClient) MinWorkerPrice(ctx context.Context, modelID [32]byte) (*big.Int, error) {
+	if err := c.requireSessionManager(); err != nil {
+		return nil, err
+	}
+	return c.sessionManager.MinWorkerPrice(&bind.CallOpts{Context: ctx}, modelID)
+}
+
+// ModelFee reads a model's governance fee: the quote for a worker that set
+// no price of its own (the zero address never does).
+func (c *ChainClient) ModelFee(ctx context.Context, modelID [32]byte) (*big.Int, error) {
+	if err := c.requireSessionManager(); err != nil {
+		return nil, err
+	}
+	return c.sessionManager.QuoteWorkerFee(&bind.CallOpts{Context: ctx}, common.Address{}, modelID)
+}
+
+// QuoteWorkerFee reads what worker would charge per job on modelID: its own
+// price, raised to the floor, or the model's fee when it set none.
+func (c *ChainClient) QuoteWorkerFee(ctx context.Context, worker common.Address, modelID [32]byte) (*big.Int, error) {
+	if err := c.requireSessionManager(); err != nil {
+		return nil, err
+	}
+	return c.sessionManager.QuoteWorkerFee(&bind.CallOpts{Context: ctx}, worker, modelID)
+}
+
+// RequestTerms are the parts of a session request that decide which workers
+// may ever claim it, whatever the sortition draw.
+type RequestTerms struct {
+	ModelID  [32]byte
+	Excluded *big.Int // capability bits a claimer must not declare
+	MaxFee   *big.Int // per-job fee cap; zero = the model's fee
+	// Worker is the worker the request named (zero = any). Others may claim
+	// only after FallbackBlocks (never when it is zero).
+	Worker         common.Address
+	FallbackBlocks uint64
+}
+
+// GetRequestTerms reads a request's model and terms. It fails on a
+// SessionManager without request terms (before worker pricing).
+func (c *ChainClient) GetRequestTerms(ctx context.Context, reqID uint64) (RequestTerms, error) {
+	if err := c.requireSessionManager(); err != nil {
+		return RequestTerms{}, err
+	}
+	opts := &bind.CallOpts{Context: ctx}
+	id := new(big.Int).SetUint64(reqID)
+	r, err := c.sessionManager.GetRequest(opts, id)
+	if err != nil {
+		return RequestTerms{}, fmt.Errorf("getRequest %d: %w", reqID, err)
+	}
+	t, err := c.sessionManager.GetRequestTerms(opts, id)
+	if err != nil {
+		return RequestTerms{}, fmt.Errorf("getRequestTerms %d: %w", reqID, err)
+	}
+	return RequestTerms{
+		ModelID: r.ModelId, Excluded: t.ExcludedCaps, MaxFee: t.MaxFee,
+		Worker: t.Worker, FallbackBlocks: t.FallbackBlocks,
+	}, nil
+}
+
+// AtCapacity reports whether the SessionManager counts worker as full: its
+// jobs in flight plus the claims it holds that were not adopted yet, against
+// AIConfig's maxConcurrentJobs. A full worker cannot claim, so a request that
+// named it waits on it until its fallback.
+func (c *ChainClient) AtCapacity(ctx context.Context, worker common.Address) (bool, error) {
+	if err := c.requireJobRegistry(); err != nil {
+		return false, err
+	}
+	if err := c.requireSessionManager(); err != nil {
+		return false, err
+	}
+	opts := &bind.CallOpts{Context: ctx}
+	inFlight, err := c.jobRegistry.GetWorkerInFlightJobs(opts, worker)
+	if err != nil {
+		return false, fmt.Errorf("getWorkerInFlightJobs: %w", err)
+	}
+	claims, err := c.sessionManager.GetPendingClaims(opts, worker)
+	if err != nil {
+		return false, fmt.Errorf("getPendingClaims: %w", err)
+	}
+	limit, err := c.aiConfig.GetMaxConcurrentJobs(opts)
+	if err != nil {
+		return false, fmt.Errorf("getMaxConcurrentJobs: %w", err)
+	}
+	return new(big.Int).Add(inFlight, claims).Cmp(limit) >= 0, nil
+}
+
+// GetChosenWorker reads the worker a request named (zero = any worker).
+func (c *ChainClient) GetChosenWorker(ctx context.Context, reqID uint64) (common.Address, error) {
+	if err := c.requireSessionManager(); err != nil {
+		return common.Address{}, err
+	}
+	out, err := c.sessionManager.GetChosenWorker(&bind.CallOpts{Context: ctx}, new(big.Int).SetUint64(reqID))
+	if err != nil {
+		return common.Address{}, fmt.Errorf("getChosenWorker %d: %w", reqID, err)
+	}
+	return out.Worker, nil
+}
+
+// DeclineSession turns down an open request that named this worker.
+func (c *ChainClient) DeclineSession(ctx context.Context, reqID uint64) error {
+	if err := c.requireSessionManager(); err != nil {
+		return err
+	}
+	return c.submitPreparedTx(ctx, "DeclineSession", nil, func(opts *bind.TransactOpts) (*types.Transaction, error) {
+		return c.sessionManager.DeclineSession(opts, new(big.Int).SetUint64(reqID))
+	})
+}
+
+// ReleaseClaim gives back a claim of this worker that was never adopted.
+func (c *ChainClient) ReleaseClaim(ctx context.Context, reqID uint64) error {
+	if err := c.requireSessionManager(); err != nil {
+		return err
+	}
+	return c.submitPreparedTx(ctx, "ReleaseClaim", nil, func(opts *bind.TransactOpts) (*types.Transaction, error) {
+		return c.sessionManager.ReleaseClaim(opts, new(big.Int).SetUint64(reqID))
+	})
+}
+
 // EligibleNow returns whether `worker` currently clears the sortition threshold for the request.
 func (c *ChainClient) EligibleNow(ctx context.Context, reqID uint64, worker common.Address) (bool, error) {
 	if err := c.requireSessionManager(); err != nil {

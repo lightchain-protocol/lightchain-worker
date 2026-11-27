@@ -170,6 +170,14 @@ On its first start the worker does not read the chain's history: it starts its s
 
 Fees accrue in JobRegistry, and the worker settles them to its balance after the dispute window. A timeout or a lost dispute counts as an offense, and three offenses suspend the worker for 7 days. On testnet the slash rates are currently 0, so an offense takes no stake; on a network with non-zero rates it also takes a share of the minimum stake. Keep the host up and the models loaded, and avoid killing the service mid-job.
 
+## Pricing and claims
+
+These need a SessionManager with worker pricing; on one without it the worker claims exactly as before.
+
+- **Your own price.** By default a worker earns the model's on-chain fee. `WORKER_PRICES="llama3-8b=2000000000000000;qwen3-vl:8b=0"` sets a per-job price per model, in wei, declared with `setWorkerPrice` at startup (only when it differs from the chain). A model left out is not touched; `0` clears a price back to the fee. A price below `minWorkerPrice(model)` is not sent. A plain request is capped at the model's fee, so a worker priced above it only claims requests that allow more. When governance turns price priority on, cheaper workers get to claim first.
+- **Declining when full.** A request can name the worker it wants. While the worker is full (locally, or on chain where unadopted claims count), or can never serve such a request (its price is above the cap, or the request excludes its capabilities), it turns the request down (`declineSession`) so the consumer is re-routed at once. `SORTITION_DECLINE_WHEN_FULL=false` keeps such requests waiting instead.
+- **Releasing unadopted claims.** A claim the consumer never adopts holds one of the worker's capacity slots on chain. After `SORTITION_ADOPT_TIMEOUT_BLOCKS` (default 30) the worker gives it back (`releaseClaim`). `0` turns this off.
+
 ## Troubleshooting
 
 Run `lcw preflight` first; each `[FAIL]` line names its fix.
