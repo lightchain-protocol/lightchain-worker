@@ -2,6 +2,7 @@ package config
 
 import (
 	"errors"
+	"math/big"
 	"net/url"
 	"os"
 	"testing"
@@ -41,6 +42,7 @@ var allEnvKeys = []string{
 	"SORTITION_STATE_DIR", "SORTITION_CHUNK_SIZE",
 	"SORTITION_POLL_INTERVAL", "SORTITION_CONFIRMATIONS",
 	"SORTITION_SESSION_RETRY_LIMIT",
+	"SORTITION_ADOPT_TIMEOUT_BLOCKS", "SORTITION_DECLINE_WHEN_FULL", "WORKER_PRICES",
 }
 
 // clearEnv ensures all config-related env vars are unset before each test.
@@ -1156,4 +1158,59 @@ func TestRedisURLFault_UnrecognisedErrorIsNotEchoed(t *testing.T) {
 
 	assert.Equal(t, "malformed URL", redisURLFault(unknown))
 	assert.Equal(t, "malformed URL", redisURLFault(&url.Error{Op: "parse", URL: "redis://:s3cr3t-p4ssw0rd@localhost", Err: unknown}))
+}
+
+func TestLoad_WorkerPrices(t *testing.T) {
+	validEnv(t)
+	t.Setenv("SUPPORTED_MODELS", "gpt-oss:20b,qwen3-vl:8b")
+	t.Setenv("WORKER_PRICES", "gpt-oss:20b=2000000000000000; qwen3-vl:8b = 0")
+
+	cfg, err := Load()
+	require.NoError(t, err)
+	assert.Equal(t, map[string]*big.Int{
+		"gpt-oss:20b": big.NewInt(2_000_000_000_000_000),
+		"qwen3-vl:8b": big.NewInt(0),
+	}, cfg.WorkerPrices)
+
+	// the on-chain maximum itself is accepted
+	t.Setenv("WORKER_PRICES", "gpt-oss:20b=79228162514264337593543950335")
+	cfg, err = Load()
+	require.NoError(t, err)
+	assert.Equal(t, maxWorkerPrice, cfg.WorkerPrices["gpt-oss:20b"])
+}
+
+func TestLoad_WorkerPricesErrors(t *testing.T) {
+	for name, tc := range map[string]struct{ raw, want string }{
+		"not a number": {"llama3-8b=0.002", `WORKER_PRICES: malformed entry "llama3-8b=0.002"`},
+		"negative":     {"llama3-8b=-1", `WORKER_PRICES: malformed entry "llama3-8b=-1"`},
+		"unsupported":  {"gpt-4o=1", `WORKER_PRICES: model "gpt-4o" is not in SUPPORTED_MODELS`},
+		"duplicate":    {"llama3-8b=1;llama3-8b=2", `WORKER_PRICES: duplicate entry for model "llama3-8b"`},
+		"above uint96": {"llama3-8b=79228162514264337593543950336", `WORKER_PRICES: llama3-8b: price 79228162514264337593543950336 wei is above the on-chain maximum 79228162514264337593543950335 (2^96-1)`},
+	} {
+		t.Run(name, func(t *testing.T) {
+			validEnv(t)
+			t.Setenv("WORKER_PRICES", tc.raw)
+			_, err := Load()
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), tc.want)
+		})
+	}
+}
+
+// Without the new variables a worker declares no prices, releases unadopted
+// claims after 30 blocks and declines requests that named it while it is full.
+func TestLoad_ClaimLifecycleDefaults(t *testing.T) {
+	validEnv(t)
+	cfg, err := Load()
+	require.NoError(t, err)
+	assert.Nil(t, cfg.WorkerPrices)
+	assert.Equal(t, uint64(30), cfg.SortitionAdoptTimeoutBlocks)
+	assert.True(t, cfg.SortitionDeclineWhenFull)
+
+	t.Setenv("SORTITION_ADOPT_TIMEOUT_BLOCKS", "0")
+	t.Setenv("SORTITION_DECLINE_WHEN_FULL", "false")
+	cfg, err = Load()
+	require.NoError(t, err)
+	assert.Equal(t, uint64(0), cfg.SortitionAdoptTimeoutBlocks)
+	assert.False(t, cfg.SortitionDeclineWhenFull)
 }

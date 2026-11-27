@@ -125,6 +125,12 @@ type Config struct {
 	// fail loudly.
 	ModelOptions map[string]ollama.ClientOptions
 
+	// WorkerPrices is WORKER_PRICES: this worker's per-job price per model,
+	// in wei, declared on chain with SessionManager.setWorkerPrice. A model
+	// with no entry is priced at its governance fee. A request is only
+	// claimable when its fee cap covers the price.
+	WorkerPrices map[string]*big.Int
+
 	// Token-stream coalescing. A chunk frame is published when either
 	// StreamChunkTokens deltas or StreamChunkInterval have accumulated,
 	// whichever comes first. Batching matters because the relay enforces
@@ -345,6 +351,13 @@ type Config struct {
 	// claim after that only spends gas on a session nobody uses. Defaults to
 	// 150 (5 min at 2 s slots, 15 min at 6 s); 0 disables.
 	SortitionMaxRequestAgeBlocks uint64
+	// SortitionAdoptTimeoutBlocks is how long a claim may wait for its requester
+	// to adopt it before the worker releases it (releaseClaim), freeing the
+	// on-chain capacity slot it holds. Defaults to 30; 0 disables.
+	SortitionAdoptTimeoutBlocks uint64
+	// SortitionDeclineWhenFull turns down requests that named this worker while
+	// it is at capacity or can never serve them. Defaults to true.
+	SortitionDeclineWhenFull bool
 	// SortitionSessionRetryLimit bounds how many passes the JobWatcher retries
 	// a job whose session is not Active before giving up and skipping it, so
 	// one session that never returns to Active cannot wedge the watcher and
@@ -519,6 +532,7 @@ func Load() (*Config, error) {
 	// at startup — a typo here would silently serve a paid Max job at the
 	// standard budget.
 	cfg.ModelOptions = parseModelOptions(os.Getenv("MODEL_OPTIONS"), cfg.SupportedModels, &errs)
+	cfg.WorkerPrices = parseWorkerPrices(os.Getenv("WORKER_PRICES"), cfg.SupportedModels, &errs)
 
 	// On-chain deadline guard. Defaults match pipeline's fallback reserves.
 	cfg.DeadlineGuardEnabled = parseBool("DEADLINE_GUARD_ENABLED", true, &errs)
@@ -590,6 +604,8 @@ func Load() (*Config, error) {
 	cfg.SortitionConfirmations = parseUint64("SORTITION_CONFIRMATIONS", 0, &errs)
 	cfg.SortitionSessionLookbackBlocks = parseUint64("SORTITION_SESSION_LOOKBACK_BLOCKS", 2000, &errs)
 	cfg.SortitionMaxRequestAgeBlocks = parseUint64("SORTITION_MAX_REQUEST_AGE_BLOCKS", 150, &errs)
+	cfg.SortitionAdoptTimeoutBlocks = parseUint64("SORTITION_ADOPT_TIMEOUT_BLOCKS", 30, &errs)
+	cfg.SortitionDeclineWhenFull = parseBool("SORTITION_DECLINE_WHEN_FULL", true, &errs)
 	cfg.SortitionSessionRetryLimit = parseInt("SORTITION_SESSION_RETRY_LIMIT", 10, &errs)
 
 	if len(errs) > 0 {
@@ -909,6 +925,49 @@ func cutLast(s string, sep byte) (before, after string, found bool) {
 		return s[:i], s[i+1:], true
 	}
 	return s, "", false
+}
+
+// maxWorkerPrice is the highest price SessionManager.setWorkerPrice accepts
+// (type(uint96).max): a delegated job's fee is recorded as a uint96.
+var maxWorkerPrice = new(big.Int).Sub(new(big.Int).Lsh(big.NewInt(1), 96), big.NewInt(1))
+
+// parseWorkerPrices parses WORKER_PRICES, "name=wei;name2=wei2": the per-job
+// price this worker asks for a SUPPORTED_MODELS model, in wei. A model with
+// no entry is priced at the model's governance fee. Prices are integers in
+// wei, as SessionManager.setWorkerPrice takes them, at most 2^96-1; 0 clears
+// a price.
+func parseWorkerPrices(raw string, supported []string, errs *[]string) map[string]*big.Int {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return nil
+	}
+	known := make(map[string]bool, len(supported))
+	for _, m := range supported {
+		known[m] = true
+	}
+	out := make(map[string]*big.Int)
+	for _, entry := range strings.Split(raw, ";") {
+		entry = strings.TrimSpace(entry)
+		if entry == "" {
+			continue
+		}
+		name, wei, found := strings.Cut(entry, "=")
+		name, wei = strings.TrimSpace(name), strings.TrimSpace(wei)
+		price, ok := new(big.Int).SetString(wei, 10)
+		switch {
+		case !found || name == "" || !ok || price.Sign() < 0:
+			*errs = append(*errs, fmt.Sprintf("WORKER_PRICES: malformed entry %q (want name=wei)", entry))
+		case price.Cmp(maxWorkerPrice) > 0:
+			*errs = append(*errs, fmt.Sprintf("WORKER_PRICES: %s: price %s wei is above the on-chain maximum %s (2^96-1)", name, price, maxWorkerPrice))
+		case !known[name]:
+			*errs = append(*errs, fmt.Sprintf("WORKER_PRICES: model %q is not in SUPPORTED_MODELS", name))
+		case out[name] != nil:
+			*errs = append(*errs, fmt.Sprintf("WORKER_PRICES: duplicate entry for model %q", name))
+		default:
+			out[name] = price
+		}
+	}
+	return out
 }
 
 // parseModelOptions parses the MODEL_OPTIONS grammar

@@ -804,6 +804,9 @@ func New(cfg *config.Config) (*Service, error) {
 		capCtx, capCancel := context.WithTimeout(context.Background(), 30*time.Second)
 		registration.NewManager(chainClient, workerAddr, nil, logger).EnsureCapabilities(capCtx, desiredCaps)
 		capCancel()
+		if len(cfg.WorkerPrices) > 0 {
+			registration.EnsurePrices(context.Background(), chainClient, workerAddr, cfg.WorkerPrices, logger)
+		}
 		// Fresh budget for the read-back: when EnsureCapabilities actually
 		// broadcast (first boot with a new predicate), WaitMined may have eaten
 		// most of capCtx — reusing it would fail the read and pin ownCaps to 0
@@ -852,6 +855,11 @@ func New(cfg *config.Config) (*Service, error) {
 			"sessionManagerAddress", cfg.SessionManagerAddress.Hex(),
 			"stateDir", cfg.SortitionStateDir,
 		)
+	} else if len(cfg.WorkerPrices) > 0 {
+		// Prices are a SessionManager (sortition) term; a dispatcher-assigned
+		// session is charged the governance fee whatever the worker asks.
+		logger.Warn("WORKER_PRICES is set but sortition is off: prices are not declared, and jobs earn the on-chain fee",
+			"hint", "set SORTITION_ENABLED=true to claim sessions at your own price")
 	}
 
 	return &Service{
