@@ -222,24 +222,27 @@ func (m *lifecycleTermsClient) QuoteWorkerFee(_ context.Context, worker common.A
 	return m.quote, nil
 }
 
-// A request reserved for another worker with no fallback is dropped at once
-// (never claimable by us); one with a fallback stays pending.
-func TestSessionWatcher_SkipsRequestsReservedForAnotherWorker(t *testing.T) {
+// A request that named another worker stays pending and eligibleNow decides.
+// getRequestTerms never shows the declined flag: once the named worker turns
+// it down the request reads as {worker: other, fallbackBlocks: 0}, exactly
+// like an exclusive one, yet anyone may claim it. Dropping it on its terms
+// would leave the requester waiting out its claim timeout.
+func TestSessionWatcher_RequestNamingAnotherWorkerIsLeftToEligibility(t *testing.T) {
 	t.Parallel()
 	var counter atomic.Int32
 	lc := newLifecycleClient(1, 2)
-	lc.eligible[1], lc.eligible[2] = false, false
+	lc.eligible[1], lc.eligible[2] = true, false
 	mc := &lifecycleTermsClient{
 		lifecycleClient: lc,
 		terms: map[uint64]chain.RequestTerms{
-			1: {MaxFee: big.NewInt(0), Worker: other, FallbackBlocks: 0},
+			1: {MaxFee: big.NewInt(0), Worker: other, FallbackBlocks: 0}, // declined by `other`
 			2: {MaxFee: big.NewInt(0), Worker: other, FallbackBlocks: 5},
 		},
 		quote: big.NewInt(500), fee: big.NewInt(1000),
 	}
 	sw := newLifecycleSW(t, mc, &counter, 30, true)
 	require.NoError(t, sw.RunOnce(context.Background()))
-	require.NotContains(t, sw.pending, uint64(1))
+	require.Equal(t, []uint64{1}, mc.claimed, "eligibleNow said yes, so it is claimed")
 	require.Contains(t, sw.pending, uint64(2))
 	require.Empty(t, lc.declined, "requests that named another worker are never declined by us")
 }

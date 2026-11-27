@@ -590,14 +590,14 @@ func (w *SessionWatcher) untrack(reqID uint64) {
 // neverClaimable returns why this worker can never claim the request, or ""
 // when the sortition draw alone decides. It mirrors eligibleNow's terms
 // checks: a declared capability the request excludes, and a quote above its
-// fee cap (the model's fee when it set none).
+// fee cap (the model's fee when it set none). A request that named another
+// worker is not one of them: once that worker declines, the terms still read
+// {worker, fallbackBlocks: 0} (the declined flag is not exposed) while anyone
+// may claim it, so eligibleNow decides.
 func (w *SessionWatcher) neverClaimable(ctx context.Context, tr TermsReader, reqID uint64) (string, error) {
 	t, err := tr.GetRequestTerms(ctx, reqID)
 	if err != nil {
 		return "", err
-	}
-	if t.Worker != (common.Address{}) && t.Worker != w.worker && t.FallbackBlocks == 0 {
-		return fmt.Sprintf("it named worker %s and nobody else", t.Worker.Hex()), nil
 	}
 	if t.Excluded != nil {
 		if clash := new(big.Int).And(t.Excluded, w.ownCaps); clash.Sign() != 0 {
