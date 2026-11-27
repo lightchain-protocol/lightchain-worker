@@ -475,6 +475,13 @@ func (w *SessionWatcher) chosenFor(ctx context.Context, lc LifecycleClient, reqI
 		return c, true
 	}
 	c, err := lc.GetChosenWorker(ctx, reqID)
+	if err != nil && strings.Contains(err.Error(), "reverted") {
+		// A SessionManager without chosen workers: the request names nobody.
+		// Cached, so an older contract costs one call per request, not one
+		// per pass.
+		w.chosen[reqID] = common.Address{}
+		return common.Address{}, true
+	}
 	if err != nil {
 		w.log.Debug("chosen worker not read", "reqId", reqID, "error", err)
 		return common.Address{}, false

@@ -25,6 +25,7 @@ type lifecycleClient struct {
 	*mockClaimClient
 	chosenBy    map[uint64]common.Address
 	chosenReads int
+	chosenErr   error
 	declined    []uint64
 	released    []uint64
 	declineErr  error
@@ -43,6 +44,9 @@ func (m *lifecycleClient) AtCapacity(_ context.Context, _ common.Address) (bool,
 
 func (m *lifecycleClient) GetChosenWorker(_ context.Context, reqID uint64) (common.Address, error) {
 	m.chosenReads++
+	if m.chosenErr != nil {
+		return common.Address{}, m.chosenErr
+	}
 	return m.chosenBy[reqID], nil
 }
 
@@ -392,4 +396,22 @@ func TestSessionWatcher_ReleasesOldClaimsMadeBeforeARestart(t *testing.T) {
 	mc.head = chain.HeadInfo{Number: 1030}
 	require.NoError(t, sw.RunOnce(context.Background()))
 	require.Equal(t, []uint64{1}, mc.released)
+}
+
+// On a SessionManager without getChosenWorker (the call reverts) the watcher
+// asks once per request, not on every pass, and claims as before.
+func TestSessionWatcher_ChosenWorkerRevertReadOnce(t *testing.T) {
+	t.Parallel()
+	var counter atomic.Int32
+	mc := newLifecycleClient(1)
+	mc.eligible[1] = false
+	mc.chosenErr = errors.New("execution reverted")
+	sw := newLifecycleSW(t, mc, &counter, 30, true)
+	for range 3 {
+		require.NoError(t, sw.RunOnce(context.Background()))
+	}
+	require.Equal(t, 1, mc.chosenReads)
+	mc.eligible[1] = true
+	require.NoError(t, sw.RunOnce(context.Background()))
+	require.Equal(t, []uint64{1}, mc.claimed)
 }
