@@ -834,6 +834,8 @@ func New(cfg *config.Config) (*Service, error) {
 			LookbackBlocks:  cfg.SortitionSessionLookbackBlocks,
 
 			MaxRequestAgeBlocks: cfg.SortitionMaxRequestAgeBlocks,
+			AdoptTimeoutBlocks:  cfg.SortitionAdoptTimeoutBlocks,
+			DeclineWhenFull:     cfg.SortitionDeclineWhenFull,
 		})
 		jobWatcher = sortition.NewJobWatcher(sortition.JobWatcherOpts{
 			Client:            chainClient,
